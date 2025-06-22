@@ -15,17 +15,17 @@ unsafe fn print_function(func: LLVMValueRef) {
     while !bb.is_null() {
         // Get first instruction of block
         let mut inst = LLVMGetFirstInstruction(bb);
-        
+
         while !inst.is_null() {
             // Convert instruction to string representation
             let inst_str = LLVMPrintValueToString(inst);
             let inst_rust_str = CStr::from_ptr(inst_str).to_str().unwrap();
             println!("  {}", inst_rust_str);
-            
+
             LLVMDisposeMessage(inst_str);
             inst = LLVMGetNextInstruction(inst);
         }
-        
+
         bb = LLVMGetNextBasicBlock(bb);
     }
 }
@@ -47,7 +47,7 @@ fn main() {
 
         // Get first function
         let mut func = LLVMGetFirstFunction(module);
-        
+
         // Iterate through all functions
         while !func.is_null() {
             print_function(func);

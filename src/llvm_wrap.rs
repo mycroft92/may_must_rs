@@ -1,11 +1,11 @@
 //! THe approach taken from Move compiler's git repo
 
 use libc::{c_uint, size_t};
+use llvm_sys::bit_reader::*;
 use llvm_sys::core::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
 use llvm_sys::target_machine::*;
-
 use std::ffi::{CStr, CString};
 use std::ptr;
 
@@ -38,6 +38,23 @@ impl Context {
                 CString::new(name).unwrap().as_ptr(),
                 self.0,
             ))
+        }
+    }
+
+    pub fn parse_bc_file(&self, name: &str) -> Option<Module> {
+        unsafe {
+            let mem_buffer = ptr::null_mut();
+            let result = LLVMCreateMemoryBufferWithContentsOfFile(
+                CString::new(name).unwrap().as_ptr(),
+                mem_buffer,
+                ptr::null_mut(),
+            );
+            if (result <= 0) {
+                return None;
+            }
+            let mut module = ptr::null_mut();
+            LLVMParseBitcode2(*mem_buffer, &mut module);
+            Some(Module(module))
         }
     }
 }
@@ -82,3 +99,37 @@ impl FunctionType {
 
 #[derive(Copy, Clone)]
 pub struct Function(LLVMValueRef);
+
+impl Function {
+    pub fn get_next_basic_block(&self, basic_block: BasicBlock) -> Option<BasicBlock> {
+        let next_bb = unsafe { BasicBlock(LLVMGetNextBasicBlock(basic_block.0)) };
+        if next_bb.0.is_null() {
+            return None;
+        }
+        Some(next_bb)
+    }
+
+    pub fn get_all_basic_blocks(&self) -> Vec<BasicBlock> {
+        vec![]
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct BasicBlock(LLVMBasicBlockRef);
+
+impl BasicBlock {
+    pub fn get_first_instruction(&self) -> Option<Instruction> {
+        None
+    }
+
+    pub fn get_next_instruction(&self, inst: Instruction) -> Option<Instruction> {
+        None
+    }
+
+    pub fn get_all_instructions(&self) -> Vec<Instruction> {
+        vec![]
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct Instruction(LLVMValueRef);
