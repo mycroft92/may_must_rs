@@ -69,6 +69,8 @@ impl Drop for Module {
     }
 }
 
+impl Module {}
+
 impl AsMut<llvm_sys::LLVMModule> for Module {
     fn as_mut(&mut self) -> &mut llvm_sys::LLVMModule {
         unsafe { &mut *self.0 }
@@ -109,8 +111,28 @@ impl Function {
         Some(next_bb)
     }
 
+    pub fn get_name(&self) -> String {
+        unsafe {
+            let name = CStr::from_ptr(LLVMGetValueName2(self.0, ptr::null_mut()))
+                .to_str()
+                .unwrap();
+            String::from(name)
+        }
+    }
+
     pub fn get_all_basic_blocks(&self) -> Vec<BasicBlock> {
-        vec![]
+        unsafe {
+            let first_bb = LLVMGetFirstBasicBlock(self.0);
+            let mut res: Vec<BasicBlock> = Vec::new();
+            res.push(BasicBlock(first_bb));
+            let mut bb = LLVMGetNextBasicBlock(first_bb);
+            while !(bb.is_null()) {
+                res.push(BasicBlock(bb));
+                bb = LLVMGetNextBasicBlock(bb);
+            }
+
+            res
+        }
     }
 }
 
@@ -127,9 +149,25 @@ impl BasicBlock {
     }
 
     pub fn get_all_instructions(&self) -> Vec<Instruction> {
-        vec![]
+        panic!("Unimplemented get all instructions")
     }
 }
 
 #[derive(Copy, Clone)]
 pub struct Instruction(LLVMValueRef);
+
+impl Instruction {
+    fn print(&self) -> String {
+        unsafe {
+            let inst_str = LLVMPrintValueToString(self.0);
+            String::from(CStr::from_ptr(inst_str).to_str().unwrap())
+        }
+    }
+}
+
+impl std::fmt::Display for Instruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let inst_rust_str = self.print();
+        write!(f, "{}", inst_rust_str)
+    }
+}
