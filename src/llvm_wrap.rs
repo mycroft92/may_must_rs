@@ -11,7 +11,6 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 pub fn initialize_target() {
-    print!("Hello world\n");
     unsafe {
         LLVM_InitializeNativeTarget();
         LLVM_InitializeNativeAsmPrinter();
@@ -58,7 +57,6 @@ impl Context {
                 LLVMDisposeMessage(error_msg);
                 return None;
             }
-            print!("arrived here\n");
             let mut module = ptr::null_mut();
             if LLVMParseBitcodeInContext2(self.0, mem_buffer, &mut module) != 0 {
                 println!("Error parsing bitcode");
@@ -86,7 +84,8 @@ impl Module {
         unsafe {
             let mut first_func = LLVMGetFirstFunction(self.0);
             let mut res: Vec<Function> = Vec::new();
-            res.push(Function(first_func));
+            let mut func = Function(first_func);
+            res.push(func);
             let mut nextf = LLVMGetNextFunction(first_func);
             while !nextf.is_null() {
                 res.push(Function(nextf));
@@ -139,10 +138,13 @@ impl Function {
 
     pub fn get_name(&self) -> String {
         unsafe {
-            let name = CStr::from_ptr(LLVMGetValueName2(self.0, ptr::null_mut()))
-                .to_str()
-                .unwrap();
-            String::from(name)
+            let name = LLVMGetValueName2(self.0, &mut 0);
+            let name_str = CStr::from_ptr(name).to_string_lossy();
+
+            //let name = CStr::from_ptr(LLVMGetValueName2(self.0, ptr::null_mut()))
+            //    .to_str()
+            //    .unwrap();
+            String::from(name_str)
         }
     }
 
