@@ -54,4 +54,5 @@ fn main() {
         LLVMDisposeModule(module);
         LLVMContextDispose(context);
     }
+    print!("finished executing");
 }

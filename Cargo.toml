@@ -6,3 +6,14 @@ edition = "2021"
 [dependencies]
 llvm-sys = "150"
 libc = "0.2"
+
+[[bin]]
+name = "first_exe"
+path = "src/main.rs"
+
+[[bin]]
+name = "llvm_try2"
+path = "read_bitcode.rs"
+[[bin]]
+name = "llvm_try"
+path = "src/main_api.rs"

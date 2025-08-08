@@ -2,6 +2,7 @@
 
 use libc::{c_uint, size_t};
 use llvm_sys::bit_reader::*;
+use llvm_sys::bit_writer::*;
 use llvm_sys::core::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
@@ -10,6 +11,7 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 pub fn initialize_target() {
+    print!("Hello world\n");
     unsafe {
         LLVM_InitializeNativeTarget();
         LLVM_InitializeNativeAsmPrinter();
@@ -43,17 +45,27 @@ impl Context {
 
     pub fn parse_bc_file(&self, name: &str) -> Option<Module> {
         unsafe {
-            let mem_buffer = ptr::null_mut();
+            let mut mem_buffer = ptr::null_mut();
+            let mut error_msg = ptr::null_mut();
             let result = LLVMCreateMemoryBufferWithContentsOfFile(
                 CString::new(name).unwrap().as_ptr(),
-                mem_buffer,
-                ptr::null_mut(),
+                &mut mem_buffer,
+                &mut error_msg,
             );
-            if (result <= 0) {
+            if (result != 0) {
+                let error = CStr::from_ptr(error_msg).to_string_lossy();
+                println!("Error reading file: {}", error);
+                LLVMDisposeMessage(error_msg);
                 return None;
             }
+            print!("arrived here\n");
             let mut module = ptr::null_mut();
-            LLVMParseBitcode2(*mem_buffer, &mut module);
+            if LLVMParseBitcodeInContext2(self.0, mem_buffer, &mut module) != 0 {
+                println!("Error parsing bitcode");
+                LLVMDisposeMemoryBuffer(mem_buffer);
+                return None;
+            }
+
             Some(Module(module))
         }
     }
@@ -69,7 +81,21 @@ impl Drop for Module {
     }
 }
 
-impl Module {}
+impl Module {
+    pub fn get_all_functions(&self) -> Vec<Function> {
+        unsafe {
+            let mut first_func = LLVMGetFirstFunction(self.0);
+            let mut res: Vec<Function> = Vec::new();
+            res.push(Function(first_func));
+            let mut nextf = LLVMGetNextFunction(first_func);
+            while !nextf.is_null() {
+                res.push(Function(nextf));
+                nextf = LLVMGetNextFunction(nextf);
+            }
+            res
+        }
+    }
+}
 
 impl AsMut<llvm_sys::LLVMModule> for Module {
     fn as_mut(&mut self) -> &mut llvm_sys::LLVMModule {
@@ -122,7 +148,7 @@ impl Function {
 
     pub fn get_all_basic_blocks(&self) -> Vec<BasicBlock> {
         unsafe {
-            let first_bb = LLVMGetFirstBasicBlock(self.0);
+            let mut first_bb = LLVMGetFirstBasicBlock(self.0);
             let mut res: Vec<BasicBlock> = Vec::new();
             res.push(BasicBlock(first_bb));
             let mut bb = LLVMGetNextBasicBlock(first_bb);
