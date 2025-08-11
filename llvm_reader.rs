@@ -1,3 +1,4 @@
+use llvm_sys::bit_reader::*;
 use llvm_sys::core::*;
 use llvm_sys::prelude::*;
 use std::ffi::CStr;
@@ -34,7 +35,7 @@ fn main() {
     unsafe {
         // Initialize LLVM
         let context = LLVMContextCreate();
-        let memory_buffer = LLVMCreateMemoryBufferWithContentsOfFile(
+        let mut memory_buffer = LLVMCreateMemoryBufferWithContentsOfFile(
             std::ffi::CString::new(std::env::args().nth(1).expect("No input file provided"))
                 .unwrap()
                 .as_ptr(),

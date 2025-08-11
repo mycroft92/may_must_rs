@@ -168,16 +168,20 @@ impl Function {
 pub struct BasicBlock(LLVMBasicBlockRef);
 
 impl BasicBlock {
-    pub fn get_first_instruction(&self) -> Option<Instruction> {
-        None
-    }
-
-    pub fn get_next_instruction(&self, inst: Instruction) -> Option<Instruction> {
-        None
-    }
-
     pub fn get_all_instructions(&self) -> Vec<Instruction> {
-        panic!("Unimplemented get all instructions")
+        //panic!("Unimplemented get all instructions");
+        unsafe {
+            let mut res: Vec<Instruction> = Vec::new();
+            let mut first = LLVMGetFirstInstruction(self.0);
+            res.push(Instruction(first));
+            let mut next = LLVMGetNextInstruction(first);
+            while !next.is_null() {
+                res.push(Instruction(next));
+                next = LLVMGetNextInstruction(next);
+            }
+
+            res
+        }
     }
 }
 
@@ -189,6 +193,17 @@ impl Instruction {
         unsafe {
             let inst_str = LLVMPrintValueToString(self.0);
             String::from(CStr::from_ptr(inst_str).to_str().unwrap())
+        }
+    }
+
+    fn is_branch_instruction(&self) -> bool {
+        unsafe {
+            let res = LLVMIsABranchInst(self.0);
+            if res.is_null() {
+                false
+            } else {
+                true
+            }
         }
     }
 }
