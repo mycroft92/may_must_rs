@@ -102,12 +102,12 @@ impl AsMut<llvm_sys::LLVMModule> for Module {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct Type(LLVMTypeRef);
 
 impl Type {}
 
-#[derive(Copy, Clone)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct FunctionType(LLVMTypeRef);
 
 impl FunctionType {
@@ -124,7 +124,7 @@ impl FunctionType {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct Function(LLVMValueRef);
 
 impl Function {
@@ -164,7 +164,7 @@ impl Function {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct BasicBlock(LLVMBasicBlockRef);
 
 impl BasicBlock {
@@ -183,9 +183,29 @@ impl BasicBlock {
             res
         }
     }
+
+    pub fn get_front(&self) -> Option<Instruction> {
+        unsafe {
+            let mut instr = LLVMGetFirstInstruction(self.0);
+            if !instr.is_null() {
+                return None;
+            }
+            Some(Instruction(instr))
+        }
+    }
+
+    pub fn get_back(&self) -> Option<Instruction> {
+        unsafe {
+            let mut instr = LLVMGetBasicBlockTerminator(self.0);
+            if !instr.is_null() {
+                return None;
+            }
+            Some(Instruction(instr))
+        }
+    }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct Instruction(LLVMValueRef);
 
 impl Instruction {
@@ -206,6 +226,12 @@ impl Instruction {
             }
         }
     }
+
+    fn is_terminator_instruction(&self) -> bool {
+        false
+    }
+
+    fn get_successors(&self) {}
 }
 
 impl std::fmt::Display for Instruction {
