@@ -1,5 +1,3 @@
-//! THe approach taken from Move compiler's git repo
-
 use libc::{c_uint, size_t};
 use llvm_sys::bit_reader::*;
 use llvm_sys::bit_writer::*;
@@ -231,7 +229,19 @@ impl Instruction {
         false
     }
 
-    fn get_successors(&self) {}
+    fn get_successors(&self) -> Vec<BasicBlock> {
+        unsafe {
+            if !self.is_terminator_instruction() {
+                return [].to_vec();
+            }
+            let mut ret: Vec<BasicBlock> = Vec::new();
+            for i in 0..LLVMGetNumSuccessors(self.0) {
+                let mut bb = LLVMGetSuccessor(self.0, i);
+                ret.push(BasicBlock(bb));
+            }
+            ret
+        }
+    }
 }
 
 impl std::fmt::Display for Instruction {
