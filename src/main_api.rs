@@ -1,5 +1,6 @@
-mod llvm_wrap;
-use crate::llvm_wrap::*;
+mod llvm_utils;
+
+use crate::llvm_utils::llvm_wrap::*;
 
 use std::env;
 fn handle(module: Module) {

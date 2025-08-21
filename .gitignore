@@ -1,1 +1,4 @@
 /target
+src/llvm.rs
+*.swp
+*.bc
