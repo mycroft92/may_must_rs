@@ -7,6 +7,20 @@ fn handle(module: Module) {
     let mut fset = module.get_all_functions();
     for f in &mut fset {
         print!("Function visit: {}\n", f.get_name());
+        let mut bbs = f.get_all_basic_blocks();
+        match bbs {
+            None => print!("Skipping, no bbs found\n"),
+            Some(bbs) => {
+                for bb in bbs {
+                    let instrs = bb.get_all_instructions();
+                    for i in instrs {
+                        if i.is_branch_instruction() {
+                            print!("Branch: {} \n", i);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

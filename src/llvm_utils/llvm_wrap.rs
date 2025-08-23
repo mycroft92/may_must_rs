@@ -82,6 +82,9 @@ impl Module {
         unsafe {
             let mut first_func = LLVMGetFirstFunction(self.0);
             let mut res: Vec<Function> = Vec::new();
+            if first_func.is_null() {
+                return vec![];
+            }
             let mut func = Function(first_func);
             res.push(func);
             let mut nextf = LLVMGetNextFunction(first_func);
@@ -146,9 +149,12 @@ impl Function {
         }
     }
 
-    pub fn get_all_basic_blocks(&self) -> Vec<BasicBlock> {
+    pub fn get_all_basic_blocks(&self) -> Option<Vec<BasicBlock>> {
         unsafe {
             let mut first_bb = LLVMGetFirstBasicBlock(self.0);
+            if first_bb.is_null() {
+                return None;
+            }
             let mut res: Vec<BasicBlock> = Vec::new();
             res.push(BasicBlock(first_bb));
             let mut bb = LLVMGetNextBasicBlock(first_bb);
@@ -157,7 +163,7 @@ impl Function {
                 bb = LLVMGetNextBasicBlock(bb);
             }
 
-            res
+            Some(res)
         }
     }
 }
@@ -171,6 +177,9 @@ impl BasicBlock {
         unsafe {
             let mut res: Vec<Instruction> = Vec::new();
             let mut first = LLVMGetFirstInstruction(self.0);
+            if first.is_null() {
+                return vec![];
+            }
             res.push(Instruction(first));
             let mut next = LLVMGetNextInstruction(first);
             while !next.is_null() {
@@ -207,29 +216,44 @@ impl BasicBlock {
 pub struct Instruction(LLVMValueRef);
 
 impl Instruction {
-    fn print(&self) -> String {
+    pub fn print(&self) -> String {
         unsafe {
             let inst_str = LLVMPrintValueToString(self.0);
             String::from(CStr::from_ptr(inst_str).to_str().unwrap())
         }
     }
 
-    fn is_branch_instruction(&self) -> bool {
+    pub fn is_branch_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsABranchInst(self.0);
-            if res.is_null() {
-                false
-            } else {
-                true
+            if !res.is_null() {
+                let a = LLVMConstIntGetZExtValue(res);
+                if a > 0 {
+                    return true;
+                } else {
+                    return false;
+                }
             }
+            false
         }
     }
 
-    fn is_terminator_instruction(&self) -> bool {
-        false
+    pub fn is_terminator_instruction(&self) -> bool {
+        unsafe {
+            let resp = LLVMIsATerminatorInst(self.0);
+            if !resp.is_null() {
+                let a = LLVMConstIntGetZExtValue(resp);
+                if a > 0 {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            false
+        }
     }
 
-    fn get_successors(&self) -> Vec<BasicBlock> {
+    pub fn get_successors(&self) -> Vec<BasicBlock> {
         unsafe {
             if !self.is_terminator_instruction() {
                 return [].to_vec();

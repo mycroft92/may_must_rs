@@ -1,10 +1,9 @@
+use crate::llvm_wrap::*;
 use llvm_sys::core::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::{LLVM_InitializeNativeAsmPrinter, LLVM_InitializeNativeTarget};
 use std::ffi::CStr;
 use std::ptr;
-mod llvm_wrap;
-use crate::llvm_wrap::*;
 pub unsafe fn count_instructions(module: LLVMModuleRef) {
     let mut function = LLVMGetFirstFunction(module);
 
