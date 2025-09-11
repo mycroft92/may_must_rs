@@ -6,6 +6,11 @@ edition = "2021"
 [dependencies]
 llvm-sys = "150"
 libc = "0.2"
+env_logger = "0.11"
+log = "0.4"
+clap = {version = "4.5", features =["cargo"]}
+thiserror = "2.0.16"
+dot = "0.1.4"
 
 [[bin]]
 name = "llvm_try"

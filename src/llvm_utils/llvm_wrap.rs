@@ -212,7 +212,7 @@ impl BasicBlock {
     }
 }
 
-#[derive(Hash, Eq, PartialEq, Copy, Clone)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
 pub struct Instruction(LLVMValueRef);
 
 impl Instruction {
