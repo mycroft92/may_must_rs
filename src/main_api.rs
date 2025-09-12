@@ -7,23 +7,11 @@ use log::*;
 use std::env;
 
 fn handle(module: Module) {
-    let mut fset = module.get_all_functions();
-    for f in &mut fset {
-        info!("Function visit: {}\n", f.get_name());
-        let mut bbs = f.get_all_basic_blocks();
-        match bbs {
-            None => info!("Skipping, no bbs found\n"),
-            Some(bbs) => {
-                for bb in bbs {
-                    let instrs = bb.get_all_instructions();
-                    for i in instrs {
-                        if i.is_branch_instruction() {
-                            info!("Branch: {} \n", i);
-                        }
-                    }
-                }
-            }
+    match llvm_utils::program_graph::generate_program_graph(&module) {
+        Ok(res_) => {
+            llvm_utils::program_graph::dump_graphs(&res_, "graph_dot");
         }
+        Err(err) => error!("{err}"),
     }
 }
 
@@ -37,10 +25,7 @@ fn init_logger(level: &u8) {
             env = Env::default().filter_or("CRICK_LOG", "trace");
         }
     }
-    Builder::from_env(env)
-        .format_level(false)
-        .format_timestamp_nanos()
-        .init();
+    Builder::from_env(env).format_level(true).init();
 }
 
 fn main() {

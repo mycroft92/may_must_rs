@@ -129,6 +129,10 @@ impl FunctionType {
 pub struct Function(LLVMValueRef);
 
 impl Function {
+    pub fn get_basic_block_count(&self) -> u32 {
+        unsafe { LLVMCountBasicBlocks(self.0) }
+    }
+
     pub fn get_next_basic_block(&self, basic_block: BasicBlock) -> Option<BasicBlock> {
         let next_bb = unsafe { BasicBlock(LLVMGetNextBasicBlock(basic_block.0)) };
         if next_bb.0.is_null() {
@@ -149,11 +153,11 @@ impl Function {
         }
     }
 
-    pub fn get_all_basic_blocks(&self) -> Option<Vec<BasicBlock>> {
+    pub fn get_all_basic_blocks(&self) -> Vec<BasicBlock> {
         unsafe {
             let mut first_bb = LLVMGetFirstBasicBlock(self.0);
             if first_bb.is_null() {
-                return None;
+                return vec![];
             }
             let mut res: Vec<BasicBlock> = Vec::new();
             res.push(BasicBlock(first_bb));
@@ -163,7 +167,7 @@ impl Function {
                 bb = LLVMGetNextBasicBlock(bb);
             }
 
-            Some(res)
+            res
         }
     }
 }
@@ -194,7 +198,7 @@ impl BasicBlock {
     pub fn get_front(&self) -> Option<Instruction> {
         unsafe {
             let mut instr = LLVMGetFirstInstruction(self.0);
-            if !instr.is_null() {
+            if instr.is_null() {
                 return None;
             }
             Some(Instruction(instr))
@@ -204,7 +208,7 @@ impl BasicBlock {
     pub fn get_back(&self) -> Option<Instruction> {
         unsafe {
             let mut instr = LLVMGetBasicBlockTerminator(self.0);
-            if !instr.is_null() {
+            if instr.is_null() {
                 return None;
             }
             Some(Instruction(instr))
@@ -219,10 +223,21 @@ impl Instruction {
     pub fn print(&self) -> String {
         unsafe {
             let inst_str = LLVMPrintValueToString(self.0);
-            String::from(CStr::from_ptr(inst_str).to_str().unwrap())
+            if inst_str.is_null() {
+                return "is null".to_string();
+            }
+            let res = String::from(CStr::from_ptr(inst_str).to_string_lossy());
+            LLVMDisposeMessage(inst_str);
+            res
         }
     }
 
+    pub fn get_operand(&self) -> String {
+        unsafe {
+            let op = LLVMGetInstructionOpcode(self.0);
+            format!("{:?}", op)
+        }
+    }
     pub fn is_branch_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsABranchInst(self.0);
@@ -253,15 +268,16 @@ impl Instruction {
         }
     }
 
-    pub fn get_successors(&self) -> Vec<BasicBlock> {
+    pub fn get_successors(&self) -> Vec<Instruction> {
         unsafe {
-            if !self.is_terminator_instruction() {
+            if self.is_terminator_instruction() {
                 return [].to_vec();
             }
-            let mut ret: Vec<BasicBlock> = Vec::new();
+            let mut ret: Vec<Instruction> = Vec::new();
             for i in 0..LLVMGetNumSuccessors(self.0) {
-                let mut bb = LLVMGetSuccessor(self.0, i);
-                ret.push(BasicBlock(bb));
+                let bb = LLVMGetSuccessor(self.0, i);
+                let first = LLVMGetFirstInstruction(bb);
+                ret.push(Instruction(first));
             }
             ret
         }

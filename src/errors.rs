@@ -1,4 +1,5 @@
 use crate::llvm_utils::llvm_wrap::Instruction;
+use std::io;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -7,6 +8,10 @@ pub enum ProgError {
     LLVMError(String),
     #[error("Error making program graph: {inst}, {1}", inst=(.0).print())]
     GraphError(Instruction, String),
+    #[error("No definition for: {0}")]
+    NoDefinitionForGraph(String),
+    #[error("IO Error: {0}")]
+    IOError(#[from] std::io::Error),
     #[error("Unknown Error: {0}")]
     UnknownError(String),
 }
