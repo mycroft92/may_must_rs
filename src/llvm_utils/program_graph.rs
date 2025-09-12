@@ -96,6 +96,7 @@ impl FunctionGraph {
                     let successors = inst.get_successors();
                     for scr in successors {
                         res.add_edge(inst, scr);
+                        debug!("{inst} -> {scr}");
                     }
                 }
                 prev = inst;

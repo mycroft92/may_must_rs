@@ -270,7 +270,7 @@ impl Instruction {
 
     pub fn get_successors(&self) -> Vec<Instruction> {
         unsafe {
-            if self.is_terminator_instruction() {
+            if !self.is_terminator_instruction() {
                 return [].to_vec();
             }
             let mut ret: Vec<Instruction> = Vec::new();
