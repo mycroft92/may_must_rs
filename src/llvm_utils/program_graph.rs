@@ -82,11 +82,14 @@ impl FunctionGraph {
 
         let bbs = function.get_all_basic_blocks();
 
-        for bb in bbs {
+        for (i, bb) in bbs.iter().enumerate() {
             let instrs = bb.get_all_instructions();
             let mut prev = bb
                 .get_front()
                 .ok_or_else(|| ProgError::LLVMError("Unable to get front for bb".to_string()))?;
+            if i == 0 {
+                res.start.push(prev);
+            }
             for inst in instrs {
                 if inst == prev {
                     continue;
