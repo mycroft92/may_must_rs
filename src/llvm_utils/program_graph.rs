@@ -19,7 +19,7 @@ pub struct FunctionGraph {
     pub name: String,
     pub vertices: Vec<Instruction>,
     pub edges: HashMap<Instruction, Node>,
-    pub start: Vec<Instruction>,
+    pub start: Option<Instruction>,
     pub end: Vec<Instruction>,
 }
 
@@ -75,7 +75,7 @@ impl FunctionGraph {
         let mut res = FunctionGraph {
             name,
             edges: HashMap::new(),
-            start: vec![],
+            start: None,
             end: vec![],
             vertices: vec![],
         };
@@ -88,7 +88,7 @@ impl FunctionGraph {
                 .get_front()
                 .ok_or_else(|| ProgError::LLVMError("Unable to get front for bb".to_string()))?;
             if i == 0 {
-                res.start.push(prev);
+                res.start = Some(prev);
             }
             for inst in instrs {
                 if inst == prev {
@@ -101,6 +101,9 @@ impl FunctionGraph {
                         res.add_edge(inst, scr);
                         debug!("{inst} -> {scr}");
                     }
+                }
+                if inst.is_return_instruction() {
+                    res.end.push(inst);
                 }
                 prev = inst;
             }

@@ -5,6 +5,7 @@ use clap::{arg, command, value_parser, ArgAction, Command};
 use env_logger::{Builder, Env};
 use log::*;
 use std::env;
+mod expressions;
 
 fn handle(module: Module) {
     match llvm_utils::program_graph::generate_program_graph(&module) {

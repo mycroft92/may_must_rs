@@ -253,6 +253,20 @@ impl Instruction {
         }
     }
 
+    pub fn is_return_instruction(&self) -> bool {
+        unsafe {
+            let res = LLVMIsAReturnInst(self.0);
+            if !res.is_null() {
+                let a = LLVMConstIntGetZExtValue(res);
+                if a > 0 {
+                    return true;
+                }
+                return false;
+            }
+            false
+        }
+    }
+
     pub fn is_terminator_instruction(&self) -> bool {
         unsafe {
             let resp = LLVMIsATerminatorInst(self.0);
