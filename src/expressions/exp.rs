@@ -1,3 +1,4 @@
+use crate::errors::{ProgError, Result};
 use ariadne::{sources, Color, Label, Report, ReportKind};
 ///Defines the type of assertions we check for witht he analysis
 use chumsky::{input::BorrowInput, input::ValueInput, pratt::*, prelude::*};
@@ -306,6 +307,10 @@ where
         .then_ignore(just(Token::TArrow))
         .then(exp_parser(make_input))
         .map_with(|(func, exp), e| (Stmt { func, exp }, e.span()))
+}
+
+pub fn parse_file() -> Result<()> {
+    Ok(())
 }
 
 fn failure(

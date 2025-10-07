@@ -24,8 +24,6 @@ pub struct FunctionGraph {
     pub vars: HashMap<String, Instruction>,
 }
 
-type Result<a> = std::result::Result<a, ProgError>;
-
 impl<'a> Labeller<'a, Instruction, (Instruction, Instruction)> for FunctionGraph {
     fn graph_id(&'a self) -> dot::Id<'a> {
         dot::Id::new(self.name.clone()).unwrap()

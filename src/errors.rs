@@ -15,3 +15,5 @@ pub enum ProgError {
     #[error("Unknown Error: {0}")]
     UnknownError(String),
 }
+
+pub type Result<a> = std::result::Result<a, ProgError>;
