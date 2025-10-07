@@ -313,8 +313,9 @@ fn failure(
     label: (String, SimpleSpan),
     extra_labels: impl IntoIterator<Item = (String, SimpleSpan)>,
     src: &str,
+    fname: &'static str,
 ) -> ! {
-    let fname = "example";
+    //let fname = "example";
     Report::build(ReportKind::Error, (fname, label.1.into_range()))
         .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
         .with_message(&msg)
@@ -334,7 +335,7 @@ fn failure(
     std::process::exit(1)
 }
 
-fn parse_failure(err: &Rich<impl fmt::Display>, src: &str) -> ! {
+fn parse_failure(err: &Rich<impl fmt::Display>, src: &str, fname: &'static str) -> ! {
     failure(
         err.reason().to_string(),
         (
@@ -346,6 +347,7 @@ fn parse_failure(err: &Rich<impl fmt::Display>, src: &str) -> ! {
         err.contexts()
             .map(|(l, s)| (format!("while parsing this {l}"), *s)),
         src,
+        fname,
     )
 }
 
@@ -378,7 +380,7 @@ mod tests {
         let tokens = lexer()
             .parse(&num)
             .into_result()
-            .unwrap_or_else(|errs| parse_failure(&errs[0], &num));
+            .unwrap_or_else(|errs| parse_failure(&errs[0], &num, "test"));
         match exp_parser(make_input)
             .parse(make_input((0..num.len()).into(), &tokens))
             .into_result()
@@ -405,7 +407,7 @@ mod tests {
         let tokens = lexer()
             .parse(&stmt)
             .into_result()
-            .unwrap_or_else(|errs| parse_failure(&errs[0], &stmt));
+            .unwrap_or_else(|errs| parse_failure(&errs[0], &stmt, "test"));
         println!("Tokens: {:?}", tokens);
         match stmt_parser(make_input)
             .parse(make_input((0..stmt.len()).into(), &tokens))
