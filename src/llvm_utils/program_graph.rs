@@ -21,6 +21,7 @@ pub struct FunctionGraph {
     pub edges: HashMap<Instruction, Node>,
     pub start: Option<Instruction>,
     pub end: Vec<Instruction>,
+    pub vars: HashMap<String, Instruction>,
 }
 
 type Result<a> = std::result::Result<a, ProgError>;
@@ -78,6 +79,7 @@ impl FunctionGraph {
             start: None,
             end: vec![],
             vertices: vec![],
+            vars: HashMap::new(),
         };
 
         let bbs = function.get_all_basic_blocks();
@@ -91,6 +93,10 @@ impl FunctionGraph {
                 res.start = Some(prev);
             }
             for inst in instrs {
+                let var_name = inst.get_assignment_var();
+                if var_name != "" {
+                    res.vars.insert(var_name, inst);
+                }
                 if inst == prev {
                     continue;
                 }
