@@ -14,6 +14,8 @@ pub enum ProgError {
     IOError(#[from] std::io::Error),
     #[error("Unknown Error: {0}")]
     UnknownError(String),
+    #[error("Error Parsing File: {0}")]
+    ParseError(String),
 }
 
 pub type Result<a> = std::result::Result<a, ProgError>;

@@ -2,6 +2,7 @@ use crate::errors::{ProgError, Result};
 use ariadne::{sources, Color, Label, Report, ReportKind};
 ///Defines the type of assertions we check for witht he analysis
 use chumsky::{input::BorrowInput, input::ValueInput, pratt::*, prelude::*};
+use std::io::{BufRead, BufReader};
 use std::{env, fmt, fs};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -109,18 +110,6 @@ enum Exp<'src> {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct Stmt<'src> {
-    func: &'src str,
-    exp: Spanned<Exp<'src>>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct Assertion<'src> {
-    stmt: Stmt<'src>,
-    name: &'src str,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Expr {
     Ident(String),
     Const(String),
@@ -128,19 +117,57 @@ pub enum Expr {
     Unop(Box<Self>),
 }
 
-fn transpose<'src>(s: Exp<'src>) -> Expr {
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct Stmt<'src> {
+    func: &'src str,
+    exp: Spanned<Exp<'src>>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Statement {
+    pub func: String,
+    pub exp: Expr,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct Assert<'src> {
+    stmt: Spanned<Stmt<'src>>,
+    name: &'src str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Assertion {
+    pub stmt: Statement,
+    pub name: String,
+}
+
+fn transpose_exp<'src>(s: Exp<'src>) -> Expr {
     match s {
         Exp::Ident(s) => Expr::Ident(String::from(s)),
         Exp::Const(s) => Expr::Const(String::from(s)),
         Exp::Binop(e1_, op, e2_) => {
             let (e1, _) = *e1_;
             let (e2, _) = *e2_;
-            Expr::Binop(Box::new(transpose(e1)), op, Box::new(transpose(e2)))
+            Expr::Binop(Box::new(transpose_exp(e1)), op, Box::new(transpose_exp(e2)))
         }
         Exp::Unop(e_) => {
             let (e, _) = *e_;
-            Expr::Unop(Box::new(transpose(e)))
+            Expr::Unop(Box::new(transpose_exp(e)))
         }
+    }
+}
+
+fn transpose_stmt<'src>(s: Stmt<'src>) -> Statement {
+    Statement {
+        func: s.func.to_string(),
+        exp: transpose_exp(s.exp.0),
+    }
+}
+
+fn transpose<'src>(s: Assert<'src>) -> Assertion {
+    Assertion {
+        name: s.name.to_string(),
+        stmt: transpose_stmt(s.stmt.0),
     }
 }
 
@@ -309,11 +336,70 @@ where
         .map_with(|(func, exp), e| (Stmt { func, exp }, e.span()))
 }
 
-pub fn parse_file() -> Result<()> {
-    Ok(())
+fn assert_parser<'tokens, 'src: 'tokens, I, M>(
+    make_input: M,
+) -> impl Parser<'tokens, I, Spanned<Assert<'src>>, extra::Err<Rich<'tokens, Token<'src>, SimpleSpan>>>
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>
+        + BorrowInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
+    // Because this function is generic over the input type, we need the caller to tell us how to create a new input,
+    // `I`, from a nested token tree. This function serves that purpose.
+    M: Fn(SimpleSpan, &'tokens [Spanned<Token<'src>>]) -> I + Clone + 'src,
+{
+    let ident = select! { Token::FIdent(ident) => ident }.labelled("identifier");
+    //just(Token::Ident(_))
+    ident
+        //.map_with(|x, e| (x, e.span()))
+        .then_ignore(just(Token::TNamed))
+        .then(stmt_parser(make_input))
+        .map_with(|(func, exp), e| {
+            (
+                Assert {
+                    name: func,
+                    stmt: exp,
+                },
+                e.span(),
+            )
+        })
 }
 
-fn failure(
+pub fn parse_file(f: &str) -> Result<Vec<Assertion>> {
+    let f_handle = fs::File::open(f).map_err(|e| Into::<ProgError>::into(e))?;
+    let f_contents = std::io::BufReader::new(f_handle).lines();
+    let mut err_cnt = 0;
+    let mut results: Vec<Assertion> = vec![];
+    for line_res in f_contents {
+        let line = line_res?;
+        let tokens = lexer().parse(&line).into_result();
+        match tokens {
+            Err(e) => {
+                parse_failure(&e[0], &line);
+                err_cnt = err_cnt + 1;
+            }
+
+            Ok(tok) => {
+                match assert_parser(make_input)
+                    .parse(make_input((0..line.len()).into(), &tok))
+                    .into_result()
+                {
+                    Err(e) => {
+                        parse_failure(&e[0], &line);
+                        err_cnt = err_cnt + 1;
+                    }
+                    Ok(stmt) => {
+                        results.push(transpose(stmt.0));
+                    }
+                }
+            }
+        }
+    }
+    if err_cnt > 0 {
+        return Err(ProgError::ParseError(f.to_string()));
+    }
+    Ok(results)
+}
+
+fn failure_noret(
     msg: String,
     label: (String, SimpleSpan),
     extra_labels: impl IntoIterator<Item = (String, SimpleSpan)>,
@@ -335,13 +421,13 @@ fn failure(
                 .with_color(Color::Yellow)
         }))
         .finish()
-        .print(sources([(fname, src)]))
+        .eprint(sources([(fname, src)]))
         .unwrap();
     std::process::exit(1)
 }
 
-fn parse_failure(err: &Rich<impl fmt::Display>, src: &str, fname: &'static str) -> ! {
-    failure(
+fn parse_failure_noret(err: &Rich<impl fmt::Display>, src: &str, fname: &'static str) -> ! {
+    failure_noret(
         err.reason().to_string(),
         (
             err.found()
@@ -353,6 +439,45 @@ fn parse_failure(err: &Rich<impl fmt::Display>, src: &str, fname: &'static str) 
             .map(|(l, s)| (format!("while parsing this {l}"), *s)),
         src,
         fname,
+    )
+}
+
+fn failure<'a>(
+    msg: String,
+    label: (String, SimpleSpan),
+    extra_labels: impl IntoIterator<Item = (String, SimpleSpan)>,
+    src: &'a str,
+) {
+    Report::build(ReportKind::Error, ("Error", label.1.into_range()))
+        .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+        .with_message(&msg)
+        .with_label(
+            Label::new(("Error", label.1.into_range()))
+                .with_message(label.0)
+                .with_color(Color::Red),
+        )
+        .with_labels(extra_labels.into_iter().map(|label2| {
+            Label::new(("Error", label2.1.into_range()))
+                .with_message(label2.0)
+                .with_color(Color::Yellow)
+        }))
+        .finish()
+        .eprint(sources([("example", src)]))
+        .unwrap();
+}
+
+fn parse_failure<'a>(err: &Rich<impl fmt::Display>, src: &'a str) {
+    failure(
+        err.reason().to_string(),
+        (
+            err.found()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "end of input".to_string()),
+            *err.span(),
+        ),
+        err.contexts()
+            .map(|(l, s)| (format!("while parsing this {l}"), *s)),
+        src,
     )
 }
 
@@ -385,14 +510,14 @@ mod tests {
         let tokens = lexer()
             .parse(&num)
             .into_result()
-            .unwrap_or_else(|errs| parse_failure(&errs[0], &num, "test"));
+            .unwrap_or_else(|errs| parse_failure_noret(&errs[0], &num, "test"));
         match exp_parser(make_input)
             .parse(make_input((0..num.len()).into(), &tokens))
             .into_result()
         {
             Ok(ast) => {
                 //println!("{:?}", ast);
-                let ast_ = transpose(ast.0);
+                let ast_ = transpose_exp(ast.0);
                 assert_eq!(
                     Expr::Binop(
                         Box::new(Expr::Const("42".to_string())),
@@ -408,11 +533,11 @@ mod tests {
 
     #[test]
     fn test_stmt() {
-        let stmt = String::from("func_name => %abcd == 42");
+        let stmt = String::from("func_name => %abcd == 42 & %gcd == 40 +8");
         let tokens = lexer()
             .parse(&stmt)
             .into_result()
-            .unwrap_or_else(|errs| parse_failure(&errs[0], &stmt, "test"));
+            .unwrap_or_else(|errs| parse_failure_noret(&errs[0], &stmt, "test"));
         println!("Tokens: {:?}", tokens);
         match stmt_parser(make_input)
             .parse(make_input((0..stmt.len()).into(), &tokens))
