@@ -92,8 +92,11 @@ impl FunctionGraph {
             }
             for inst in instrs {
                 let var_name = inst.get_assignment_var();
-                if var_name != "" {
-                    res.vars.insert(var_name, inst);
+                match var_name {
+                    Some(name) => {
+                        res.vars.insert(name, inst);
+                    }
+                    None => {}
                 }
                 if inst == prev {
                     continue;

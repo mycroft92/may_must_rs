@@ -1,5 +1,6 @@
 mod errors;
 mod llvm_utils;
+use crate::expressions::exp::{parse_cmd_line, Assertion, Expr, Statement};
 use crate::llvm_utils::llvm_wrap::*;
 use clap::{arg, command, value_parser, ArgAction, Command};
 use env_logger::{Builder, Env};
@@ -51,6 +52,26 @@ fn main() {
         None => {
             info!("Nothing to process");
             return;
+        }
+    }
+    let assert_stmt;
+    match matches.get_one::<String>("assert") {
+        Some(cmd) => {
+            assert_stmt = cmd;
+        }
+        None => {
+            info!("Nothing to process");
+            return;
+        }
+    }
+
+    let assertion_ast;
+    match parse_cmd_line(assert_stmt) {
+        Err(e) => {
+            std::process::exit(1);
+        }
+        Ok(assertion) => {
+            assertion_ast = assertion;
         }
     }
 

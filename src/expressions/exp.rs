@@ -363,6 +363,29 @@ where
         })
 }
 
+pub fn parse_cmd_line(s: &str) -> Result<Assertion> {
+    let contents = "cmdline :: ".to_string() + s;
+    let tokens = lexer().parse(&contents).into_result();
+    match tokens {
+        Err(e) => {
+            parse_failure(&e[0], &contents);
+            Err(ProgError::ParseError(s.to_string()))
+        }
+        Ok(toks) => {
+            match assert_parser(make_input)
+                .parse(make_input((0..contents.len()).into(), &toks))
+                .into_result()
+            {
+                Err(e) => {
+                    parse_failure(&e[0], &contents);
+                    Err(ProgError::ParseError(s.to_string()))
+                }
+                Ok(assert) => Ok(transpose(assert.0)),
+            }
+        }
+    }
+}
+
 pub fn parse_file(f: &str) -> Result<Vec<Assertion>> {
     let f_handle = fs::File::open(f).map_err(|e| Into::<ProgError>::into(e))?;
     let f_contents = std::io::BufReader::new(f_handle).lines();

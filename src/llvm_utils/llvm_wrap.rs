@@ -220,12 +220,14 @@ impl BasicBlock {
 pub struct Instruction(LLVMValueRef);
 
 impl Instruction {
-    pub fn get_assignment_var(&self) -> String {
+    pub fn get_assignment_var(&self) -> Option<String> {
         let instr = self.print();
-        if let Some((name, rest)) = instr.split_once(' ') {
-            return String::from(name);
+        if let Some((name, rest)) = instr.trim().split_once(' ') {
+            if !name.is_empty() && (name.chars().nth(0).unwrap() == '%') {
+                return Some(String::from(name));
+            }
         }
-        "".to_string()
+        None
     }
     pub fn print(&self) -> String {
         unsafe {
