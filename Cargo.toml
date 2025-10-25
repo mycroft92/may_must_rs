@@ -13,12 +13,17 @@ thiserror = "2.0.16"
 dot = "0.1.4"
 chumsky = {features = ["pratt"], version = "0.11"}
 ariadne = "0.5.1"
+z3 = "0"
 
 
-[[bin]]
-name = "var_reader"
-path = "name_tester.rs"
+#[[bin]]
+#name = "var_reader"
+#path = "name_tester.rs"
 
 [[bin]]
 name = "llvm_try"
 path = "src/main_api.rs"
+
+[env]
+Z3_LIBRARY_PATH_OVERRIDE = "/opt/homebrew/lib"
+Z3_SYS_Z3_HEADER = "/opt/homebrew/include/z3.h"
