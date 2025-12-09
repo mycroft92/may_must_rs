@@ -1,4 +1,11 @@
+*.ll
+*.bc
 /target
 src/llvm.rs
 *.swp
 *.bc
+Cargo.lock
+*.s
+graph_dot/
+*.png
+.DS_Store

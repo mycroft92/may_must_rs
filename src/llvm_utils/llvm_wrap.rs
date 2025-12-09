@@ -223,8 +223,8 @@ impl Instruction {
     pub fn get_assignment_var(&self) -> Option<String> {
         let instr = self.print();
         if let Some((name, rest)) = instr.trim().split_once(' ') {
-            if !name.is_empty() && (name.chars().nth(0).unwrap() == '%') {
-                return Some(String::from(name));
+            if (name.len() > 0) && (name.chars().nth(0).unwrap() == '%') {
+                return Some(String::from(&name[1..]));
             }
         }
         None
