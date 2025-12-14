@@ -5,8 +5,170 @@ use llvm_sys::core::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
 use llvm_sys::target_machine::*;
+use llvm_sys::LLVMOpcode;
 use std::ffi::{CStr, CString};
 use std::ptr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstructionOpcode {
+    // Terminator Instructions
+    Ret,
+    Br,
+    Switch,
+    IndirectBr,
+    Invoke,
+    Resume,
+    Unreachable,
+    CleanupRet,
+    CatchRet,
+    CatchSwitch,
+    CallBr,
+
+    // Standard Unary Operators
+    FNeg,
+
+    // Standard Binary Operators
+    Add,
+    FAdd,
+    Sub,
+    FSub,
+    Mul,
+    FMul,
+    UDiv,
+    SDiv,
+    FDiv,
+    URem,
+    SRem,
+    FRem,
+
+    // Logical Operators
+    Shl,
+    LShr,
+    AShr,
+    And,
+    Or,
+    Xor,
+
+    // Memory Operators
+    Alloca,
+    Load,
+    Store,
+    GetElementPtr,
+    Fence,
+    AtomicCmpXchg,
+    AtomicRMW,
+
+    // Cast Operators
+    Trunc,
+    ZExt,
+    SExt,
+    FPToUI,
+    FPToSI,
+    UIToFP,
+    SIToFP,
+    FPTrunc,
+    FPExt,
+    PtrToInt,
+    IntToPtr,
+    BitCast,
+    AddrSpaceCast,
+
+    // Other Operators
+    ICmp,
+    FCmp,
+    PHI,
+    Call,
+    Select,
+    UserOp1,
+    UserOp2,
+    VAArg,
+    ExtractElement,
+    InsertElement,
+    ShuffleVector,
+    ExtractValue,
+    InsertValue,
+    LandingPad,
+    CleanupPad,
+    CatchPad,
+    Freeze,
+
+    Unknown,
+}
+
+impl From<LLVMOpcode> for InstructionOpcode {
+    fn from(opcode: LLVMOpcode) -> Self {
+        match opcode {
+            LLVMOpcode::LLVMRet => InstructionOpcode::Ret,
+            LLVMOpcode::LLVMBr => InstructionOpcode::Br,
+            LLVMOpcode::LLVMSwitch => InstructionOpcode::Switch,
+            LLVMOpcode::LLVMIndirectBr => InstructionOpcode::IndirectBr,
+            LLVMOpcode::LLVMInvoke => InstructionOpcode::Invoke,
+            LLVMOpcode::LLVMUnreachable => InstructionOpcode::Unreachable,
+            LLVMOpcode::LLVMCallBr => InstructionOpcode::CallBr,
+            LLVMOpcode::LLVMFNeg => InstructionOpcode::FNeg,
+            LLVMOpcode::LLVMAdd => InstructionOpcode::Add,
+            LLVMOpcode::LLVMFAdd => InstructionOpcode::FAdd,
+            LLVMOpcode::LLVMSub => InstructionOpcode::Sub,
+            LLVMOpcode::LLVMFSub => InstructionOpcode::FSub,
+            LLVMOpcode::LLVMMul => InstructionOpcode::Mul,
+            LLVMOpcode::LLVMFMul => InstructionOpcode::FMul,
+            LLVMOpcode::LLVMUDiv => InstructionOpcode::UDiv,
+            LLVMOpcode::LLVMSDiv => InstructionOpcode::SDiv,
+            LLVMOpcode::LLVMFDiv => InstructionOpcode::FDiv,
+            LLVMOpcode::LLVMURem => InstructionOpcode::URem,
+            LLVMOpcode::LLVMSRem => InstructionOpcode::SRem,
+            LLVMOpcode::LLVMFRem => InstructionOpcode::FRem,
+            LLVMOpcode::LLVMShl => InstructionOpcode::Shl,
+            LLVMOpcode::LLVMLShr => InstructionOpcode::LShr,
+            LLVMOpcode::LLVMAShr => InstructionOpcode::AShr,
+            LLVMOpcode::LLVMAnd => InstructionOpcode::And,
+            LLVMOpcode::LLVMOr => InstructionOpcode::Or,
+            LLVMOpcode::LLVMXor => InstructionOpcode::Xor,
+            LLVMOpcode::LLVMAlloca => InstructionOpcode::Alloca,
+            LLVMOpcode::LLVMLoad => InstructionOpcode::Load,
+            LLVMOpcode::LLVMStore => InstructionOpcode::Store,
+            LLVMOpcode::LLVMGetElementPtr => InstructionOpcode::GetElementPtr,
+            LLVMOpcode::LLVMTrunc => InstructionOpcode::Trunc,
+            LLVMOpcode::LLVMZExt => InstructionOpcode::ZExt,
+            LLVMOpcode::LLVMSExt => InstructionOpcode::SExt,
+            LLVMOpcode::LLVMFPToUI => InstructionOpcode::FPToUI,
+            LLVMOpcode::LLVMFPToSI => InstructionOpcode::FPToSI,
+            LLVMOpcode::LLVMUIToFP => InstructionOpcode::UIToFP,
+            LLVMOpcode::LLVMSIToFP => InstructionOpcode::SIToFP,
+            LLVMOpcode::LLVMFPTrunc => InstructionOpcode::FPTrunc,
+            LLVMOpcode::LLVMFPExt => InstructionOpcode::FPExt,
+            LLVMOpcode::LLVMPtrToInt => InstructionOpcode::PtrToInt,
+            LLVMOpcode::LLVMIntToPtr => InstructionOpcode::IntToPtr,
+            LLVMOpcode::LLVMBitCast => InstructionOpcode::BitCast,
+            LLVMOpcode::LLVMAddrSpaceCast => InstructionOpcode::AddrSpaceCast,
+            LLVMOpcode::LLVMICmp => InstructionOpcode::ICmp,
+            LLVMOpcode::LLVMFCmp => InstructionOpcode::FCmp,
+            LLVMOpcode::LLVMPHI => InstructionOpcode::PHI,
+            LLVMOpcode::LLVMCall => InstructionOpcode::Call,
+            LLVMOpcode::LLVMSelect => InstructionOpcode::Select,
+            LLVMOpcode::LLVMUserOp1 => InstructionOpcode::UserOp1,
+            LLVMOpcode::LLVMUserOp2 => InstructionOpcode::UserOp2,
+            LLVMOpcode::LLVMVAArg => InstructionOpcode::VAArg,
+            LLVMOpcode::LLVMExtractElement => InstructionOpcode::ExtractElement,
+            LLVMOpcode::LLVMInsertElement => InstructionOpcode::InsertElement,
+            LLVMOpcode::LLVMShuffleVector => InstructionOpcode::ShuffleVector,
+            LLVMOpcode::LLVMExtractValue => InstructionOpcode::ExtractValue,
+            LLVMOpcode::LLVMInsertValue => InstructionOpcode::InsertValue,
+            LLVMOpcode::LLVMFreeze => InstructionOpcode::Freeze,
+            LLVMOpcode::LLVMFence => InstructionOpcode::Fence,
+            LLVMOpcode::LLVMAtomicCmpXchg => InstructionOpcode::AtomicCmpXchg,
+            LLVMOpcode::LLVMAtomicRMW => InstructionOpcode::AtomicRMW,
+            LLVMOpcode::LLVMResume => InstructionOpcode::Resume,
+            LLVMOpcode::LLVMLandingPad => InstructionOpcode::LandingPad,
+            LLVMOpcode::LLVMCleanupRet => InstructionOpcode::CleanupRet,
+            LLVMOpcode::LLVMCatchRet => InstructionOpcode::CatchRet,
+            LLVMOpcode::LLVMCatchPad => InstructionOpcode::CatchPad,
+            LLVMOpcode::LLVMCleanupPad => InstructionOpcode::CleanupPad,
+            LLVMOpcode::LLVMCatchSwitch => InstructionOpcode::CatchSwitch,
+            _ => InstructionOpcode::Unknown,
+        }
+    }
+}
 
 pub fn initialize_target() {
     unsafe {
@@ -241,12 +403,19 @@ impl Instruction {
         }
     }
 
-    pub fn get_operand(&self) -> String {
+    pub fn get_opcode(&self) -> InstructionOpcode {
         unsafe {
             let op = LLVMGetInstructionOpcode(self.0);
-            format!("{:?}", op)
+            InstructionOpcode::from(op)
         }
     }
+
+    //pub fn get_operand(&self) -> String {
+    //unsafe {
+    //let op = LLVMGetInstructionOpcode(self.0);
+    //format!("{:?}", op)
+    //}
+    //}
     pub fn is_branch_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsABranchInst(self.0);
@@ -259,6 +428,16 @@ impl Instruction {
                 }
             }
             false
+        }
+    }
+
+    pub fn get_ret_type(&self) -> Option<Type> {
+        unsafe {
+            let type_ref = LLVMTypeOf(self.0);
+            if type_ref.is_null() {
+                return None;
+            }
+            Some(Type(type_ref))
         }
     }
 
