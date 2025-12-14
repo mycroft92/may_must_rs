@@ -1,2 +1,2 @@
-
-short may_assert (int);
+#include <stdbool.h>
+void may_assert (bool);
