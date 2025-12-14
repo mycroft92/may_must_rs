@@ -330,7 +330,7 @@ where
     // `I`, from a nested token tree. This function serves that purpose.
     M: Fn(SimpleSpan, &'tokens [Spanned<Token<'src>>]) -> I + Clone + 'src,
 {
-    let ident = select! { Token::FIdent(ident) => ident }.labelled("identifier");
+    let ident = select! { Token::FIdent(ident) => ident }.labelled("function identifier");
     //just(Token::Ident(_))
     ident
         //.map_with(|x, e| (x, e.span()))
