@@ -205,7 +205,10 @@ fn lexer<'src>(
     recursive(|token| {
         choice((
             // Keywords
-            just('%').then(text::ident()).to_slice().map(Token::Ident),
+            just('%')
+                .then(text::ident().or(text::int(10)).repeated().at_least(1))
+                .to_slice()
+                .map(Token::Ident),
             text::ident().map(Token::FIdent),
             // Operators
             operator("=="),

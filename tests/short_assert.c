@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <assert.h>
+#include "local_assert.h"
 
 int main() {
     int sum = 0;
@@ -11,7 +12,7 @@ int main() {
     }
     
     // Assert that the sum equals the expected formula: n*(n+1)/2
-    assert(sum == n * (n + 1) / 2);
+    may_assert(sum == n * (n + 1) / 2);
     
     printf("Sum of 1 to %d is %d\n", n, sum);
     printf("Assertion passed!\n");

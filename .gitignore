@@ -9,3 +9,4 @@ Cargo.lock
 graph_dot/
 *.png
 .DS_Store
+*.pch
