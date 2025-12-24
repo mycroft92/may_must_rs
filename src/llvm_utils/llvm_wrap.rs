@@ -470,6 +470,35 @@ impl Instruction {
         }
     }
 
+    pub fn get_called_function(&self) -> Option<String> {
+        if self.get_opcode() != InstructionOpcode::Call {
+            return None;
+        }
+        unsafe {
+            let val = LLVMGetCalledValue(self.0);
+            let name = LLVMGetValueName(val);
+            let name_str = CStr::from_ptr(name).to_string_lossy();
+            return Some(String::from(name_str));
+        }
+    }
+
+    pub fn get_call_args(&self) -> Vec<Instruction> {
+        if self.get_opcode() != InstructionOpcode::Call {
+            return vec![];
+        }
+        unsafe {
+            let num_args = LLVMGetNumArgOperands(self.0);
+            let mut args = Vec::with_capacity(num_args as usize);
+            for i in 0..num_args {
+                let arg = LLVMGetArgOperand(self.0, i);
+                if !arg.is_null() {
+                    args.push(Instruction(arg));
+                }
+            }
+            args
+        }
+    }
+
     pub fn get_successors(&self) -> Vec<Instruction> {
         unsafe {
             if !self.is_terminator_instruction() {

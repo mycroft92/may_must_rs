@@ -22,7 +22,10 @@ pub struct FunctionGraph {
     pub start: Option<Instruction>,
     pub end: Vec<Instruction>,
     pub vars: HashMap<String, Instruction>,
+    pub asserts: Vec<Instruction>,
 }
+
+static IGNORE_LIST: &[&'static str] = &["printf"];
 
 impl<'a> Labeller<'a, Instruction, (Instruction, Instruction)> for FunctionGraph {
     fn graph_id(&'a self) -> dot::Id<'a> {
@@ -78,6 +81,7 @@ impl FunctionGraph {
             end: vec![],
             vertices: vec![],
             vars: HashMap::new(),
+            asserts: vec![],
         };
 
         let bbs = function.get_all_basic_blocks();
@@ -92,6 +96,23 @@ impl FunctionGraph {
             }
             for inst in instrs {
                 let var_name = inst.get_assignment_var();
+                match inst.get_called_function() {
+                    Some(x) => {
+                        for &name in IGNORE_LIST {
+                            if name == x {
+                                continue;
+                            }
+                        }
+                        // Time to make the asserts
+                        if x == "may_assert" {
+                            res.asserts.push(*inst.get_call_args().get(0).unwrap());
+                            continue;
+                        }
+
+                        println!("Function call to: {} ", x);
+                    }
+                    None => {}
+                }
                 match var_name {
                     Some(name) => {
                         res.vars.insert(name, inst);
