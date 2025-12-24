@@ -98,10 +98,15 @@ impl FunctionGraph {
                 let var_name = inst.get_assignment_var();
                 match inst.get_called_function() {
                     Some(x) => {
-                        for &name in IGNORE_LIST {
-                            if name == x {
-                                continue;
+                        let mut set_continue = false;
+                        for name in IGNORE_LIST {
+                            if *name == x {
+                                set_continue = true;
+                                break;
                             }
+                        }
+                        if set_continue {
+                            continue;
                         }
                         // Time to make the asserts
                         if x == "may_assert" {
@@ -203,7 +208,11 @@ pub fn generate_program_graph(m: &Module) -> Result<Vec<FunctionGraph>> {
             Ok(graph) => {
                 res.push(graph);
             }
-            Err(ProgError::NoDefinitionForGraph(name)) => warn!("No definition found for {name}"),
+            Err(ProgError::NoDefinitionForGraph(name)) => {
+                if name != "may_assert" {
+                    warn!("No definition found for {name}");
+                }
+            }
             Err(err) => {
                 return Err(err);
             }
