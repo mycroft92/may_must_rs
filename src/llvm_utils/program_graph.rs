@@ -110,11 +110,13 @@ impl FunctionGraph {
                         }
                         // Time to make the asserts
                         if x == "may_assert" {
+                            //unwraap works because may_assert must have one argument, otherwise
+                            //its a compile error
                             res.asserts.push(*inst.get_call_args().get(0).unwrap());
                             continue;
                         }
 
-                        println!("Function call to: {} ", x);
+                        debug!("Function call to: {} ", x);
                     }
                     None => {}
                 }
