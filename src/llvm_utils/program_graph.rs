@@ -25,7 +25,7 @@ pub struct FunctionGraph {
     pub asserts: Vec<Instruction>,
 }
 
-static IGNORE_LIST: &[&'static str] = &["printf"];
+static IGNORE_LIST: &[&'static str] = &["printf", "putchar"];
 
 impl<'a> Labeller<'a, Instruction, (Instruction, Instruction)> for FunctionGraph {
     fn graph_id(&'a self) -> dot::Id<'a> {
