@@ -21,8 +21,8 @@ z3 = "0"
 #path = "name_tester.rs"
 
 [[bin]]
-name = "llvm_try"
-path = "src/main_api.rs"
+name = "main"
+path = "src/main.rs"
 
 [env]
 Z3_LIBRARY_PATH_OVERRIDE = "/opt/homebrew/lib"
