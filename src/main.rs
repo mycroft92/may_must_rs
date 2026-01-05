@@ -8,6 +8,9 @@ use log::*;
 use std::env;
 mod expressions;
 
+mod analysis;
+mod smt;
+
 fn handle(module: Module) {
     match llvm_utils::program_graph::generate_program_graph(&module) {
         Ok(res_) => {
