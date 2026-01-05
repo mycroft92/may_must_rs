@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use z3::ast::{Ast, Bool, Int, Real};
-use z3::{FuncDecl, Model, Solver, Sort, Symbol};
+use z3::{FuncDecl, Model, SatResult, Solver, Sort, Symbol};
 
 pub struct Z3Interface {
     pub solver: Solver,
@@ -170,6 +170,54 @@ impl Z3Interface {
     /// Get real sort
     pub fn real_sort(&self) -> Sort {
         Sort::real()
+    }
+
+    pub fn get_model_values(&mut self) -> Option<HashMap<String, String>> {
+        if self.solver.check() != SatResult::Sat {
+            return None;
+        }
+
+        let model = self.solver.get_model()?;
+        let mut values = HashMap::new();
+
+        // Evaluate all int variables
+        for (name, var) in &self.int_vars {
+            if let Some(value) = model.eval(var, true) {
+                if let Some(int_val) = value.as_i64() {
+                    values.insert(name.clone(), int_val.to_string());
+                } else {
+                    values.insert(name.clone(), value.to_string());
+                }
+            }
+        }
+
+        // Evaluate all bool variables
+        for (name, var) in &self.bool_vars {
+            if let Some(value) = model.eval(var, true) {
+                if let Some(bool_val) = value.as_bool() {
+                    values.insert(name.clone(), bool_val.to_string());
+                } else {
+                    values.insert(name.clone(), value.to_string());
+                }
+            }
+        }
+
+        // Evaluate all real variables
+        for (name, var) in &self.real_vars {
+            if let Some(value) = model.eval(var, true) {
+                if let Some((num, den)) = value.as_rational() {
+                    if den == 1 {
+                        values.insert(name.clone(), num.to_string());
+                    } else {
+                        values.insert(name.clone(), format!("{}/{}", num, den));
+                    }
+                } else {
+                    values.insert(name.clone(), value.to_string());
+                }
+            }
+        }
+
+        Some(values)
     }
 }
 
