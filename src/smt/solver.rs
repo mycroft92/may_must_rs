@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use z3::ast::{Ast, Bool, Int, Real};
-use z3::{FuncDecl, Model, SatResult, Solver, Sort, Symbol};
+use z3::ast::{Array, Ast, Bool, Int, Real, BV};
+use z3::{Model, RecFuncDecl, SatResult, Solver, Sort, Symbol};
 
 pub struct Z3Interface {
     pub solver: Solver,
@@ -8,7 +8,9 @@ pub struct Z3Interface {
     pub int_vars: HashMap<String, Int>,
     pub bool_vars: HashMap<String, Bool>,
     pub real_vars: HashMap<String, Real>,
-    pub uninterpreted_funcs: HashMap<String, FuncDecl>,
+    pub bv_vars: HashMap<String, BV>,
+    pub array_vars: HashMap<String, Array>,
+    pub uninterpreted_funcs: HashMap<String, RecFuncDecl>,
     pub sorts: HashMap<String, Sort>,
 }
 
@@ -21,6 +23,8 @@ impl Z3Interface {
             int_vars: HashMap::new(),
             bool_vars: HashMap::new(),
             real_vars: HashMap::new(),
+            bv_vars: HashMap::new(),
+            array_vars: HashMap::new(),
             uninterpreted_funcs: HashMap::new(),
             sorts: HashMap::new(),
         }
@@ -77,6 +81,42 @@ impl Z3Interface {
         self.real_var(&name)
     }
 
+    /// Get or create a bitvector variable
+    pub fn bv_var(&mut self, name: &str, size: u32) -> BV {
+        let key = format!("{}_{}", name, size);
+        if let Some(var) = self.bv_vars.get(&key) {
+            var.clone()
+        } else {
+            let var = BV::new_const(name, size);
+            self.bv_vars.insert(key, var.clone());
+            var
+        }
+    }
+
+    /// Create a fresh bitvector variable with unique name
+    pub fn fresh_bv_var(&mut self, prefix: &str, size: u32) -> BV {
+        let name = format!("{}_{}", prefix, self.bv_vars.len());
+        self.bv_var(&name, size)
+    }
+
+    /// Get or create an array variable
+    pub fn array_var(&mut self, name: &str, domain: &Sort, range: &Sort) -> Array {
+        let key = format!("{}_{:?}_{:?}", name, domain, range);
+        if let Some(var) = self.array_vars.get(&key) {
+            var.clone()
+        } else {
+            let var = Array::new_const(name, domain, range);
+            self.array_vars.insert(key, var.clone());
+            var
+        }
+    }
+
+    /// Create a fresh array variable with unique name
+    pub fn fresh_array_var(&mut self, prefix: &str, domain: &Sort, range: &Sort) -> Array {
+        let name = format!("{}_{}", prefix, self.array_vars.len());
+        self.array_var(&name, domain, range)
+    }
+
     /// Create an integer constant
     pub fn int_const(&self, value: i64) -> Int {
         Int::from_i64(value)
@@ -89,7 +129,12 @@ impl Z3Interface {
 
     /// Create a real constant from numerator and denominator
     pub fn real_const(&self, num: i32, den: i32) -> Real {
-        Real::from_rational(num.into(), den.into())
+        Real::from_real(num, den)
+    }
+
+    /// Create a bitvector constant
+    pub fn bv_const(&self, value: i64, size: u32) -> BV {
+        BV::from_i64(value, size)
     }
 
     /// Create or get an uninterpreted sort
@@ -97,7 +142,7 @@ impl Z3Interface {
         if let Some(sort) = self.sorts.get(name) {
             sort.clone()
         } else {
-            let sort = Sort::uninterpreted(Symbol::from(name));
+            let sort = Sort::uninterpreted(Symbol::String(name.to_string()));
             self.sorts.insert(name.to_string(), sort.clone());
             sort
         }
@@ -109,9 +154,9 @@ impl Z3Interface {
         name: &str,
         domain: &[&Sort],
         range: &Sort,
-    ) -> &'r FuncDecl {
+    ) -> &'r RecFuncDecl {
         if !self.uninterpreted_funcs.contains_key(name) {
-            let func = FuncDecl::new(name, domain, range);
+            let func = RecFuncDecl::new(name, domain, range);
             self.uninterpreted_funcs.insert(name.to_string(), func);
         }
         self.uninterpreted_funcs.get(name).unwrap()
@@ -172,6 +217,16 @@ impl Z3Interface {
         Sort::real()
     }
 
+    /// Get bitvector sort
+    pub fn bv_sort(&self, size: u32) -> Sort {
+        Sort::bitvector(size)
+    }
+
+    /// Get array sort
+    pub fn array_sort(&self, domain: &Sort, range: &Sort) -> Sort {
+        Sort::array(domain, range)
+    }
+
     pub fn get_model_values(&mut self) -> Option<HashMap<String, String>> {
         if self.solver.check() != SatResult::Sat {
             return None;
@@ -205,7 +260,7 @@ impl Z3Interface {
         // Evaluate all real variables
         for (name, var) in &self.real_vars {
             if let Some(value) = model.eval(var, true) {
-                if let Some((num, den)) = value.as_rational() {
+                if let Some((num, den)) = value.as_real() {
                     if den == 1 {
                         values.insert(name.clone(), num.to_string());
                     } else {
@@ -217,13 +272,21 @@ impl Z3Interface {
             }
         }
 
-        Some(values)
-    }
-}
+        // Evaluate all bitvector variables
+        for (name, var) in &self.bv_vars {
+            if let Some(value) = model.eval(var, true) {
+                values.insert(name.clone(), value.to_string());
+            }
+        }
 
-impl Default for Z3Interface {
-    fn default() -> Self {
-        Self::new()
+        // Evaluate all array variables
+        for (name, var) in &self.array_vars {
+            if let Some(value) = model.eval(var, true) {
+                values.insert(name.clone(), value.to_string());
+            }
+        }
+
+        Some(values)
     }
 }
 
@@ -233,6 +296,7 @@ mod tests {
 
     #[test]
     fn test_basic_usage() {
+        let cfg = z3::Config::new();
         let mut z3 = Z3Interface::new();
 
         let x = z3.int_var("x");
@@ -270,6 +334,34 @@ mod tests {
         let half = z3.real_const(1, 2);
 
         z3.assert(&x.gt(&half));
+
+        assert_eq!(z3.check(), z3::SatResult::Sat);
+    }
+
+    #[test]
+    fn test_bitvectors() {
+        let mut z3 = Z3Interface::new();
+
+        let x = z3.bv_var("x", 8);
+        let y = z3.bv_var("y", 8);
+        let ten = z3.bv_const(10, 8);
+
+        z3.assert(&x.bvadd(&y)._eq(&ten));
+        z3.assert(&x.bvugt(&y));
+
+        assert_eq!(z3.check(), z3::SatResult::Sat);
+    }
+
+    #[test]
+    fn test_arrays() {
+        let mut z3 = Z3Interface::new();
+
+        let int_sort = z3.int_sort();
+        let arr = z3.array_var("arr", &int_sort, &int_sort);
+        let i = z3.int_var("i");
+        let zero = z3.int_const(0);
+
+        z3.assert(&arr.select(&i)._eq(&zero));
 
         assert_eq!(z3.check(), z3::SatResult::Sat);
     }
