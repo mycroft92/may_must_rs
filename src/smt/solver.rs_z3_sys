@@ -1,0 +1,868 @@
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::ptr;
+use z3_sys::*;
+
+/// Safe wrapper around Z3 context and configuration
+pub struct Z3Context {
+    cfg: Z3_config,
+    ctx: Z3_context,
+    variables: HashMap<String, Z3Variable>,
+    functions: HashMap<String, Z3_func_decl>,
+    fresh_counter: usize,
+}
+
+/// Represents different types of Z3 variables
+#[derive(Clone, Copy)]
+pub enum Z3Variable {
+    Int(Z3_ast),
+    Real(Z3_ast),
+    Bool(Z3_ast),
+    BitVec(Z3_ast),
+    Array(Z3_ast),
+}
+
+impl Z3Variable {
+    pub fn as_ast(&self) -> Z3_ast {
+        match self {
+            Z3Variable::Int(ast) => *ast,
+            Z3Variable::Real(ast) => *ast,
+            Z3Variable::Bool(ast) => *ast,
+            Z3Variable::BitVec(ast) => *ast,
+            Z3Variable::Array(ast) => *ast,
+        }
+    }
+}
+
+impl Z3Context {
+    /// Create a new Z3 context with default configuration
+    pub fn new() -> Self {
+        unsafe {
+            let cfg = Z3_mk_config();
+            let ctx = Z3_mk_context(cfg);
+            Z3_inc_ref(ctx, Z3_mk_true(ctx)); // Keep context alive
+
+            Self {
+                cfg,
+                ctx,
+                variables: HashMap::new(),
+                functions: HashMap::new(),
+                fresh_counter: 0,
+            }
+        }
+    }
+
+    /// Get the raw Z3 context (for advanced usage)
+    pub fn raw_context(&self) -> Z3_context {
+        self.ctx
+    }
+
+    /// Generate a fresh name with the given prefix
+    fn fresh_name(&mut self, prefix: &str) -> String {
+        let name = format!("{}_{}", prefix, self.fresh_counter);
+        self.fresh_counter += 1;
+        name
+    }
+
+    /// Create an integer variable with the given name
+    pub fn mk_int_var(&mut self, name: &str) -> Z3Variable {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let symbol = Z3_mk_string_symbol(self.ctx, c_name.as_ptr());
+            let int_sort = Z3_mk_int_sort(self.ctx);
+            let ast = Z3_mk_const(self.ctx, symbol, int_sort);
+            Z3_inc_ref(self.ctx, ast);
+
+            let var = Z3Variable::Int(ast);
+            self.variables.insert(name.to_string(), var);
+            var
+        }
+    }
+
+    /// Create a fresh integer variable with the given prefix
+    pub fn mk_fresh_int_var(&mut self, prefix: &str) -> (String, Z3Variable) {
+        let name = self.fresh_name(prefix);
+        let var = self.mk_int_var(&name);
+        (name, var)
+    }
+
+    /// Create a real variable with the given name
+    pub fn mk_real_var(&mut self, name: &str) -> Z3Variable {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let symbol = Z3_mk_string_symbol(self.ctx, c_name.as_ptr());
+            let real_sort = Z3_mk_real_sort(self.ctx);
+            let ast = Z3_mk_const(self.ctx, symbol, real_sort);
+            Z3_inc_ref(self.ctx, ast);
+
+            let var = Z3Variable::Real(ast);
+            self.variables.insert(name.to_string(), var);
+            var
+        }
+    }
+
+    /// Create a fresh real variable with the given prefix
+    pub fn mk_fresh_real_var(&mut self, prefix: &str) -> (String, Z3Variable) {
+        let name = self.fresh_name(prefix);
+        let var = self.mk_real_var(&name);
+        (name, var)
+    }
+
+    /// Create a boolean variable with the given name
+    pub fn mk_bool_var(&mut self, name: &str) -> Z3Variable {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let symbol = Z3_mk_string_symbol(self.ctx, c_name.as_ptr());
+            let bool_sort = Z3_mk_bool_sort(self.ctx);
+            let ast = Z3_mk_const(self.ctx, symbol, bool_sort);
+            Z3_inc_ref(self.ctx, ast);
+
+            let var = Z3Variable::Bool(ast);
+            self.variables.insert(name.to_string(), var);
+            var
+        }
+    }
+
+    /// Create a fresh boolean variable with the given prefix
+    pub fn mk_fresh_bool_var(&mut self, prefix: &str) -> (String, Z3Variable) {
+        let name = self.fresh_name(prefix);
+        let var = self.mk_bool_var(&name);
+        (name, var)
+    }
+
+    /// Create a bitvector variable with the given name and size
+    pub fn mk_bv_var(&mut self, name: &str, size: u32) -> Z3Variable {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let symbol = Z3_mk_string_symbol(self.ctx, c_name.as_ptr());
+            let bv_sort = Z3_mk_bv_sort(self.ctx, size);
+            let ast = Z3_mk_const(self.ctx, symbol, bv_sort);
+            Z3_inc_ref(self.ctx, ast);
+
+            let var = Z3Variable::BitVec(ast);
+            self.variables.insert(name.to_string(), var);
+            var
+        }
+    }
+
+    /// Create a fresh bitvector variable with the given prefix and size
+    pub fn mk_fresh_bv_var(&mut self, prefix: &str, size: u32) -> (String, Z3Variable) {
+        let name = self.fresh_name(prefix);
+        let var = self.mk_bv_var(&name, size);
+        (name, var)
+    }
+
+    /// Create an array variable (index_sort -> value_sort)
+    pub fn mk_array_var(
+        &mut self,
+        name: &str,
+        index_sort: Z3_sort,
+        value_sort: Z3_sort,
+    ) -> Z3Variable {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let symbol = Z3_mk_string_symbol(self.ctx, c_name.as_ptr());
+            let array_sort = Z3_mk_array_sort(self.ctx, index_sort, value_sort);
+            let ast = Z3_mk_const(self.ctx, symbol, array_sort);
+            Z3_inc_ref(self.ctx, ast);
+
+            let var = Z3Variable::Array(ast);
+            self.variables.insert(name.to_string(), var);
+            var
+        }
+    }
+
+    /// Create a fresh array variable
+    pub fn mk_fresh_array_var(
+        &mut self,
+        prefix: &str,
+        index_sort: Z3_sort,
+        value_sort: Z3_sort,
+    ) -> (String, Z3Variable) {
+        let name = self.fresh_name(prefix);
+        let var = self.mk_array_var(&name, index_sort, value_sort);
+        (name, var)
+    }
+
+    /// Get integer sort
+    pub fn int_sort(&self) -> Z3_sort {
+        unsafe { Z3_mk_int_sort(self.ctx) }
+    }
+
+    /// Get real sort
+    pub fn real_sort(&self) -> Z3_sort {
+        unsafe { Z3_mk_real_sort(self.ctx) }
+    }
+
+    /// Get boolean sort
+    pub fn bool_sort(&self) -> Z3_sort {
+        unsafe { Z3_mk_bool_sort(self.ctx) }
+    }
+
+    /// Get bitvector sort
+    pub fn bv_sort(&self, size: u32) -> Z3_sort {
+        unsafe { Z3_mk_bv_sort(self.ctx, size) }
+    }
+
+    /// Create an uninterpreted function
+    pub fn mk_func_decl(&mut self, name: &str, domain: &[Z3_sort], range: Z3_sort) -> Z3_func_decl {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let symbol = Z3_mk_string_symbol(self.ctx, c_name.as_ptr());
+            let func_decl = Z3_mk_func_decl(
+                self.ctx,
+                symbol,
+                domain.len() as u32,
+                domain.as_ptr(),
+                range,
+            );
+            Z3_inc_ref(self.ctx, Z3_func_decl_to_ast(self.ctx, func_decl));
+
+            self.functions.insert(name.to_string(), func_decl);
+            func_decl
+        }
+    }
+
+    /// Create a recursive function declaration
+    pub fn mk_rec_func_decl(
+        &mut self,
+        name: &str,
+        domain: &[Z3_sort],
+        range: Z3_sort,
+    ) -> Z3_func_decl {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let symbol = Z3_mk_string_symbol(self.ctx, c_name.as_ptr());
+            let func_decl = Z3_mk_rec_func_decl(
+                self.ctx,
+                symbol,
+                domain.len() as u32,
+                domain.as_ptr(),
+                range,
+            );
+            Z3_inc_ref(self.ctx, Z3_func_decl_to_ast(self.ctx, func_decl));
+
+            self.functions.insert(name.to_string(), func_decl);
+            func_decl
+        }
+    }
+
+    /// Add a recursive function definition
+    pub fn add_rec_def(&self, func_decl: Z3_func_decl, args: &[Z3_ast], body: Z3_ast) {
+        unsafe {
+            Z3_add_rec_def(self.ctx, func_decl, args.len() as u32, args.as_ptr(), body);
+        }
+    }
+
+    /// Apply a function to arguments
+    pub fn mk_app(&self, func_decl: Z3_func_decl, args: &[Z3_ast]) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_app(self.ctx, func_decl, args.len() as u32, args.as_ptr());
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create a forall quantifier
+    //pub fn mk_forall(&self, bound_vars: &[Z3_ast], body: Z3_ast) -> Z3_ast {
+    //unsafe {
+    //let num_bound = bound_vars.len() as u32;
+    //let weight = 1;
+    //let num_patterns = 0;
+    //let patterns: *const Z3_pattern = ptr::null();
+    //let num_no_patterns = 0;
+    //let no_patterns: *const Z3_ast = ptr::null();
+
+    //let ast = Z3_mk_forall_const(
+    //self.ctx,
+    //weight,
+    //num_bound,
+    //bound_vars.as_ptr(),
+    //num_patterns,
+    //patterns,
+    //body,
+    //);
+    //Z3_inc_ref(self.ctx, ast);
+    //ast
+    //}
+    //}
+
+    ///// Create an exists quantifier
+    //pub fn mk_exists(&self, bound_vars: &[Z3_ast], body: Z3_ast) -> Z3_ast {
+    //unsafe {
+    //let num_bound = bound_vars.len() as u32;
+    //let weight = 1;
+    //let num_patterns = 0;
+    //let patterns: *const Z3_pattern = ptr::null();
+    //let num_no_patterns = 0;
+    //let no_patterns: *const Z3_ast = ptr::null();
+
+    //let ast = Z3_mk_exists_const(
+    //self.ctx,
+    //weight,
+    //num_bound,
+    //bound_vars.as_ptr(),
+    //num_patterns,
+    //patterns,
+    //body,
+    //);
+    //Z3_inc_ref(self.ctx, ast);
+    //ast
+    //}
+    //}
+
+    /// Create logical AND of multiple ASTs
+    pub fn mk_and(&self, args: &[Z3_ast]) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_and(self.ctx, args.len() as u32, args.as_ptr());
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create logical OR of multiple ASTs
+    pub fn mk_or(&self, args: &[Z3_ast]) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_or(self.ctx, args.len() as u32, args.as_ptr());
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create logical NOT
+    pub fn mk_not(&self, arg: Z3_ast) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_not(self.ctx, arg);
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create logical IMPLIES
+    pub fn mk_implies(&self, lhs: Z3_ast, rhs: Z3_ast) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_implies(self.ctx, lhs, rhs);
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create logical IFF (if and only if)
+    pub fn mk_iff(&self, lhs: Z3_ast, rhs: Z3_ast) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_iff(self.ctx, lhs, rhs);
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create logical XOR
+    pub fn mk_xor(&self, lhs: Z3_ast, rhs: Z3_ast) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_xor(self.ctx, lhs, rhs);
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create equality
+    pub fn mk_eq(&self, lhs: Z3_ast, rhs: Z3_ast) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_eq(self.ctx, lhs, rhs);
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create distinct constraint (all arguments are pairwise different)
+    pub fn mk_distinct(&self, args: &[Z3_ast]) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_distinct(self.ctx, args.len() as u32, args.as_ptr());
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create true constant
+    pub fn mk_true(&self) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_true(self.ctx);
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Create false constant
+    pub fn mk_false(&self) -> Z3_ast {
+        unsafe {
+            let ast = Z3_mk_false(self.ctx);
+            Z3_inc_ref(self.ctx, ast);
+            ast
+        }
+    }
+
+    /// Get a variable by name
+    pub fn get_var(&self, name: &str) -> Option<Z3Variable> {
+        self.variables.get(name).copied()
+    }
+
+    /// Get a function by name
+    pub fn get_func(&self, name: &str) -> Option<Z3_func_decl> {
+        self.functions.get(name).copied()
+    }
+
+    /// Get all variable names
+    pub fn var_names(&self) -> Vec<String> {
+        self.variables.keys().cloned().collect()
+    }
+}
+
+impl Drop for Z3Context {
+    fn drop(&mut self) {
+        unsafe {
+            // Decrement references for all variables
+            for var in self.variables.values() {
+                Z3_dec_ref(self.ctx, var.as_ast());
+            }
+
+            // Decrement references for all functions
+            for func in self.functions.values() {
+                Z3_dec_ref(self.ctx, Z3_func_decl_to_ast(self.ctx, *func));
+            }
+
+            Z3_dec_ref(self.ctx, Z3_mk_true(self.ctx));
+            Z3_del_context(self.ctx);
+            Z3_del_config(self.cfg);
+        }
+    }
+}
+
+/// Safe wrapper around Z3 FixedPoint solver
+pub struct Z3FixedPoint {
+    ctx: Z3_context,
+    fp: Z3_fixedpoint,
+}
+
+impl Z3FixedPoint {
+    /// Create a new FixedPoint solver with the given context
+    pub fn new(z3_ctx: &Z3Context) -> Self {
+        unsafe {
+            let ctx = z3_ctx.raw_context();
+            let fp = Z3_mk_fixedpoint(ctx);
+            Z3_fixedpoint_inc_ref(ctx, fp);
+
+            Self { ctx, fp }
+        }
+    }
+
+    /// Get the raw fixedpoint solver
+    pub fn raw_solver(&self) -> Z3_fixedpoint {
+        self.fp
+    }
+
+    /// Register a relation (predicate)
+    pub fn register_relation(&self, func_decl: Z3_func_decl) {
+        unsafe {
+            Z3_fixedpoint_register_relation(self.ctx, self.fp, func_decl);
+        }
+    }
+
+    /// Add a rule to the fixedpoint solver
+    pub fn add_rule(&self, rule: Z3_ast, name: Option<&str>) {
+        unsafe {
+            let symbol = if let Some(n) = name {
+                let c_name = CString::new(n).unwrap();
+                Z3_mk_string_symbol(self.ctx, c_name.as_ptr())
+            } else {
+                ptr::null_mut()
+            };
+            Z3_fixedpoint_add_rule(self.ctx, self.fp, rule, symbol);
+        }
+    }
+
+    /// Query the fixedpoint solver
+    pub fn query(&self, query: Z3_ast) -> Z3_lbool {
+        unsafe { Z3_fixedpoint_query(self.ctx, self.fp, query) }
+    }
+
+    /// Get the answer as a string
+    pub fn get_answer(&self) -> String {
+        unsafe {
+            let answer_ast = Z3_fixedpoint_get_answer(self.ctx, self.fp);
+            let answer_str = Z3_ast_to_string(self.ctx, answer_ast);
+            CStr::from_ptr(answer_str).to_string_lossy().into_owned()
+        }
+    }
+}
+
+impl Drop for Z3FixedPoint {
+    fn drop(&mut self) {
+        unsafe {
+            Z3_fixedpoint_dec_ref(self.ctx, self.fp);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_int_vars() {
+        let mut ctx = Z3Context::new();
+
+        // Create named variable
+        let x = ctx.mk_int_var("x");
+        assert!(ctx.get_var("x").is_some());
+
+        // Create fresh variable
+        let (name, _y) = ctx.mk_fresh_int_var("temp");
+        assert!(name.starts_with("temp_"));
+        assert!(ctx.get_var(&name).is_some());
+    }
+
+    #[test]
+    fn test_create_real_vars() {
+        let mut ctx = Z3Context::new();
+
+        let r = ctx.mk_real_var("r");
+        assert!(ctx.get_var("r").is_some());
+
+        let (name, _s) = ctx.mk_fresh_real_var("real");
+        assert!(name.starts_with("real_"));
+    }
+
+    #[test]
+    fn test_create_bool_vars() {
+        let mut ctx = Z3Context::new();
+
+        let b = ctx.mk_bool_var("b");
+        assert!(ctx.get_var("b").is_some());
+
+        let (name, _c) = ctx.mk_fresh_bool_var("flag");
+        assert!(name.starts_with("flag_"));
+    }
+
+    #[test]
+    fn test_create_bv_vars() {
+        let mut ctx = Z3Context::new();
+
+        let bv = ctx.mk_bv_var("bv8", 8);
+        assert!(ctx.get_var("bv8").is_some());
+
+        let (name, _bv32) = ctx.mk_fresh_bv_var("bits", 32);
+        assert!(name.starts_with("bits_"));
+    }
+
+    #[test]
+    fn test_create_array_vars() {
+        let mut ctx = Z3Context::new();
+
+        let int_sort = ctx.int_sort();
+        let arr = ctx.mk_array_var("arr", int_sort, int_sort);
+        assert!(ctx.get_var("arr").is_some());
+
+        let (name, _arr2) = ctx.mk_fresh_array_var("array", int_sort, int_sort);
+        assert!(name.starts_with("array_"));
+    }
+
+    #[test]
+    fn test_create_uninterpreted_function() {
+        let mut ctx = Z3Context::new();
+
+        let int_sort = ctx.int_sort();
+        let domain = vec![int_sort, int_sort];
+        let func = ctx.mk_func_decl("add", &domain, int_sort);
+
+        assert!(ctx.get_func("add").is_some());
+    }
+
+    #[test]
+    fn test_create_recursive_function() {
+        let mut ctx = Z3Context::new();
+
+        let int_sort = ctx.int_sort();
+        let domain = vec![int_sort];
+        let func = ctx.mk_rec_func_decl("factorial", &domain, int_sort);
+
+        assert!(ctx.get_func("factorial").is_some());
+    }
+
+    #[test]
+    fn test_logical_operations() {
+        let mut ctx = Z3Context::new();
+
+        let p = ctx.mk_bool_var("p");
+        let q = ctx.mk_bool_var("q");
+
+        let p_ast = p.as_ast();
+        let q_ast = q.as_ast();
+
+        // Test AND
+        let _and_expr = ctx.mk_and(&[p_ast, q_ast]);
+
+        // Test OR
+        let _or_expr = ctx.mk_or(&[p_ast, q_ast]);
+
+        // Test NOT
+        let _not_expr = ctx.mk_not(p_ast);
+
+        // Test IMPLIES
+        let _implies_expr = ctx.mk_implies(p_ast, q_ast);
+
+        // Test IFF
+        let _iff_expr = ctx.mk_iff(p_ast, q_ast);
+
+        // Test XOR
+        let _xor_expr = ctx.mk_xor(p_ast, q_ast);
+    }
+
+    //#[test]
+    //fn test_quantifiers() {
+    //let mut ctx = Z3Context::new();
+
+    //let x = ctx.mk_int_var("x");
+    //let y = ctx.mk_int_var("y");
+
+    //let x_ast = x.as_ast();
+    //let y_ast = y.as_ast();
+
+    //let body = ctx.mk_eq(x_ast, y_ast);
+
+    //// Test forall
+    //let _forall_expr = ctx.mk_forall(&[x_ast], body);
+
+    //// Test exists
+    //let _exists_expr = ctx.mk_exists(&[x_ast], body);
+    //}
+
+    #[test]
+    fn test_variable_storage() {
+        let mut ctx = Z3Context::new();
+
+        ctx.mk_int_var("x");
+        ctx.mk_real_var("y");
+        ctx.mk_bool_var("z");
+
+        let names = ctx.var_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"x".to_string()));
+        assert!(names.contains(&"y".to_string()));
+        assert!(names.contains(&"z".to_string()));
+    }
+
+    #[test]
+    fn test_fixedpoint_solver() {
+        let mut ctx = Z3Context::new();
+        let fp = Z3FixedPoint::new(&ctx);
+
+        // Create a simple relation: edge(x, y)
+        let int_sort = ctx.int_sort();
+        let domain = vec![int_sort, int_sort];
+        let edge = ctx.mk_func_decl("edge", &domain, ctx.bool_sort());
+
+        fp.register_relation(edge);
+
+        // This test just verifies the API works without crashing
+        // A full test would require building rules and queries
+    }
+
+    #[test]
+    fn test_multiple_contexts() {
+        let mut ctx1 = Z3Context::new();
+        let mut ctx2 = Z3Context::new();
+
+        ctx1.mk_int_var("x");
+        ctx2.mk_int_var("x");
+
+        assert!(ctx1.get_var("x").is_some());
+        assert!(ctx2.get_var("x").is_some());
+    }
+
+    #[test]
+    fn test_fresh_name_generation() {
+        let mut ctx = Z3Context::new();
+
+        let (name1, _) = ctx.mk_fresh_int_var("var");
+        let (name2, _) = ctx.mk_fresh_int_var("var");
+        let (name3, _) = ctx.mk_fresh_int_var("var");
+
+        assert_eq!(name1, "var_0");
+        assert_eq!(name2, "var_1");
+        assert_eq!(name3, "var_2");
+    }
+
+    #[test]
+    fn test_constants() {
+        let ctx = Z3Context::new();
+
+        let _true_ast = ctx.mk_true();
+        let _false_ast = ctx.mk_false();
+    }
+
+    #[test]
+    fn test_recursive_function_definition() {
+        let mut ctx = Z3Context::new();
+
+        // Create recursive factorial function: factorial(n) = if n <= 0 then 1 else n * factorial(n-1)
+        let int_sort = ctx.int_sort();
+        let domain = vec![int_sort];
+        let factorial = ctx.mk_rec_func_decl("factorial", &domain, int_sort);
+
+        // Create the parameter variable
+        let n = ctx.mk_int_var("n");
+        let n_ast = n.as_ast();
+
+        // Create constants
+        let zero = unsafe {
+            let ast = Z3_mk_int(ctx.raw_context(), 0, int_sort);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        let one = unsafe {
+            let ast = Z3_mk_int(ctx.raw_context(), 1, int_sort);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create n <= 0
+        let n_le_zero = unsafe {
+            let ast = Z3_mk_le(ctx.raw_context(), n_ast, zero);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create n - 1
+        let n_minus_1 = unsafe {
+            let ast = Z3_mk_sub(ctx.raw_context(), 2, [n_ast, one].as_ptr());
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create factorial(n-1)
+        let factorial_n_minus_1 = ctx.mk_app(factorial, &[n_minus_1]);
+
+        // Create n * factorial(n-1)
+        let n_times_factorial = unsafe {
+            let ast = Z3_mk_mul(ctx.raw_context(), 2, [n_ast, factorial_n_minus_1].as_ptr());
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create if-then-else: if n <= 0 then 1 else n * factorial(n-1)
+        let body = unsafe {
+            let ast = Z3_mk_ite(ctx.raw_context(), n_le_zero, one, n_times_factorial);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Add the recursive definition
+        ctx.add_rec_def(factorial, &[n_ast], body);
+
+        // Verify the function was created
+        assert!(ctx.get_func("factorial").is_some());
+
+        // Clean up
+        unsafe {
+            Z3_dec_ref(ctx.raw_context(), zero);
+            Z3_dec_ref(ctx.raw_context(), one);
+            Z3_dec_ref(ctx.raw_context(), n_le_zero);
+            Z3_dec_ref(ctx.raw_context(), n_minus_1);
+            Z3_dec_ref(ctx.raw_context(), factorial_n_minus_1);
+            Z3_dec_ref(ctx.raw_context(), n_times_factorial);
+            Z3_dec_ref(ctx.raw_context(), body);
+        }
+    }
+
+    #[test]
+    fn test_recursive_fibonacci() {
+        let mut ctx = Z3Context::new();
+
+        // Create recursive fibonacci function: fib(n) = if n <= 1 then n else fib(n-1) + fib(n-2)
+        let int_sort = ctx.int_sort();
+        let domain = vec![int_sort];
+        let fib = ctx.mk_rec_func_decl("fib", &domain, int_sort);
+
+        // Create the parameter variable
+        let n = ctx.mk_int_var("n");
+        let n_ast = n.as_ast();
+
+        // Create constants
+        let one = unsafe {
+            let ast = Z3_mk_int(ctx.raw_context(), 1, int_sort);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        let two = unsafe {
+            let ast = Z3_mk_int(ctx.raw_context(), 2, int_sort);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create n <= 1
+        let n_le_one = unsafe {
+            let ast = Z3_mk_le(ctx.raw_context(), n_ast, one);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create n - 1
+        let n_minus_1 = unsafe {
+            let ast = Z3_mk_sub(ctx.raw_context(), 2, [n_ast, one].as_ptr());
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create n - 2
+        let n_minus_2 = unsafe {
+            let ast = Z3_mk_sub(ctx.raw_context(), 2, [n_ast, two].as_ptr());
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create fib(n-1)
+        let fib_n_minus_1 = ctx.mk_app(fib, &[n_minus_1]);
+
+        // Create fib(n-2)
+        let fib_n_minus_2 = ctx.mk_app(fib, &[n_minus_2]);
+
+        // Create fib(n-1) + fib(n-2)
+        let fib_sum = unsafe {
+            let ast = Z3_mk_add(
+                ctx.raw_context(),
+                2,
+                [fib_n_minus_1, fib_n_minus_2].as_ptr(),
+            );
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Create if-then-else: if n <= 1 then n else fib(n-1) + fib(n-2)
+        let body = unsafe {
+            let ast = Z3_mk_ite(ctx.raw_context(), n_le_one, n_ast, fib_sum);
+            Z3_inc_ref(ctx.raw_context(), ast);
+            ast
+        };
+
+        // Add the recursive definition
+        ctx.add_rec_def(fib, &[n_ast], body);
+
+        // Verify the function was created
+        assert!(ctx.get_func("fib").is_some());
+
+        // Clean up
+        unsafe {
+            Z3_dec_ref(ctx.raw_context(), one);
+            Z3_dec_ref(ctx.raw_context(), two);
+            Z3_dec_ref(ctx.raw_context(), n_le_one);
+            Z3_dec_ref(ctx.raw_context(), n_minus_1);
+            Z3_dec_ref(ctx.raw_context(), n_minus_2);
+            Z3_dec_ref(ctx.raw_context(), fib_n_minus_1);
+            Z3_dec_ref(ctx.raw_context(), fib_n_minus_2);
+            Z3_dec_ref(ctx.raw_context(), fib_sum);
+            Z3_dec_ref(ctx.raw_context(), body);
+        }
+    }
+}
