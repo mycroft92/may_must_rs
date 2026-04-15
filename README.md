@@ -80,39 +80,47 @@ to a violation.
 `UNKNOWN`: the current engine could not decide, usually because an assertion
 argument stayed symbolic or an execution bound was reached.
 
-## What Was Wrong Before
+## Today's Session Report
 
-The original codebase had useful LLVM wrappers and a graph dumper, but the
-actual analysis modules were mostly empty.
+Today's session made the current SMASH-style prototype easier to reproduce,
+test, and resume.
 
-The CFG builder had a correctness bug: it carried `prev` across basic-block
-boundaries. That added fallthrough edges from a terminator in one block to the
-first instruction of the next block in module order, even when LLVM control
-flow did not allow that edge. Reachability analysis over that graph would be
-unsound because it could explore paths that do not exist.
+Repository workflow updates:
 
-The builder also skipped `may_assert` calls and stored only the assertion
-argument. That was enough to remember that an assertion existed, but not enough
-to evaluate it at the correct program point with the correct symbolic state.
+- added `tests/build_ir.sh` to compile C inputs into human-readable `.ll` files
+  and analyzer-ready `.bc` files;
+- replaced the old ad hoc `tests/Makefile` targets with `ir`, `smoke`, and
+  `clean`;
+- added `tests/out/` to `.gitignore` so generated LLVM artifacts stay
+  reproducible instead of checked in;
+- added `tests/indirect_branch_example.c` so the indirect-branch example has a
+  corresponding C source in `tests/`;
+- added `TASKVIEW.md` as the resume document for the next implementation
+  session against the SMASH paper.
 
-The LLVM wrapper methods for branch, return, and terminator checks treated the
-result of `LLVMIsA*` as a constant integer. These APIs return a nullable LLVM
-value reference. The correct test is only whether the pointer is null.
+Current smoke coverage:
 
-While verifying this implementation, one more LLVM API issue surfaced: calling
-`LLVMGetCondition` on an unconditional branch exits abnormally. The analyzer now
-checks the branch successor count first and asks LLVM for a condition only on
-conditional branches.
+- `tests/smash_must.c` is the smallest current must-summary example;
+- `tests/smash_smoke.sh` builds that C file, runs the analyzer, and checks for:
 
-LLVM unnamed temporaries such as `%23` do not always have a value name from
-`LLVMGetValueName2`. The symbolic evaluator now falls back to parsing the
-assignment name from the printed instruction, so operands that refer to unnamed
-instructions can still resolve to values already computed in the symbolic
-state.
+```text
+Query <main: true => violate:any_may_assert>
+Result: BUG reachable (must summary)
+Summaries: 1 must, 0 not-may
+```
 
-## What Was Corrected
+Run it with:
 
-`src/llvm_utils/program_graph.rs` now builds instruction-level CFGs per basic
+```sh
+make -C tests smoke
+```
+
+Use `CARGO_FLAGS=--offline make -C tests smoke` when the local dependency cache
+is available but the network is not.
+
+## What Is Implemented
+
+`src/llvm_utils/program_graph.rs` builds instruction-level CFGs per basic
 block:
 
 - adds every instruction as a vertex;
@@ -120,10 +128,9 @@ block:
 - records `may_assert` call instructions as assertion sites;
 - adds sequential edges only within a basic block;
 - adds terminator-to-successor edges using LLVM successor information;
-- reports DOT write errors instead of ignoring them.
+- records DOT write errors.
 
-`src/llvm_utils/llvm_wrap.rs` now exposes the LLVM details needed by the
-analyzer:
+`src/llvm_utils/llvm_wrap.rs` exposes the LLVM details needed by the analyzer:
 
 - function parameters;
 - instruction and value names;
@@ -131,9 +138,9 @@ analyzer:
 - branch conditions;
 - integer constants;
 - integer comparison predicates;
-- corrected branch, return, and terminator tests.
+- branch, return, and terminator checks.
 
-`src/analysis/domain.rs` now defines the paper-level analysis objects:
+`src/analysis/domain.rs` defines the paper-level analysis objects:
 
 - `Predicate`: lightweight pre/postcondition representation;
 - `Query`: a reachability query `<pre ?=> function post>`;
@@ -155,7 +162,20 @@ analyzer:
 - reports `UNKNOWN` instead of pretending safety when bounds or symbolic gaps
   prevent a decision.
 
-`src/main.rs` now invokes the analyzer instead of only dumping graphs:
+`src/analysis/state.rs` and `src/smt/solver.rs` provide the next-stage SMT
+building blocks:
+
+- one SMT symbol per immutable LLVM SSA value;
+- versioned memory arrays;
+- accumulated path assumptions;
+- explicit procedure-summary boundary symbols;
+- unit-tested Z3 variable creation, assertions, satisfiability checks, and
+  model extraction.
+
+These SMT pieces are tested, but they are not yet wired into the active
+`may_must.rs` engine.
+
+`src/main.rs` invokes the analyzer through the CLI:
 
 - no `-a`: analyze embedded `may_assert(...)` calls;
 - with `-a`: analyze the provided assertion at returns from the named function;
