@@ -1,11 +1,8 @@
-use libc::{c_uint, size_t};
 use llvm_sys::bit_reader::*;
-use llvm_sys::bit_writer::*;
 use llvm_sys::core::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
-use llvm_sys::target_machine::*;
-use llvm_sys::LLVMOpcode;
+use llvm_sys::{LLVMIntPredicate, LLVMOpcode};
 use std::ffi::{CStr, CString};
 use std::ptr;
 
@@ -305,13 +302,28 @@ impl Function {
 
     pub fn get_name(&self) -> String {
         unsafe {
-            let name = LLVMGetValueName2(self.0, &mut 0);
+            let mut len = 0;
+            let name = LLVMGetValueName2(self.0, &mut len);
             let name_str = CStr::from_ptr(name).to_string_lossy();
 
             //let name = CStr::from_ptr(LLVMGetValueName2(self.0, ptr::null_mut()))
             //    .to_str()
             //    .unwrap();
             String::from(name_str)
+        }
+    }
+
+    pub fn get_params(&self) -> Vec<Instruction> {
+        unsafe {
+            let count = LLVMCountParams(self.0);
+            let mut params = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let param = LLVMGetParam(self.0, i);
+                if !param.is_null() {
+                    params.push(Instruction(param));
+                }
+            }
+            params
         }
     }
 
@@ -403,6 +415,31 @@ impl Instruction {
         }
     }
 
+    pub fn get_name(&self) -> Option<String> {
+        unsafe {
+            let mut len = 0;
+            let name = LLVMGetValueName2(self.0, &mut len);
+            if name.is_null() || len == 0 {
+                return None;
+            }
+            Some(CStr::from_ptr(name).to_string_lossy().into_owned())
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        if let Some(name) = self.get_name() {
+            if name.starts_with('%') || name.starts_with('@') {
+                name
+            } else {
+                format!("%{name}")
+            }
+        } else if let Some(value) = self.as_constant_int() {
+            value.to_string()
+        } else {
+            self.print()
+        }
+    }
+
     pub fn get_opcode(&self) -> InstructionOpcode {
         unsafe {
             let op = LLVMGetInstructionOpcode(self.0);
@@ -419,15 +456,7 @@ impl Instruction {
     pub fn is_branch_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsABranchInst(self.0);
-            if !res.is_null() {
-                let a = LLVMConstIntGetZExtValue(res);
-                if a > 0 {
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-            false
+            !res.is_null()
         }
     }
 
@@ -444,29 +473,14 @@ impl Instruction {
     pub fn is_return_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsAReturnInst(self.0);
-            if !res.is_null() {
-                let a = LLVMConstIntGetZExtValue(res);
-                if a > 0 {
-                    return true;
-                }
-                return false;
-            }
-            false
+            !res.is_null()
         }
     }
 
     pub fn is_terminator_instruction(&self) -> bool {
         unsafe {
             let resp = LLVMIsATerminatorInst(self.0);
-            if !resp.is_null() {
-                let a = LLVMConstIntGetZExtValue(resp);
-                if a > 0 {
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-            false
+            !resp.is_null()
         }
     }
 
@@ -496,6 +510,70 @@ impl Instruction {
                 }
             }
             args
+        }
+    }
+
+    pub fn get_operand_count(&self) -> usize {
+        unsafe { LLVMGetNumOperands(self.0).max(0) as usize }
+    }
+
+    pub fn get_operand(&self, index: usize) -> Option<Instruction> {
+        unsafe {
+            if index >= self.get_operand_count() {
+                return None;
+            }
+            let operand = LLVMGetOperand(self.0, index as libc::c_uint);
+            if operand.is_null() {
+                None
+            } else {
+                Some(Instruction(operand))
+            }
+        }
+    }
+
+    pub fn get_operands(&self) -> Vec<Instruction> {
+        (0..self.get_operand_count())
+            .filter_map(|idx| self.get_operand(idx))
+            .collect()
+    }
+
+    pub fn get_branch_condition(&self) -> Option<Instruction> {
+        if !self.is_branch_instruction() {
+            return None;
+        }
+        unsafe {
+            let condition = LLVMGetCondition(self.0);
+            if condition.is_null() {
+                None
+            } else {
+                Some(Instruction(condition))
+            }
+        }
+    }
+
+    pub fn as_constant_int(&self) -> Option<i64> {
+        unsafe {
+            if LLVMIsAConstantInt(self.0).is_null() {
+                None
+            } else {
+                Some(LLVMConstIntGetSExtValue(self.0))
+            }
+        }
+    }
+
+    pub fn get_icmp_predicate(&self) -> Option<&'static str> {
+        if self.get_opcode() != InstructionOpcode::ICmp {
+            return None;
+        }
+        unsafe {
+            match LLVMGetICmpPredicate(self.0) {
+                LLVMIntPredicate::LLVMIntEQ => Some("=="),
+                LLVMIntPredicate::LLVMIntNE => Some("!="),
+                LLVMIntPredicate::LLVMIntUGT | LLVMIntPredicate::LLVMIntSGT => Some(">"),
+                LLVMIntPredicate::LLVMIntUGE | LLVMIntPredicate::LLVMIntSGE => Some(">="),
+                LLVMIntPredicate::LLVMIntULT | LLVMIntPredicate::LLVMIntSLT => Some("<"),
+                LLVMIntPredicate::LLVMIntULE | LLVMIntPredicate::LLVMIntSLE => Some("<="),
+            }
         }
     }
 

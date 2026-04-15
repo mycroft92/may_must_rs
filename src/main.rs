@@ -1,23 +1,76 @@
 mod errors;
 mod llvm_utils;
-use crate::expressions::exp::{parse_cmd_line, Assertion, Expr, Statement};
+use crate::analysis::may_must::{AnalysisAnswer, SmashAnalyzer, SmashConfig};
+use crate::expressions::exp::{parse_cmd_line, Assertion};
 use crate::llvm_utils::llvm_wrap::*;
-use clap::{arg, command, value_parser, ArgAction, Command};
+use clap::{arg, command, value_parser};
 use env_logger::{Builder, Env};
 use log::*;
-use std::env;
+use std::path::Path;
 mod expressions;
 
 mod analysis;
 mod smt;
 
-fn handle(module: Module) {
+fn handle(module: Module, input_file: &str, assertion: Option<Assertion>, max_steps: usize) {
     match llvm_utils::program_graph::generate_program_graph(&module) {
-        Ok(res_) => {
-            llvm_utils::program_graph::dump_graphs(&res_, "graph_dot");
+        Ok(graphs) => {
+            let graph_dir = graph_output_dir(input_file);
+            llvm_utils::program_graph::dump_graphs(&graphs, &graph_dir);
+            let mut analyzer = SmashAnalyzer::new(
+                graphs,
+                SmashConfig {
+                    max_steps,
+                    ..SmashConfig::default()
+                },
+            );
+            let reports = match assertion {
+                Some(assertion) => vec![analyzer.analyze_assertion(assertion)],
+                None => analyzer.analyze_embedded_assertions(),
+            };
+
+            if reports.is_empty() {
+                println!("No embedded may_assert calls found.");
+                return;
+            }
+
+            for report in reports {
+                println!(
+                    "Query <{}: {} => {}>",
+                    report.query.function, report.query.pre, report.query.post
+                );
+                match report.answer {
+                    AnalysisAnswer::BugFound { trace } => {
+                        println!("Result: BUG reachable (must summary)");
+                        println!("Trace:");
+                        for (idx, step) in trace.iter().enumerate() {
+                            println!("  {}. {}", idx + 1, step);
+                        }
+                    }
+                    AnalysisAnswer::ProvenSafe => {
+                        println!("Result: SAFE (not-may summary)");
+                    }
+                    AnalysisAnswer::Unknown { reason } => {
+                        println!("Result: UNKNOWN");
+                        println!("Reason: {reason}");
+                    }
+                }
+                println!(
+                    "Summaries: {} must, {} not-may",
+                    report.must_summaries, report.not_may_summaries
+                );
+            }
         }
         Err(err) => error!("{err}"),
     }
+}
+
+fn graph_output_dir(input_file: &str) -> String {
+    let stem = Path::new(input_file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("module");
+    format!("graph_dot/{stem}")
 }
 
 fn init_logger(level: &u8) {
@@ -39,7 +92,13 @@ fn main() {
         .arg(arg!(
             -d --debug ... "Turn debugging information on"
         ))
-        .arg(arg!(-a --assert <STRING> "assertion to look for"))
+        .arg(arg!(-a --assert <STRING> "assertion to check, e.g. 'main => %23 == 1'. If omitted, embedded may_assert calls are checked"))
+        .arg(
+            arg!(--"max-steps" <N> "maximum symbolic execution steps per query")
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("20000"),
+        )
         .get_matches();
 
     let inpfile;
@@ -57,31 +116,15 @@ fn main() {
             return;
         }
     }
-    let assert_stmt;
-    match matches.get_one::<String>("assert") {
-        Some(cmd) => {
-            assert_stmt = cmd;
-        }
-        None => {
-            info!("Nothing to process");
-            return;
-        }
-    }
-
-    let assertion_ast;
-    match parse_cmd_line(assert_stmt) {
-        Err(e) => {
-            std::process::exit(1);
-        }
-        Ok(assertion) => {
-            assertion_ast = assertion;
-        }
-    }
+    let assertion_ast = matches
+        .get_one::<String>("assert")
+        .map(|cmd| parse_cmd_line(cmd).unwrap_or_else(|_| std::process::exit(1)));
+    let max_steps = *matches.get_one::<usize>("max-steps").unwrap_or(&20_000);
 
     initialize_target();
     let context = Context::new();
     match context.parse_bc_file(inpfile) {
-        Some(module) => handle(module),
+        Some(module) => handle(module, inpfile, assertion_ast, max_steps),
         None => {}
     }
 }

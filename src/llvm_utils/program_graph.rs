@@ -1,6 +1,6 @@
 use crate::errors::*;
 use crate::llvm_utils::llvm_wrap::*;
-use dot::{render, Edges, GraphWalk, Labeller, Nodes};
+use dot::Labeller;
 use log::*;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -17,6 +17,7 @@ pub struct Node {
 #[derive(Clone, Debug)]
 pub struct FunctionGraph {
     pub name: String,
+    pub params: Vec<String>,
     pub vertices: Vec<Instruction>,
     pub edges: HashMap<Instruction, Node>,
     pub start: Option<Instruction>,
@@ -24,8 +25,6 @@ pub struct FunctionGraph {
     pub vars: HashMap<String, Instruction>,
     pub asserts: Vec<Instruction>,
 }
-
-static IGNORE_LIST: &[&'static str] = &["printf", "putchar"];
 
 impl<'a> Labeller<'a, Instruction, (Instruction, Instruction)> for FunctionGraph {
     fn graph_id(&'a self) -> dot::Id<'a> {
@@ -75,6 +74,11 @@ impl FunctionGraph {
         }
 
         let mut res = FunctionGraph {
+            params: function
+                .get_params()
+                .into_iter()
+                .map(|param| param.display_name())
+                .collect(),
             name,
             edges: HashMap::new(),
             start: None,
@@ -86,61 +90,45 @@ impl FunctionGraph {
 
         let bbs = function.get_all_basic_blocks();
 
-        for (i, bb) in bbs.iter().enumerate() {
+        for bb in &bbs {
             let instrs = bb.get_all_instructions();
-            let mut prev = bb
-                .get_front()
-                .ok_or_else(|| ProgError::LLVMError("Unable to get front for bb".to_string()))?;
-            if i == 0 {
-                res.start = Some(prev);
+            if instrs.is_empty() {
+                continue;
             }
-            for inst in instrs {
-                let var_name = inst.get_assignment_var();
-                match inst.get_called_function() {
-                    Some(x) => {
-                        let mut set_continue = false;
-                        for name in IGNORE_LIST {
-                            if *name == x {
-                                set_continue = true;
-                                break;
-                            }
-                        }
-                        if set_continue {
-                            continue;
-                        }
-                        // Time to make the asserts
-                        if x == "may_assert" {
-                            //unwraap works because may_assert must have one argument, otherwise
-                            //its a compile error
-                            res.asserts.push(*inst.get_call_args().get(0).unwrap());
-                            continue;
-                        }
 
-                        debug!("Function call to: {} ", x);
-                    }
-                    None => {}
+            if res.start.is_none() {
+                res.start = instrs.first().copied();
+            }
+
+            for inst in &instrs {
+                if let Some(name) = inst.get_assignment_var() {
+                    res.vars.insert(name, *inst);
                 }
-                match var_name {
-                    Some(name) => {
-                        res.vars.insert(name, inst);
-                    }
-                    None => {}
+
+                if inst.get_called_function().as_deref() == Some("may_assert") {
+                    res.asserts.push(*inst);
+                } else if let Some(callee) = inst.get_called_function() {
+                    debug!("Function call to: {} ", callee);
                 }
-                if inst == prev {
-                    continue;
-                }
-                res.add_edge(prev, inst);
-                if inst.is_terminator_instruction() {
-                    let successors = inst.get_successors();
-                    for scr in successors {
-                        res.add_edge(inst, scr);
-                        debug!("{inst} -> {scr}");
-                    }
-                }
+
                 if inst.is_return_instruction() {
-                    res.end.push(inst);
+                    res.end.push(*inst);
                 }
-                prev = inst;
+
+                res.add_instruction(*inst);
+            }
+
+            for pair in instrs.windows(2) {
+                res.add_edge(pair[0], pair[1])?;
+            }
+
+            if let Some(term) = instrs.last() {
+                if term.is_terminator_instruction() {
+                    for successor in term.get_successors() {
+                        res.add_edge(*term, successor)?;
+                        debug!("{term} -> {successor}");
+                    }
+                }
             }
         }
 
@@ -225,6 +213,8 @@ pub fn generate_program_graph(m: &Module) -> Result<Vec<FunctionGraph>> {
 
 pub fn dump_graphs(funcgraph: &Vec<FunctionGraph>, outdir: &str) {
     for g in funcgraph {
-        g.generate_dot_file(outdir);
+        if let Err(err) = g.generate_dot_file(outdir) {
+            warn!("Unable to write graph for {}: {err}", g.name);
+        }
     }
 }
