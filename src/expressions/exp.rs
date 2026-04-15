@@ -1,3 +1,18 @@
+//! Small assertion-language parser.
+//!
+//! The analyzer accepts command-line or file-based assertions independently of
+//! LLVM parsing. This module owns that language:
+//!
+//! ```text
+//! name :: function => expression
+//! ```
+//!
+//! `parse_cmd_line` synthesizes the `name ::` prefix for one-off CLI
+//! assertions, while `parse_file` expects the full form. The parser is built in
+//! three stages: lexical token tree, Pratt expression parser, then assertion
+//! parser. Keeping this separate from LLVM lets tests exercise assertion
+//! syntax without needing bitcode.
+
 use crate::errors::{ProgError, Result};
 use ariadne::{sources, Color, Label, Report, ReportKind};
 ///Defines the type of assertions we check for witht he analysis

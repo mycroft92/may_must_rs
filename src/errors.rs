@@ -1,3 +1,10 @@
+//! Shared error type for the analyzer.
+//!
+//! The project uses a single `ProgError` enum so parsing, LLVM graph building,
+//! and filesystem operations can all return the same `Result<T>` alias. Error
+//! variants stay close to the subsystem that detects them, but callers do not
+//! need to thread multiple error types through the analysis pipeline.
+
 use crate::llvm_utils::llvm_wrap::Instruction;
 use std::io;
 use thiserror::Error;

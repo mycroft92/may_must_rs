@@ -1,3 +1,10 @@
+//! CLI entry point.
+//!
+//! The binary keeps orchestration here and leaves the core work to modules:
+//! parse command-line assertions, parse LLVM bitcode through `llvm_wrap`, build
+//! per-function graphs, always dump DOT debug graphs, then run the current
+//! SMASH-style analyzer.
+
 mod errors;
 mod llvm_utils;
 use crate::analysis::may_must::{AnalysisAnswer, SmashAnalyzer, SmashConfig};

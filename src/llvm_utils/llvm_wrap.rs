@@ -1,3 +1,21 @@
+//! Safe-ish Rust boundary around the LLVM C API.
+//!
+//! This module is intentionally the narrowest place where most `unsafe` LLVM
+//! calls live. The rest of the analyzer should work with small copyable wrapper
+//! types (`Module`, `Function`, `BasicBlock`, `Instruction`) instead of raw
+//! `LLVM*Ref` pointers. That keeps the design honest:
+//!
+//! - ownership and disposal live near the C API (`Drop` for `Context` and
+//!   `Module`);
+//! - callers get Rust `Option`/`Vec`/`String` results instead of null pointers;
+//! - pointer identity remains available for graph keys by deriving `Hash`/`Eq`
+//!   on the wrapper types;
+//! - adding new LLVM queries means adding one wrapper method here rather than
+//!   spreading `unsafe` through analysis code.
+//!
+//! These wrappers are not a complete type-safe LLVM binding. They are a local
+//! boundary for the subset of LLVM IR the analyzer currently needs.
+
 use llvm_sys::bit_reader::*;
 use llvm_sys::core::*;
 use llvm_sys::prelude::*;

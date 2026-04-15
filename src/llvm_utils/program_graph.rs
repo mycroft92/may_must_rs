@@ -1,3 +1,20 @@
+//! Instruction-level control-flow graph construction.
+//!
+//! This layer turns LLVM's function/basic-block/instruction structure into a
+//! graph that the analysis can traverse without calling the LLVM C API again.
+//! The graph is intentionally at instruction granularity because assertions,
+//! symbolic transfers, and traces all need exact instruction positions.
+//!
+//! Design notes:
+//! - `FunctionGraph::vertices` keeps a stable display order for DOT output.
+//! - `edges` stores predecessor and successor sets keyed by `Instruction`
+//!   pointer identity.
+//! - sequential edges are added only inside a basic block;
+//! - terminator edges come from LLVM successor information;
+//! - `may_assert` call instructions are retained as assertion sites so the
+//!   analyzer can evaluate them in the symbolic state at that exact program
+//!   point.
+
 use crate::errors::*;
 use crate::llvm_utils::llvm_wrap::*;
 use dot::Labeller;
