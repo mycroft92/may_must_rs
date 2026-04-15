@@ -363,8 +363,9 @@ This document should become the implementation contract for
 
 ## 14. Suggested Implementation Order
 
-1. Add `analysis/state.rs` with typed symbolic state.
-2. Add `analysis/transfer.rs` with a small supported LLVM subset:
+1. Keep `make -C tests smoke` green as the minimal current SMASH regression.
+2. Add a safe not-may smoke test and an `UNKNOWN` smoke test.
+3. Add `analysis/transfer.rs` with a small supported LLVM subset:
    - integer arithmetic;
    - `icmp`;
    - `alloca`;
@@ -372,15 +373,17 @@ This document should become the implementation contract for
    - `store`;
    - conditional/unconditional `br`;
    - `ret`.
-3. Use `SmtEncodingContext` for symbolic values.
-4. Replace string-based `SymbolicState` in `may_must.rs`.
-5. Add `docs/llvm-transfer-semantics.md`.
-6. Add Z3-backed path feasibility.
-7. Add Z3-backed summary applicability.
-8. Implement actual/formal and return binding for direct calls.
-9. Add external summaries for common functions.
-10. Start predicate abstraction/refinement for the may side.
-11. Start DART-style model-to-input generation for the must side.
+4. Move current string-based transfer behavior out of `may_must.rs` before
+   changing semantics.
+5. Use `SmtEncodingContext` for symbolic values.
+6. Replace string-based `SymbolicState` in `may_must.rs`.
+7. Add `docs/llvm-transfer-semantics.md`.
+8. Add Z3-backed path feasibility.
+9. Add Z3-backed summary applicability.
+10. Implement actual/formal and return binding for direct calls.
+11. Add external summaries for common functions.
+12. Start predicate abstraction/refinement for the may side.
+13. Start DART-style model-to-input generation for the must side.
 
 ## 15. Near-Term Test Plan
 
@@ -396,4 +399,3 @@ Add focused LLVM/C tests for:
 - one external function treated as an uninterpreted summary;
 - assertion inside a callee;
 - recursive call returning `Unknown`.
-

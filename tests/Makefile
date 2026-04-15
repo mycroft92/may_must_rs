@@ -1,15 +1,14 @@
-.PHONY: gen_example
+.PHONY: ir smoke clean
 
-gen_example: example.ll
-	llvm-as example.ll -o example.bc
-	llc example.bc -o example.s
-	clang example.s -o example
+TEST_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+REPO_ROOT := $(abspath $(TEST_DIR)/..)
+OUT_DIR ?= $(TEST_DIR)/out
 
-gen_sample: sample.c
-	clang -S -emit-llvm sample.c -o sample.ll 	
-	clang -S sample.c -o sample.bc
+ir:
+	cd $(REPO_ROOT) && ./tests/build_ir.sh --out-dir $(OUT_DIR)
+
+smoke:
+	cd $(REPO_ROOT) && ./tests/smash_smoke.sh
 
 clean:
-	rm -rf *.bc *.s example sample.ll
-
-
+	rm -rf $(OUT_DIR)

@@ -16,22 +16,46 @@ generation.
 
 ## How To Run
 
+Generate LLVM IR and bitcode from the C test inputs:
+
+```sh
+make -C tests ir
+```
+
+This writes human-readable `.ll` files and analyzer-ready `.bc` files under
+`tests/out/`.
+Set `CLANG=/path/to/clang` if you need the generated bitcode to match a
+specific LLVM reader version.
+
+Run the minimal SMASH smoke test:
+
+```sh
+make -C tests smoke
+```
+
+If Cargo cannot access the network and the dependency cache is already present,
+use:
+
+```sh
+CARGO_FLAGS=--offline make -C tests smoke
+```
+
 Check embedded `may_assert(...)` calls:
 
 ```sh
-cargo run --bin main -- short_assert.bc
+cargo run --bin main -- tests/out/short_assert.bc
 ```
 
 Check a command-line postcondition at function return:
 
 ```sh
-cargo run --bin main -- short_assert.bc -a "main => %23 == 1"
+cargo run --bin main -- tests/out/short_assert.bc -a "main => %23 == 1"
 ```
 
 Bound symbolic execution work per query:
 
 ```sh
-cargo run --bin main -- short_assert.bc --max-steps 50000
+cargo run --bin main -- tests/out/short_assert.bc --max-steps 50000
 ```
 
 Every run writes debug DOT graphs to `graph_dot/<input-stem>/`, one file per
@@ -233,3 +257,12 @@ struct fields, arrays, or pointer arithmetic.
 Unsupported or undecidable cases return `UNKNOWN`. This is deliberate: a
 bounded prototype should not report safety when it has only failed to explore
 enough.
+
+## Next Work
+
+Use `TASKVIEW.md` as the live resume document for the next implementation
+session. The immediate next engineering step is to extract LLVM instruction
+semantics from `src/analysis/may_must.rs` into `src/analysis/transfer.rs`
+without changing behavior. After that, the planned direction is to wire
+`src/analysis/state.rs` and `src/smt/solver.rs` into path feasibility and
+summary applicability.

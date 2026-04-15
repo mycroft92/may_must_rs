@@ -8,6 +8,7 @@ src/llvm.rs
 Cargo.lock
 *.s
 graph_dot/
+tests/out/
 *.png
 .DS_Store
 *.pch
