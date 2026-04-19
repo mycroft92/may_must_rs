@@ -21,6 +21,7 @@ use std::path::Path;
 mod expressions;
 
 mod analysis;
+mod analysis2;
 mod smt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

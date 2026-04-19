@@ -164,7 +164,24 @@ implementation path. The legacy analyzer remains the default, and
   direct-call summary composition;
 - kept `src/analysis/may_must.rs` intact as the executable toy/reference
   implementation;
-- kept `cargo test` green with 35 unit tests.
+- kept `cargo test` green with 37 unit tests after adding the `analysis2`
+  scaffold.
+
+A separate `src/analysis2` tree now exists for paper-shaped development. It is
+not wired into the CLI and does not depend on `src/analysis`. Its purpose is to
+make SMASH notation explicit in code:
+
+- `cfg.rs`: procedures, CFG edges, and `Gamma_e`;
+- `state.rs`: `Pi_n`, `Omega_n`, regions, and may edges;
+- `rules.rs`: named rules such as `MUST-POST`, `NOTMAY-PRE`,
+  `MUST-POST-USE-SUMMARY`, and `NOTMAY-PRE-USE-SUMMARY`;
+- `oracle.rs`: abstract predicate and transition queries that can later be
+  backed by SMT;
+- `llvm_adapter.rs`: Option A bridge from LLVM `FunctionGraph` into
+  `PaperProcedure` plus external `EdgeId -> LlvmEdgeMetadata`;
+- `transfer.rs`: metadata-backed `TransitionOracle` with a dedicated
+  `LlvmEdgeTransfer` interface for LLVM edge guard/effect modeling;
+- `design.md`: the paper-to-code map for this independent scaffold.
 
 ## What Is Implemented
 
@@ -236,6 +253,10 @@ The typed SMT-side analysis scaffold is split across:
 These SMT pieces are wired behind `--engine smt`. The default command still
 runs `src/analysis/may_must.rs` so the old toy/reference implementation stays
 usable while the SMT path is incomplete.
+
+The paper-shaped `src/analysis2` scaffold is compile-tested but scaffold-only.
+It is intended for understanding and implementing the paper rules directly
+before adapting them back to LLVM or SMT execution.
 
 `src/main.rs` invokes the analyzer through the CLI:
 

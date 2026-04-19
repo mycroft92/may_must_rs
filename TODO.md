@@ -299,6 +299,10 @@ Current state: `src/analysis/may_must_rules.rs` contains the first explicit
 named summary-applicability rule checks. `summary_store.rs` now delegates
 summary applicability to this rule module.
 
+There is now also a separate paper-shaped scaffold under `src/analysis2`.
+That tree is intentionally independent from `src/analysis` and should be used
+when we want a one-to-one map from the SMASH paper to code.
+
 Design goal: keep the implementation close to the SMASH paper by giving the
 named proof obligations explicit functions, while using the existing typed
 predicate and summary infrastructure.
@@ -321,6 +325,15 @@ Needed:
 - Add more rule-specific tests as more paper obligations are implemented.
 - Keep exact entailment directions marked for review until checked against the
   paper.
+- In `analysis2`, continue making the intraprocedural paper rules explicit:
+  - `must_post_edge`;
+  - `not_may_pre_edge`;
+  - `must_post_use_summary`;
+  - `not_may_pre_use_summary`.
+- Keep `analysis2::rules::must_post_edge` distinct from
+  `analysis::may_must_rules::must_post`; the former is the paper transition
+  rule `Omega_n1 + Gamma_e -> theta -> Omega_n2`, while the latter is still a
+  cached-summary applicability check.
 
 Suggested module boundary:
 
@@ -331,6 +344,60 @@ smt_engine.rs     -> decides when to apply/create summaries
 predicates.rs     -> discharges SMT formula checks
 transfer.rs       -> models LLVM instructions only
 ```
+
+Paper-shaped module boundary:
+
+```text
+analysis2/rules.rs     -> named SMASH rules
+analysis2/state.rs     -> Pi_n, Omega_n, regions, and may edges
+analysis2/cfg.rs       -> procedures, edges, and Gamma_e
+analysis2/oracle.rs    -> abstract predicate/transition checks
+analysis2/summaries.rs -> reachability queries and summaries
+analysis2/driver.rs    -> deterministic rule orchestration
+```
+
+## 6.3 Build The Paper-Shaped `analysis2` Engine
+
+Current state: `src/analysis2` contains the independent scaffold:
+
+- `vocabulary.rs`: procedure, node, edge, and region IDs.
+- `formula.rs`: small solver-independent predicates.
+- `oracle.rs`: `PredicateOracle` and `TransitionOracle`.
+- `llvm_adapter.rs`: Option A conversion from LLVM instruction graph to
+  `PaperProcedure` plus external `EdgeId -> LlvmEdgeMetadata`.
+- `cfg.rs`: `PaperProcedure`, `PaperEdge`, and explicit `Gamma_e`.
+- `state.rs`: `Pi_n`, `Omega_n`, regions, and may edges.
+- `summaries.rs`: `ReachabilityQuery`, `ProcedureSummary`, and
+  `SummaryTable`.
+- `rules.rs`: explicit rule functions for `MUST-POST`, `NOTMAY-PRE`, summary
+  use, and summary creation.
+- `driver.rs`: deterministic summary lookup order before intraprocedural
+  analysis.
+- `transfer.rs`: metadata-backed `LlvmTransitionOracle` with an explicit
+  `LlvmEdgeTransfer` interface.
+
+Needed:
+
+- Add an intraprocedural driver over `(edge, source region, destination
+  region)` obligations.
+- Apply `must_post_edge` to grow `Omega_n2`.
+- Apply `not_may_pre_edge` to split `Pi_n1` and add may edges.
+- Add call-edge handling through `must_post_use_summary` and
+  `not_may_pre_use_summary`.
+- Decide how `N_e` should be represented for refined regions after splitting.
+- Add a real SMT-backed `PredicateOracle`.
+- Strengthen `analysis2::transfer::LlvmTransitionOracle` beyond the current
+  syntactic guard/effect approximation so it computes:
+
+```text
+theta subset Post(Gamma_e, source)
+Pre(Gamma_e, target) subset beta
+```
+
+- Expand the existing adapter from `llvm_utils::program_graph::FunctionGraph`
+  to cover more LLVM edge kinds and richer metadata.
+- Keep this tree independent from `src/analysis` until the paper mapping is
+  clear.
 
 ## 6.5 Extend The SMT Analysis Engine Worklist
 
@@ -499,22 +566,26 @@ This document should become the implementation contract for
 ## 14. Suggested Implementation Order
 
 1. Keep `make -C tests smoke` green as the minimal current SMASH regression.
-2. Keep `cargo test` green; current count after the SMT test additions is 35
+2. Keep `cargo test` green; current count after the `analysis2` scaffold is 37
    tests.
-3. Review the exact entailment directions in `src/analysis/may_must_rules.rs`
+3. Use `src/analysis2/design.md` and `src/analysis2/rules.rs` as the
+   one-to-one paper mapping while reviewing rule names.
+4. Review the exact entailment directions in `src/analysis/may_must_rules.rs`
    against the SMASH paper before relying on the SMT path for CLI results.
-4. Add one test showing unsupported `phi`, `switch`, or unsupported call
+5. Add an `analysis2` intraprocedural driver that updates `Omega` and
+   partitions through named rules.
+6. Add one test showing unsupported `phi`, `switch`, or unsupported call
    returns `UNKNOWN`.
-5. Add `docs/llvm-transfer-semantics.md`.
-6. Replace simple stack memory with the `MemoryTerm`/`StateEncoding` plan in
+7. Add `docs/llvm-transfer-semantics.md`.
+8. Replace simple stack memory with the `MemoryTerm`/`StateEncoding` plan in
    `src/analysis/memory_updates.md`.
-7. Add `getelementptr` or return `UNKNOWN` for it explicitly.
-8. Implement actual/formal and return binding for direct calls.
-9. Enable `tests/paper_section2_fig1_not_may.c` as an executable regression
+9. Add `getelementptr` or return `UNKNOWN` for it explicitly.
+10. Implement actual/formal and return binding for direct calls.
+11. Enable `tests/paper_section2_fig1_not_may.c` as an executable regression
    once direct-call composition exists.
-10. Add external summaries for common functions.
-11. Start predicate abstraction/refinement for the may side.
-12. Start DART-style model-to-input generation for the must side.
+12. Add external summaries for common functions.
+13. Start predicate abstraction/refinement for the may side.
+14. Start DART-style model-to-input generation for the must side.
 
 ## 15. Near-Term Test Plan
 
