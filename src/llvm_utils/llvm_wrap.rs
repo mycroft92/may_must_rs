@@ -226,7 +226,7 @@ impl Context {
                 &mut mem_buffer,
                 &mut error_msg,
             );
-            if (result != 0) {
+            if result != 0 {
                 let error = CStr::from_ptr(error_msg).to_string_lossy();
                 println!("Error reading file: {}", error);
                 LLVMDisposeMessage(error_msg);
@@ -257,12 +257,12 @@ impl Drop for Module {
 impl Module {
     pub fn get_all_functions(&self) -> Vec<Function> {
         unsafe {
-            let mut first_func = LLVMGetFirstFunction(self.0);
+            let first_func = LLVMGetFirstFunction(self.0);
             let mut res: Vec<Function> = Vec::new();
             if first_func.is_null() {
                 return vec![];
             }
-            let mut func = Function(first_func);
+            let func = Function(first_func);
             res.push(func);
             let mut nextf = LLVMGetNextFunction(first_func);
             while !nextf.is_null() {
@@ -347,7 +347,7 @@ impl Function {
 
     pub fn get_all_basic_blocks(&self) -> Vec<BasicBlock> {
         unsafe {
-            let mut first_bb = LLVMGetFirstBasicBlock(self.0);
+            let first_bb = LLVMGetFirstBasicBlock(self.0);
             if first_bb.is_null() {
                 return vec![];
             }
@@ -372,7 +372,7 @@ impl BasicBlock {
         //panic!("Unimplemented get all instructions");
         unsafe {
             let mut res: Vec<Instruction> = Vec::new();
-            let mut first = LLVMGetFirstInstruction(self.0);
+            let first = LLVMGetFirstInstruction(self.0);
             if first.is_null() {
                 return vec![];
             }
@@ -389,7 +389,7 @@ impl BasicBlock {
 
     pub fn get_front(&self) -> Option<Instruction> {
         unsafe {
-            let mut instr = LLVMGetFirstInstruction(self.0);
+            let instr = LLVMGetFirstInstruction(self.0);
             if instr.is_null() {
                 return None;
             }
@@ -399,7 +399,7 @@ impl BasicBlock {
 
     pub fn get_back(&self) -> Option<Instruction> {
         unsafe {
-            let mut instr = LLVMGetBasicBlockTerminator(self.0);
+            let instr = LLVMGetBasicBlockTerminator(self.0);
             if instr.is_null() {
                 return None;
             }

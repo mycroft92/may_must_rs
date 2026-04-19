@@ -6,7 +6,6 @@
 //! need to thread multiple error types through the analysis pipeline.
 
 use crate::llvm_utils::llvm_wrap::Instruction;
-use std::io;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

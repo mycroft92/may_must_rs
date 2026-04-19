@@ -17,8 +17,8 @@ use crate::errors::{ProgError, Result};
 use ariadne::{sources, Color, Label, Report, ReportKind};
 ///Defines the type of assertions we check for witht he analysis
 use chumsky::{input::BorrowInput, input::ValueInput, pratt::*, prelude::*};
-use std::io::{BufRead, BufReader};
-use std::{env, fmt, fs};
+use std::io::BufRead;
+use std::{fmt, fs};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Op {
