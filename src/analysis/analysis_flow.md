@@ -1,4 +1,4 @@
-# Analysis Flowq
+# Analysis Flow
 
 This file is the flow-heavy companion to `src/analysis/design.md`.
 
