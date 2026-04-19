@@ -1,416 +1,197 @@
-# Tomorrow Task View: SMT-Backed SMASH Path
+# Tomorrow Task View: Active Paper Driver
 
-This is the resume point for the next session. The project target remains the
-SMASH paper by Godefroid, Nori, Rajamani, and Tetali:
-
-<https://dl.acm.org/doi/10.1145/1706299.1706307>
+This is the resume point for the next session.
 
 ## Current Working Baseline
 
-- The default CLI path is still the legacy toy/reference analyzer:
+- `src/analysis` is now the active analysis tree.
+- The old toy analyzer and experimental SMT path were moved to:
+
+```text
+obsolete/src/analysis
+obsolete/src/analysis.rs
+```
+
+- The CLI now runs the paper-shaped intraprocedural driver:
 
 ```sh
 cargo run --bin main -- <bitcode.bc>
 ```
 
-- The experimental SMT path is available with:
+- `--assert` is not implemented in the active driver.
+- The active query builder currently uses the first embedded `may_assert(...)`
+  as the single target assertion and encodes its violation as:
 
-```sh
-cargo run --bin main -- <bitcode.bc> --engine smt
+```text
+assert_violation(site) && !assert_arg
 ```
 
-- The default analyzer is still `src/analysis/may_must.rs`.
-- `may_must.rs` is intentionally still the toy/reference implementation:
-  - string-backed symbolic values;
-  - simple `HashMap<String, String>` memory;
-  - syntactic path contradictions;
-  - syntactic summary applicability;
-  - bounded worklist search.
-- The SMT-backed path is now wired behind `--engine smt` for direct embedded
-  `may_assert` queries.
-- The SMT path does not yet support command-line `--assert`, direct-call
-  summary composition, `phi`, `switch`, casts, `getelementptr`, or full memory
-  summaries.
-- Current test status after adding the independent `analysis2` scaffold:
+- Only that selected target site is treated as a violation target; other
+  `may_assert(...)` calls stay as ordinary call effects.
+- Explicit target selection is not implemented yet.
+- Current test status:
 
 ```sh
 cargo test
-# 37 passed
-```
+# 22 passed
 
-Smoke status:
-
-```sh
 make -C tests smoke
-# legacy default passes
-
-cargo run -- tests/out/smash_must.bc --engine smt
-# SMT engine also reports the direct may_assert(false) bug
-
-make -C tests smt-smoke
-# SMT bug, safe/not-may, and branch-pruning smoke cases pass
+# passes
 ```
 
-## What Was Added In The SMT Scaffold
+## What The Active Tree Contains
 
-`src/analysis/predicates.rs`
-
-- Defines solver-independent `IntTerm` and `Formula`.
-- Encodes formulas into `StateEncoding`.
-- Provides SMT-backed:
-  - `is_satisfiable_in`;
-  - `entails_in`;
-  - `intersects_in`.
-
-`src/analysis/smt_path.rs`
-
-- Defines cloneable `SmtPathState`.
-- Carries:
-  - integer SSA bindings;
-  - Boolean SSA bindings;
-  - simple stack-memory integer bindings;
-  - path conditions;
-  - scalar return value;
-  - trace strings.
-- Important simplification: executable SMT memory is currently a
-  `HashMap<pointer-key, IntTerm>`, not the final SMT-array/object memory model.
-  It exists so unoptimized `alloca`/`store`/`load` test IR can reach assertions.
-  It does not model aliasing, offsets, globals, heap objects, structs, arrays,
-  or function-boundary memory summaries.
-- Maps formal parameters to `SummaryPhase::Pre`.
-- Builds scalar return relations against `SummaryPhase::Post`.
-- Checks path feasibility with Z3.
-
-`src/analysis/summary_store.rs`
-
-- Defines typed `FunctionSummary`, `SummaryTarget`, `SummaryEvidence`, and
-  `SmtQuery`.
-- Stores only `Must` and `NotMay` summaries.
-- Uses SMT-backed applicability checks.
-- Does not store separate May summaries.
-
-`src/analysis/smt_engine.rs`
-
-- Defines `SmtAnalysisEngine` and `SmtEngineConfig`.
-- Owns summary storage.
-- Implements the SMASH summary lookup order:
-  1. applicable `Must`;
-  2. applicable `NotMay`;
-  3. otherwise execute the supported intraprocedural subset.
-- Owns the first SMT worklist for direct embedded `may_assert` queries.
-- Records `Must` summaries on feasible assertion violations.
-- Records `NotMay` summaries only when all supported paths complete.
-- Returns `UNKNOWN` when an unsupported instruction blocks coverage.
-
-`src/analysis/transfer.rs`
-
-- Defines the first SMT forward transfer layer.
-- Supports:
-  - simple `alloca`;
-  - simple `store`;
-  - simple `load`;
-  - scalar `add`;
-  - scalar `sub`;
-  - scalar `mul`;
-  - `icmp`;
-  - unconditional `br`;
-  - conditional `br` with SMT pruning;
-  - scalar `ret`.
-- Unsupported instructions return explicit `TransferError`.
-
-`src/analysis/may_must_rules.rs`
-
-- Contains the first explicit named-rule layer that keeps the code close to the
-  SMASH paper.
-- It is a facade over `predicates.rs` and `summary_store.rs`, not a new solver
-  or executor.
-- It currently implements named summary applicability checks.
-
-Section 2 target examples now present:
-
-- `src/analysis/smt_engine.rs` has unit tests for Figure 1's not-may summary
-  for `g` and Figure 2's must summary for `f`.
-- `tests/paper_section2_fig1_not_may.c` is a future direct-call composition
-  fixture for Figure 1.
-- Figures 3 and 4 are intentionally not added yet because they rely on
-  pre-existing/external `bar` summaries.
-
-## What Was Added In The Paper-Shaped `analysis2` Scaffold
-
-`src/analysis2` is a new development line for mapping the SMASH paper
-one-to-one into code. It is intentionally independent from `src/analysis`:
+The active paper-shaped modules are:
 
 ```text
-analysis  = current executable prototype and SMT-backed experiment
-analysis2 = paper-vocabulary scaffold for explicit rules
+src/analysis/vocabulary.rs   -> procedure, node, edge, and region IDs
+src/analysis/formula.rs      -> solver-independent predicates
+src/analysis/oracle.rs       -> PredicateOracle and TransitionOracle
+src/analysis/llvm_adapter.rs -> FunctionGraph -> (PaperProcedure, metadata)
+src/analysis/cfg.rs          -> PaperProcedure, PaperEdge, Gamma_e
+src/analysis/state.rs        -> Pi_n, Omega_n, regions, may edges
+src/analysis/summaries.rs    -> ReachabilityQuery, ProcedureSummary, SummaryTable
+src/analysis/transfer.rs     -> LlvmTransitionOracle and LlvmEdgeTransfer
+src/analysis/rules.rs        -> named paper rules
+src/analysis/driver.rs       -> summary reuse + intraprocedural worklist
+src/analysis/design.md       -> paper-to-code map
 ```
 
-The new tree currently contains:
-
-- `src/analysis2/vocabulary.rs`: procedure, node, edge, and region IDs.
-- `src/analysis2/formula.rs`: solver-independent predicates over state sets.
-- `src/analysis2/oracle.rs`: abstract predicate and transition oracles.
-- `src/analysis2/llvm_adapter.rs`: Option A bridge from `FunctionGraph` to
-  paper edges plus external `EdgeId -> LlvmEdgeMetadata`.
-- `src/analysis2/cfg.rs`: paper-shaped procedures, edges, and `Gamma_e`.
-- `src/analysis2/state.rs`: `Pi_n`, `Omega_n`, regions, and may edges.
-- `src/analysis2/summaries.rs`: paper-style reachability queries plus `Must`
-  and `NotMay` summaries.
-- `src/analysis2/transfer.rs`: LLVM-backed `TransitionOracle` and
-  `LlvmEdgeTransfer` interface over adapter metadata.
-- `src/analysis2/rules.rs`: explicit named rule functions:
-  - `must_post_edge`;
-  - `not_may_pre_edge`;
-  - `must_post_use_summary`;
-  - `not_may_pre_use_summary`;
-  - `applicable_must_summary`;
-  - `applicable_not_may_summary`;
-  - `create_must_summary`;
-  - `create_not_may_summary`.
-- `src/analysis2/driver.rs`: deterministic summary-reuse order before
-  intraprocedural analysis.
-- `src/analysis2/design.md`: the paper-to-code map for the new tree.
-
-The key difference from `src/analysis/may_must_rules.rs` is that
-`analysis2::rules::must_post_edge` is the paper's transition rule:
+The current driver already has:
 
 ```text
-Omega_n1 + Gamma_e -> theta -> Omega_n2
+answer_from_summaries
+run_intraprocedural
 ```
 
-It is not just a cached-summary postcondition applicability check.
-
-## Important Design Decisions
-
-Use one forward transfer layer.
-
-Do not build separate pre-transfer and post-transfer implementations. Each
-instruction transfer consumes one `SmtPathState` and returns the next
-`SmtPathState`:
+The worklist unit is:
 
 ```text
-state_before_instruction -> state_after_instruction
+(edge, source region, destination region)
 ```
 
-`SummaryPhase::Pre` and `SummaryPhase::Post` are function-boundary concepts,
-not per-instruction transfer modes. A function summary relation is assembled at
-return or violation boundaries, for example:
+Current rule use inside the worklist:
 
 ```text
-Post.ret == term_built_from_Pre.params_and_path_constraints
+MUST-POST   -> grows Omega_n
+NOTMAY-PRE  -> splits Pi_n and records may edges
 ```
 
-Keep `src/analysis/may_must.rs` intact for now.
+## What Is Archived
 
-The current CLI is useful as executable documentation and regression coverage.
-The SMT path should become independently tested before replacing or integrating
-with the CLI path.
-
-Do not add May summaries.
-
-Persist only:
+The following are archived only and should not be treated as active behavior:
 
 ```text
-Must   : there exists a witness path
-NotMay : no supported path reaches the queried target
+obsolete/src/analysis/may_must.rs
+obsolete/src/analysis/summary_store.rs
+obsolete/src/analysis/may_must_rules.rs
+obsolete/src/analysis/predicates.rs
+obsolete/src/analysis/smt_path.rs
+obsolete/src/analysis/analysis_flow.md
+obsolete/src/analysis/summary_store_design.md
+obsolete/src/analysis/memory_updates.md
 ```
 
-May analysis is an internal process that can produce a `NotMay` proof. A saved
-May summary is not useful for answering the top-level query.
+Use them for reference only when porting ideas into the active tree.
 
-Use `analysis2` for paper-shaped rules before deepening the engine.
+## Immediate Next Work
 
-The goal is not to invent extra abstraction. The old SMT path can stay
-executable while the new tree makes the paper mapping explicit:
+1. Make the driver genuinely interprocedural.
+   - Use `answer_from_summaries` before fresh analysis.
+   - Add call-edge handling through:
+     - `must_post_use_summary`
+     - `not_may_pre_use_summary`
+   - Instantiate callee queries from caller state and resume the caller from
+     callee summaries.
 
-```text
-src/analysis        -> working prototype/SMT experiment
-src/analysis2       -> paper-shaped rules and state
-analysis2/rules.rs  -> named paper obligations
-analysis2/state.rs  -> Pi_n, Omega_n, and may edges
-analysis2/cfg.rs    -> Gamma_e and graph shape
-analysis2/oracle.rs -> abstract set and transition queries
-analysis2/llvm_adapter.rs -> FunctionGraph -> (PaperProcedure, metadata table)
-analysis2/transfer.rs -> metadata-backed transition oracle
-```
+2. Add summary creation, not just summary lookup.
+   - Emit `Must` when the target is shown reachable.
+   - Emit `NotMay` when the target is shown unreachable over the supported
+     fragment.
+   - Keep summaries target-specific.
 
-Current `analysis2` rule functions:
+3. Keep target selection honest while doing the interprocedural work.
+   - Current stopgap: first embedded `may_assert(...)`.
+   - Next real step: resolve one explicit target assertion from the CLI/query.
 
-```text
-must_post_edge
-not_may_pre_edge
-must_post_use_summary
-not_may_pre_use_summary
-applicable_must_summary
-applicable_not_may_summary
-```
+4. Strengthen the active oracle path.
+   - Add an analysis-level SMT encoding module under `src/analysis`.
+   - Prefer one combined `SmtOracle` implementing both `PredicateOracle` and
+     `TransitionOracle` unless the code gets too large.
+   - Add an SMT-backed `PredicateOracle`.
+   - Strengthen `LlvmTransitionOracle` beyond the current syntactic
+     guard/effect approximation.
+   - Make `theta subset Post(Gamma_e, source)` and
+     `Pre(Gamma_e, target) subset beta` more faithful.
+   - Keep LLVM metadata extraction in `llvm_adapter.rs`; do not put solver
+     setup there.
 
-Keep the summary-applicability directions marked for review until checked
-against the SMASH paper.
+5. Clarify memory in paper terms.
+   - Decide what memory object should live in the active state/query language.
+   - Port only the useful ideas from `obsolete/src/analysis/memory_updates.md`.
+   - Keep the active tree paper-readable while doing it.
+
+6. Expand LLVM coverage when needed by the active driver.
+   - calls with summaries
+   - `phi`
+   - `switch`
+   - `getelementptr`
+   - casts/conversions
+   - richer return/query handling
 
 ## Commands To Re-Establish Context
 
-Run Rust tests:
+Run unit tests:
 
 ```sh
 cargo test
 ```
 
-Generate C test bitcode and readable LLVM IR:
+Generate bitcode and readable LLVM IR:
 
 ```sh
 make -C tests ir
 ```
 
-Run the existing CLI smoke test:
+Run the active smoke test:
 
 ```sh
 make -C tests smoke
 ```
 
-Use offline cargo if network is unavailable:
+Run the current driver directly:
 
 ```sh
-CARGO_FLAGS=--offline make -C tests smoke
-```
-
-Run the default legacy analyzer directly:
-
-```sh
-cargo run --bin main -- tests/out/short_assert.bc
-```
-
-Run the experimental SMT analyzer directly:
-
-```sh
-cargo run --bin main -- tests/out/short_assert.bc --engine smt
+cargo run --bin main -- tests/out/smash_must.bc
 ```
 
 ## Files To Start With Tomorrow
 
-- `src/analysis2/design.md`: read this first for the new paper-shaped track.
-- `src/analysis2/rules.rs`: continue making SMASH rules explicit.
-- `src/analysis2/state.rs`: extend `Pi_n`, `Omega_n`, and region-splitting
-  support.
-- `src/analysis2/cfg.rs`: clarify local, branch, call, and return edge
-  semantics in terms of `Gamma_e`.
-- `src/analysis2/oracle.rs`: add the future SMT-backed oracle boundary.
-- `src/analysis2/llvm_adapter.rs`: extend edge metadata and conversion from
-  LLVM instruction graph.
-- `src/analysis2/transfer.rs`: improve post/pre approximations beyond current
-  syntactic guard/effect model.
-- `src/analysis/smt_engine.rs`: extend the first worklist beyond direct
-  intraprocedural assertions.
-- `src/analysis/may_must_rules.rs`: review and extend explicit named rule
-  functions before wiring deeper summary logic into the engine.
-- `src/analysis/transfer.rs`: add missing LLVM instruction semantics only when
-  the engine needs them.
-- `src/analysis/smt_path.rs`: entry states, feasibility, branch states, return
-  relations, and the current simple memory bindings.
-- `src/analysis/memory_updates.md`: concrete plan to remove the temporary
-  map-based SMT memory and route memory terms through `StateEncoding`.
-- `src/analysis/summary_store.rs`: record and query `Must`/`NotMay` summaries.
-- `src/analysis/predicates.rs`: extend formulas only if the scalar worklist
-  needs a missing term or connective.
-- `src/llvm_utils/program_graph.rs`: use `FunctionGraph::start`, `edges`, and
-  `params`.
-- `src/llvm_utils/llvm_wrap.rs`: use existing instruction wrappers; add new
-  wrappers only when the SMT worklist really needs them.
-- `src/analysis/may_must.rs`: reference behavior only; avoid changing it during
-  the first SMT worklist pass.
+- `src/analysis/analysis_flowq.md`
+- `src/analysis/design.md`
+- `src/analysis/driver.rs`
+- `src/analysis/rules.rs`
+- `src/analysis/state.rs`
+- `src/analysis/cfg.rs`
+- `src/analysis/oracle.rs`
+- `src/analysis/llvm_adapter.rs`
+- `src/analysis/transfer.rs`
+- `src/analysis/summaries.rs`
+- `src/main.rs`
 
-## Tomorrow's Task List
+Use the archived tree only when you need old implementation ideas:
 
-1. Continue the paper-shaped `analysis2` track until the rules map cleanly.
-   - Keep it independent from `src/analysis`.
-   - Keep Option A split: `PaperEdge` LLVM-agnostic, metadata in external
-     `EdgeId -> LlvmEdgeMetadata`.
-   - Add the intraprocedural worklist over `Pi_n`, `Omega_n`, and `N_e`.
-   - Apply `must_post_edge` to update `Omega_n2`.
-   - Apply `not_may_pre_edge` to refine `Pi_n1`.
-   - Add tests that name the paper symbols directly.
+- `obsolete/src/analysis/analysis_flow.md`
+- `obsolete/src/analysis/summary_store_design.md`
+- `obsolete/src/analysis/memory_updates.md`
 
-2. Start the memory migration described in `src/analysis/memory_updates.md`
-   only after the `analysis2` rule shape is comfortable.
-   - Add solver-independent `MemoryTerm` and `IntTerm::Load`.
-   - Encode memory terms through `StateEncoding`.
-   - Replace `SmtPathState`'s `HashMap<pointer-key, IntTerm>` memory with a
-     current memory term.
-   - Update `store`/`load` transfer to construct memory terms instead of using
-     pointer-key map lookups.
-   - Keep `cargo test` and `make -C tests smt-smoke` green.
+## First Concrete Commit Next Session
 
-3. Add the next focused regression coverage for the SMT CLI path.
-   - Unsupported `phi`, `switch`, or non-`may_assert` call returns `UNKNOWN`.
-   - Direct-call Figure 1 stays expected-unsupported until call summaries are
-     implemented.
+Start the real paper path, not another local cleanup:
 
-4. Review `src/analysis/may_must_rules.rs` against the SMASH paper.
-   - Confirm or correct the current `must_pre` direction.
-   - Confirm or correct the current `must_post` intersection check.
-   - Confirm or correct the `not_may_pre` and `not_may_post` directions.
-   - Keep the rule module as a facade over formulas and summaries only.
-   - Do not add raw Z3 or LLVM transfer logic here.
-
-5. Start direct-call summary composition in the SMT path.
-   - Detect non-`may_assert` calls in `smt_engine.rs`.
-   - Query the callee with actual/formal parameter binding.
-   - Instantiate callee `Must` and `NotMay` summaries in the caller context.
-   - Return `UNKNOWN` for recursion until a specific recursive strategy exists.
-
-6. Decide how command-line assertions should enter the SMT path.
-   - Either translate `expressions::Expr` into `Formula`.
-   - Or keep `--assert` explicitly legacy-only until return-query summaries are
-     implemented.
-
-7. Keep existing regressions green.
-
-```sh
-cargo test
-make -C tests smoke
-```
-
-## First Concrete Commit Tomorrow
-
-Target a small commit that advances the paper-shaped scaffold without changing
-the legacy default:
-
-- add an `analysis2` intraprocedural driver skeleton over `Pi_n`, `Omega_n`,
-  and `N_e`;
-- add tests for `MUST-POST` and `NOTMAY-PRE` with explicit `Gamma_e`, `theta`,
-  and `beta` names;
-- keep `analysis2` independent from `src/analysis`;
-- keep `cargo test` passing.
-
-The follow-up commit can remove the temporary SMT memory map:
-
-- implement `MemoryTerm` and `IntTerm::Load`;
-- route `store`/`load` transfer through solver-independent memory terms;
-- delete `SmtPathState`'s map-based memory helpers;
-- add focused memory-term tests;
-- review and adjust explicit named summary applicability rules if needed;
-- keep `cargo test` passing.
-
-Do not add direct-call composition, `phi`, or `switch` in that commit unless
-the memory migration is already passing cleanly.
-
-## Follow-On Work After The Scalar SMT Worklist
-
-1. Create `docs/llvm-transfer-semantics.md`.
-2. Add `getelementptr` or return `UNKNOWN` for it explicitly.
-3. Finish direct-call summary composition:
-   - actual/formal binding;
-   - callee return to caller result;
-   - assertion inside callee;
-   - recursion returns `UNKNOWN`.
-4. Consider making `--engine smt` the default only after direct calls,
-   command-line assertions, and core memory behavior are tested.
-
-## Design Guardrails
-
-- Do not claim full SMASH until predicate abstraction, DART-style must
-  generation, and full summary checks exist.
-- Prefer `UNKNOWN` over unsound `SAFE`.
-- Keep generated `.ll`, `.bc`, and DOT files ignored and reproducible.
-- Keep test C inputs in `tests/`; generated files belong in `tests/out/`.
-- Keep `may_must.rs` stable until the SMT engine has its own regression tests.
+1. route the driver through `answer_from_summaries`;
+2. add one end-to-end call-edge case that uses a callee summary;
+3. create the resulting `Must` or `NotMay` summary in the active table;
+4. after that, start `src/analysis/smt_encoding.rs` with a combined SMT-backed
+   oracle for both predicate and transition queries;
+5. keep `cargo test` and `make -C tests smoke` green.

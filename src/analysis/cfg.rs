@@ -1,7 +1,17 @@
 //! Paper-shaped CFG and edge-transition vocabulary.
+//!
+//! Paper correspondence:
+//!
+//! ```text
+//! PaperProcedure -> procedure P
+//! NodeId         -> node n
+//! PaperEdge      -> edge e
+//! PaperEdge::gamma -> Gamma_e
+//! EdgeKind       -> edge classification used by the implementation
+//! ```
 
-use crate::analysis2::formula::Predicate;
-use crate::analysis2::vocabulary::{EdgeId, NodeId, ProcedureName};
+use crate::analysis::formula::Predicate;
+use crate::analysis::vocabulary::{EdgeId, NodeId, ProcedureName};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperProcedure {
@@ -35,6 +45,18 @@ impl PaperProcedure {
         self.add_node(edge.to);
         self.edges.push(edge);
         self.edges.sort_by_key(|edge| edge.id);
+    }
+
+    pub fn edge(&self, edge_id: EdgeId) -> Option<&PaperEdge> {
+        self.edges.iter().find(|edge| edge.id == edge_id)
+    }
+
+    pub fn outgoing_edges(&self, node: NodeId) -> impl Iterator<Item = &PaperEdge> {
+        self.edges.iter().filter(move |edge| edge.from == node)
+    }
+
+    pub fn incoming_edges(&self, node: NodeId) -> impl Iterator<Item = &PaperEdge> {
+        self.edges.iter().filter(move |edge| edge.to == node)
     }
 }
 

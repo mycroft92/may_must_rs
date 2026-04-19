@@ -4,13 +4,22 @@
 //! current executable implementation.  It should remain free of LLVM and Z3
 //! details.  Those details enter through `PredicateOracle` and
 //! `TransitionOracle`.
+//!
+//! Paper correspondence:
+//!
+//! ```text
+//! must_post_edge            -> MUST-POST
+//! not_may_pre_edge          -> NOTMAY-PRE
+//! must_post_use_summary     -> MUST-POST-USE-SUMMARY
+//! not_may_pre_use_summary   -> NOTMAY-PRE-USE-SUMMARY
+//! applicable_*_summary      -> summary applicability checks
+//! ```
 
-use crate::analysis2::cfg::PaperEdge;
-use crate::analysis2::formula::Predicate;
-use crate::analysis2::oracle::{OracleResult, PredicateOracle, TransitionOracle};
-use crate::analysis2::state::MayEdge;
-use crate::analysis2::summaries::{ProcedureSummary, ReachabilityQuery, SummaryKind};
-use crate::analysis2::vocabulary::{EdgeId, RegionId};
+use crate::analysis::cfg::PaperEdge;
+use crate::analysis::formula::Predicate;
+use crate::analysis::oracle::{OracleResult, PredicateOracle, TransitionOracle};
+use crate::analysis::summaries::{ProcedureSummary, ReachabilityQuery, SummaryKind};
+use crate::analysis::vocabulary::{EdgeId, RegionId};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -85,7 +94,6 @@ pub enum RuleConclusion {
         beta: Predicate,
         keep_region: Predicate,
         reject_region: Predicate,
-        may_edge: MayEdge,
     },
     ReuseSummary {
         summary: ProcedureSummary,
@@ -151,8 +159,8 @@ pub fn not_may_pre_edge<P, T>(
     predicates: &P,
     transitions: &T,
     edge: &PaperEdge,
-    source_region_id: RegionId,
-    dest_region_id: RegionId,
+    _source_region_id: RegionId,
+    _dest_region_id: RegionId,
     source_region: &Predicate,
     dest_region: &Predicate,
     omega_n1: &Predicate,
@@ -187,15 +195,12 @@ where
 
     let keep_region = Predicate::and([source_region.clone(), beta.clone()]);
     let reject_region = Predicate::and([source_region.clone(), Predicate::not(beta.clone())]);
-    let may_edge = MayEdge::new(edge.id, source_region_id, dest_region_id);
-
     Ok(RuleApplication::applied(
         RuleName::NotMayPre,
         RuleConclusion::RefineAndAddMayEdge {
             beta,
             keep_region,
             reject_region,
-            may_edge,
         },
         "beta over-approximates Pre(Gamma_e, phi2) and excludes Omega_n1",
     ))
@@ -253,9 +258,9 @@ where
 pub fn not_may_pre_use_summary<P>(
     predicates: &P,
     summary: &ProcedureSummary,
-    edge_id: EdgeId,
-    source_region_id: RegionId,
-    dest_region_id: RegionId,
+    _edge_id: EdgeId,
+    _source_region_id: RegionId,
+    _dest_region_id: RegionId,
     source_region: &Predicate,
     dest_region: &Predicate,
     omega_n1: &Predicate,
@@ -294,7 +299,6 @@ where
             beta: theta.clone(),
             keep_region: Predicate::and([source_region.clone(), theta.clone()]),
             reject_region: Predicate::and([source_region.clone(), Predicate::not(theta)]),
-            may_edge: MayEdge::new(edge_id, source_region_id, dest_region_id),
         },
         "not-may summary supplies the preimage-side splitter",
     ))
@@ -383,7 +387,7 @@ where
 }
 
 pub fn create_must_summary(
-    procedure: impl Into<crate::analysis2::vocabulary::ProcedureName>,
+    procedure: impl Into<crate::analysis::vocabulary::ProcedureName>,
     pre: Predicate,
     post: Predicate,
     witness: impl Into<String>,
@@ -398,7 +402,7 @@ pub fn create_must_summary(
 }
 
 pub fn create_not_may_summary(
-    procedure: impl Into<crate::analysis2::vocabulary::ProcedureName>,
+    procedure: impl Into<crate::analysis::vocabulary::ProcedureName>,
     pre: Predicate,
     post: Predicate,
     proof: impl Into<String>,
@@ -415,9 +419,9 @@ pub fn create_not_may_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis2::cfg::PaperEdge;
-    use crate::analysis2::oracle::SyntacticOracle;
-    use crate::analysis2::vocabulary::{EdgeId, NodeId};
+    use crate::analysis::cfg::PaperEdge;
+    use crate::analysis::oracle::SyntacticOracle;
+    use crate::analysis::vocabulary::{EdgeId, NodeId};
 
     #[test]
     fn must_post_uses_gamma_edge_to_produce_theta() {

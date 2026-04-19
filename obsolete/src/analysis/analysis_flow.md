@@ -1,5 +1,9 @@
 # Analysis Flow: Paper-To-Code Mapping
 
+Archived note: this document describes the old `obsolete/src/analysis`
+development line. It is preserved for reference only. The active analysis path
+now lives under `src/analysis` and is documented in `src/analysis/design.md`.
+
 This note explains how the SMASH paper concepts map to this repository's code,
 where each paper-level rule should live, and how the top-level analyzer should
 call those rules.
@@ -17,9 +21,8 @@ SMT symbol encoding     -> state.rs
 raw Z3 operations       -> smt/solver.rs
 ```
 
-The default CLI still runs `may_must.rs`. The SMT-backed path described here is
-available behind `--engine smt` for direct embedded `may_assert` queries and is
-still being built beside the legacy implementation.
+At the time this note was written, the default CLI still ran `may_must.rs`.
+That is no longer true in the active tree.
 
 ## Paper Concepts
 

@@ -3,6 +3,15 @@
 //! These predicates are deliberately small.  They are set descriptions over
 //! program states, not raw SMT ASTs.  Rule code asks an oracle about emptiness,
 //! subset, and intersection instead of embedding a solver here.
+//!
+//! Paper correspondence:
+//!
+//! ```text
+//! Predicate -> phi, beta, theta, query pre/post, summary pre/post
+//! ```
+//!
+//! This file intentionally stays above SMT. Encoding these predicates into Z3
+//! belongs in a future analysis-level encoding/oracle layer, not here.
 
 use std::fmt;
 

@@ -11,133 +11,128 @@ At the start of a new session, read these files in order:
 2. `TODO.md`
 3. `TASKVIEW.md`
 4. `AGENTS.md`
-5. `src/analysis/analysis_flow.md`
-6. `src/analysis/summary_store_design.md`
-7. `src/analysis2/design.md`
+5. `src/analysis/design.md`
+6. `src/analysis/analysis_flowq.md`
 
-Then inspect the relevant Rust modules before editing. For paper-shaped rule
-work, start with:
+If the task touches the archived implementation, also read:
+
+1. `obsolete/src/analysis/analysis_flow.md`
+2. `obsolete/src/analysis/summary_store_design.md`
+3. `obsolete/src/analysis/memory_updates.md`
+
+Then inspect the relevant Rust modules before editing.
+
+For active paper-shaped work, start with:
 
 ```text
-src/analysis2/rules.rs
-src/analysis2/state.rs
-src/analysis2/cfg.rs
-src/analysis2/oracle.rs
-src/analysis2/llvm_adapter.rs
-src/analysis2/transfer.rs
-src/analysis2/summaries.rs
-src/analysis2/driver.rs
-src/analysis2/formula.rs
+src/analysis/rules.rs
+src/analysis/state.rs
+src/analysis/cfg.rs
+src/analysis/oracle.rs
+src/analysis/llvm_adapter.rs
+src/analysis/transfer.rs
+src/analysis/summaries.rs
+src/analysis/driver.rs
+src/analysis/formula.rs
 ```
 
-For the existing SMT-analysis work, start with:
+For archived-reference work only, start with:
 
 ```text
-src/analysis/may_must_rules.rs
-src/analysis/summary_store.rs
-src/analysis/smt_engine.rs
-src/analysis/transfer.rs
-src/analysis/smt_path.rs
-src/analysis/predicates.rs
-src/analysis/state.rs
+obsolete/src/analysis/analysis_flow.md
+obsolete/src/analysis/summary_store_design.md
+obsolete/src/analysis/memory_updates.md
+obsolete/src/analysis/
 src/smt/solver.rs
 ```
 
-The default CLI still uses:
-
-```text
-src/analysis/may_must.rs
-```
-
-Treat `may_must.rs` as the working toy/reference implementation. The
-experimental SMT path is selected with `--engine smt` and currently covers
-direct embedded `may_assert` queries only.
-
-`src/analysis2` is scaffold-only and intentionally independent from
-`src/analysis`. Use it when the task is to map the paper rules one-to-one.
-Do not import `crate::analysis` from `analysis2`.
-
 ## Current Architecture
+
+The active implementation is the paper-shaped tree in `src/analysis`.
 
 The intended module boundaries are:
 
 ```text
-paper proof rules        -> src/analysis/may_must_rules.rs
-summary storage/search   -> src/analysis/summary_store.rs
-query orchestration      -> src/analysis/smt_engine.rs
-LLVM instruction meaning -> src/analysis/transfer.rs
-path state               -> src/analysis/smt_path.rs
-formula vocabulary       -> src/analysis/predicates.rs
-SMT symbol encoding      -> src/analysis/state.rs
-raw Z3 operations        -> src/smt/solver.rs
-default toy analyzer     -> src/analysis/may_must.rs
-```
-
-Do not blur these boundaries without a concrete reason.
-
-The paper-shaped `analysis2` boundaries are:
-
-```text
-named SMASH rules      -> src/analysis2/rules.rs
-Pi_n / Omega_n / Ne    -> src/analysis2/state.rs
-P / n / e / Gamma_e    -> src/analysis2/cfg.rs
-predicate vocabulary   -> src/analysis2/formula.rs
-set/transition queries -> src/analysis2/oracle.rs
-LLVM bridge            -> src/analysis2/llvm_adapter.rs
-edge transfer model    -> src/analysis2/transfer.rs
-procedure summaries    -> src/analysis2/summaries.rs
-summary orchestration  -> src/analysis2/driver.rs
+named SMASH rules      -> src/analysis/rules.rs
+Pi_n / Omega_n / N_e   -> src/analysis/state.rs
+P / n / e / Gamma_e    -> src/analysis/cfg.rs
+predicate vocabulary   -> src/analysis/formula.rs
+set/transition queries -> src/analysis/oracle.rs
+LLVM bridge            -> src/analysis/llvm_adapter.rs
+edge transfer model    -> src/analysis/transfer.rs
+procedure summaries    -> src/analysis/summaries.rs
+summary orchestration  -> src/analysis/driver.rs
 ```
 
 Keep the core paper modules (`cfg`, `formula`, `state`, `rules`, `summaries`,
 `driver`, `oracle`) free of LLVM and Z3 details. LLVM specifics should stay in
 `llvm_adapter.rs` and `transfer.rs`.
 
+The archived implementation now lives under:
+
+```text
+obsolete/src/analysis
+```
+
+Do not move archived concepts back into `src/analysis` unless there is a
+deliberate migration step.
+
+## Current CLI
+
+`src/main.rs` now drives the paper-shaped tree directly:
+
+```text
+LLVM bitcode
+  -> llvm_utils::program_graph::generate_program_graph
+  -> analysis::llvm_adapter::adapt_function_graph
+  -> analysis::driver::PaperDriver::run_intraprocedural
+```
+
+Current default query policy:
+
+```text
+one target assertion per query
+current CLI policy = first embedded may_assert(...)
+post = assert_violation(site) && !assert_arg
+```
+
+Only the selected target site is turned into `assert_violation(site)`;
+non-target `may_assert(...)` calls stay as ordinary call effects.
+
+`--assert` is not implemented in the active driver.
+
 ## Flow Rules
 
-The SMT-backed analysis should follow this high-level flow:
+The active intraprocedural flow is:
 
 ```text
-analyze_query(graph, query)
-  1. ask SummaryStore for an applicable Must summary
-  2. ask SummaryStore for an applicable NotMay summary
-  3. if neither applies, execute the function body
-  4. if a feasible target is found, create a Must summary
-  5. if all supported paths finish without target, create a NotMay summary
-  6. if unsupported/undecidable, return Unknown
+run_intraprocedural(procedure, query)
+  1. initialize Pi_n and Omega_n from the query
+  2. enqueue (edge, source region, destination region) obligations
+  3. apply MUST-POST to grow Omega_n
+  4. apply NOTMAY-PRE to split Pi_n and record may edges
+  5. requeue obligations affected by Omega growth or partition refinement
+  6. stop at REACHABLE, obligation limit, or worklist exhaustion
 ```
 
-Summary lookup should read as paper-rule application:
+Current initialization:
 
 ```text
-SummaryStore::find_applicable_must
-  -> may_must_rules::applicable_must_summary
-      -> must_pre
-      -> must_post
-
-SummaryStore::find_applicable_not_may
-  -> may_must_rules::applicable_not_may_summary
-      -> not_may_pre
-      -> not_may_post
+Omega_entry = query.pre
+Pi_exit     = { query.post, !query.post }
+other Pi_n  = { true }
 ```
 
-Current named obligations:
+Current requeue policy:
 
 ```text
-MustPre:    summary.pre entails query.pre
-MustPost:   summary.post intersects query.post
-
-NotMayPre:  query.pre entails summary.pre
-NotMayPost: query.post entails summary.post
+Omega growth at node n -> enqueue outgoing obligations from n
+Pi split at node n     -> enqueue incoming and outgoing obligations touching n
 ```
-
-These directions mirror the current implementation and remain marked for review
-against the SMASH paper before relying on the SMT path as the default engine.
 
 ## Rule Placement
 
-For the paper-shaped track, prefer `src/analysis2/rules.rs`. Its rule names
-should correspond directly to the SMASH paper, for example:
+Rule names in `src/analysis/rules.rs` should match the paper directly:
 
 ```text
 MUST-POST                  -> must_post_edge
@@ -146,7 +141,7 @@ MUST-POST-USE-SUMMARY      -> must_post_use_summary
 NOTMAY-PRE-USE-SUMMARY     -> not_may_pre_use_summary
 ```
 
-In that tree:
+In the active tree:
 
 ```text
 Gamma_e  -> PaperEdge::gamma
@@ -156,34 +151,19 @@ theta    -> RuleConclusion::AddOmega
 beta     -> RuleConclusion::RefineAndAddMayEdge
 ```
 
-The older `src/analysis/may_must_rules.rs` is currently a summary-applicability
-facade for the SMT experiment, not the full intraprocedural paper rule layer.
+`rules.rs` may:
 
-`may_must_rules.rs` should contain named paper proof obligations only.
+- inspect `PaperEdge`, `ProcedureSummary`, and `ReachabilityQuery`;
+- call `PredicateOracle` and `TransitionOracle`;
+- return structured rule applications and conclusions.
 
-It may:
+`rules.rs` must not:
 
-- call `Formula::entails_in`;
-- call `Formula::intersects_in`;
-- inspect `FunctionSummary`, `SmtQuery`, `SummaryKind`, and `SummaryTarget`;
-- return structured rule-check results.
-
-It must not:
-
-- run a CFG worklist;
-- inspect LLVM instructions directly;
-- own raw Z3 solver operations;
+- inspect raw LLVM instruction wrappers directly;
+- own Z3 solver operations;
+- run the CFG worklist;
 - store summaries;
-- create summaries;
 - implement LLVM transfer semantics.
-
-`summary_store.rs` should search cached summaries and delegate rule decisions
-to `may_must_rules.rs`.
-
-`smt_engine.rs` should decide when to apply summaries, execute functions, and
-record new `Must`/`NotMay` summaries.
-
-`transfer.rs` should only model LLVM instruction semantics over `SmtPathState`.
 
 ## Summary Policy
 
@@ -194,81 +174,32 @@ Must   : there exists a witness path
 NotMay : no supported path reaches the queried target
 ```
 
-Do not add persistent May summaries. May analysis is an internal process that
-can eventually produce a NotMay proof. A saved May fact is too weak to answer
-the top-level query.
+Do not add persistent May summaries.
 
-Summaries should use function-boundary vocabulary:
-
-```text
-SummaryPhase::Pre
-SummaryPhase::Post
-Pre.param_i
-Post.ret
-Pre.mem
-Post.mem
-```
-
-Do not persist summaries in terms of local temporary SSA names unless that is
-explicitly part of a short-lived construction step.
+The active `SummaryTable` is part of the paper tree, but summary use is not
+yet wired into call-edge execution. Keep summary types aligned with the paper
+even before that integration exists.
 
 ## Transfer Policy
 
-Use one forward transfer layer:
+The active transfer boundary is:
 
 ```text
-state_before_instruction -> state_after_instruction
+TransitionOracle
+  backed by
+LlvmTransitionOracle
 ```
 
-Do not create separate pre-transfer and post-transfer implementations.
-`SummaryPhase::Pre` and `SummaryPhase::Post` are function-boundary concepts,
-not per-instruction transfer modes.
-
-Current SMT transfer subset:
+Keep the design split:
 
 ```text
-alloca/store/load as a simple stack-memory map
-add
-sub
-mul
-icmp
-unconditional br
-conditional br with SMT pruning
-scalar ret
+LLVM IR / FunctionGraph      -> llvm_adapter.rs
+EdgeId -> LlvmEdgeMetadata   -> llvm_adapter.rs
+metadata -> guard/effect     -> transfer.rs
+paper rules consume Post/Pre -> rules.rs
 ```
 
-Unsupported instructions should produce `UNKNOWN`, not an unsound safe result.
-
-Memory caveat: the executable SMT path deliberately uses a temporary
-`HashMap<pointer-key, IntTerm>` in `SmtPathState`. `StateEncoding` has
-versioned SMT-array memory helpers, but the worklist does not use them yet.
-Do not treat the current `alloca`/`store`/`load` support as alias-aware or
-summary-ready memory semantics.
-
-## Assertion Policy
-
-Embedded assertions should be normalized conceptually as:
-
-```text
-target = AssertionViolation(assert_id)
-violation condition = !assert_arg
-```
-
-For an assertion query, the SMT engine should check:
-
-```text
-path_condition & !assert_arg & query.post
-```
-
-Outcomes:
-
-```text
-SAT      -> record Must
-UNSAT    -> continue this path
-UNKNOWN  -> return Unknown
-```
-
-Assertion-target handling belongs in `smt_engine.rs`, not in `transfer.rs`.
+Do not collapse this boundary by making `rules.rs` parse LLVM instructions.
 
 ## Documentation Guidelines
 
@@ -278,7 +209,7 @@ Use these destinations:
 
 ```text
 README.md
-  User-facing project status, how to run, current capabilities, and limitations.
+  User-facing project status, how to run, current capabilities, and limits.
 
 TODO.md
   Backlog and implementation checklist. Mark what exists versus what remains.
@@ -286,35 +217,33 @@ TODO.md
 TASKVIEW.md
   Resume document for the next session. Keep it concrete and ordered.
 
-src/analysis/analysis_flow.md
-  Paper-to-code mapping and top-level analysis flow.
+src/analysis/design.md
+  Paper-to-code map for Pi, Omega, Gamma_e, summaries, and rule names.
 
-src/analysis/summary_store_design.md
-  Query/summary/store design details and applicability caveats.
-
-src/analysis2/design.md
-  Paper-shaped scaffold map for Pi, Omega, Gamma_e, summaries, and rule names.
+src/analysis/analysis_flowq.md
+  Flow-oriented paper mapping, module correspondence, and SMT layering notes.
 
 AGENTS.md
   Agent/session instructions and stable engineering guardrails.
 ```
 
-When adding a new analysis concept:
+Archived notes stay under `obsolete/src/analysis`.
+
+When adding a new active analysis concept:
 
 1. Put the implementation in the narrowest correct module.
 2. Add focused unit tests.
 3. Update `TODO.md` if it changes the backlog.
 4. Update `TASKVIEW.md` if it changes the next-session plan.
-5. Update `analysis_flow.md` or `summary_store_design.md` if it changes the
-   paper-to-code mapping.
-6. Update `README.md` only when user-facing behavior, architecture status, or
-   run instructions change.
+5. Update `src/analysis/design.md` if it changes the paper-to-code mapping.
+6. Update `README.md` when user-facing behavior or run instructions change.
 
 Do not overclaim. Clearly distinguish:
 
 ```text
 implemented and CLI-active
-implemented but scaffold-only
+implemented but not wired
+archived reference code
 planned
 unsupported and returns Unknown
 ```
@@ -329,7 +258,7 @@ cargo test
 ```
 
 Run when touching CLI behavior, graph construction, LLVM wrapping, tests, or
-smoke-test assumptions:
+smoke assumptions:
 
 ```sh
 make -C tests smoke
@@ -343,12 +272,9 @@ CARGO_FLAGS=--offline make -C tests smoke
 
 ## Guardrails
 
-- Keep `src/analysis/may_must.rs` stable until the SMT engine has independent
-  regression coverage.
-- Prefer `UNKNOWN` over unsound `SAFE`.
+- Prefer `UNKNOWN` over unsound success claims.
 - Keep generated `.ll`, `.bc`, and DOT files out of source control.
 - Keep C test inputs in `tests/`; generated artifacts belong in `tests/out/`.
-- Add abstractions only when they make the paper-to-code mapping clearer or
-  remove real duplication.
-- Keep implementation close to the SMASH paper, but only fill gaps required by
-  the current milestone.
+- Keep the active implementation close to the paper and fill only the gaps the
+  current milestone needs.
+- Treat `obsolete/src/analysis` as reference material, not active code.

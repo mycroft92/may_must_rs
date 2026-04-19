@@ -17,6 +17,16 @@
 //! validity over linear arithmetic and uninterpreted functions. This file is
 //! the local hook for that future integration. Solver mechanics stay here;
 //! symbol identity should stay with the analysis encoding layer.
+//!
+//! Paper correspondence:
+//!
+//! ```text
+//! Z3Interface        -> raw theorem-prover operations
+//! SmtEncodingContext -> owned symbolic names for an analysis encoding
+//! ```
+//!
+//! This file is backend infrastructure only. It is not itself the paper-level
+//! oracle or the active analysis state encoding.
 
 use std::collections::HashMap;
 use z3::ast::{Array, Bool, Int, Real, BV};

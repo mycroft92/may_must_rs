@@ -5,12 +5,21 @@
 //! - a paper-shaped `PaperProcedure`;
 //! - an external `EdgeId -> LlvmEdgeMetadata` registry.
 //!
+//! Paper correspondence:
+//!
+//! ```text
+//! LLVM function CFG            -> procedure P
+//! LLVM instruction successor   -> edge e
+//! adapted edge metadata        -> implementation detail for Gamma_e lookup
+//! ```
+//!
 //! The paper modules (`cfg`, `rules`, `state`, `summaries`) remain LLVM-free.
-//! LLVM details stay here and are consumed by `analysis2::transfer`.
+//! LLVM details stay here and are consumed by `analysis::transfer`.
+//! This file should not own SMT encoding or solver operations.
 
-use crate::analysis2::cfg::{EdgeKind, EdgeTransition, PaperEdge, PaperProcedure};
-use crate::analysis2::formula::Predicate;
-use crate::analysis2::vocabulary::{EdgeId, NodeId, ProcedureName};
+use crate::analysis::cfg::{EdgeKind, EdgeTransition, PaperEdge, PaperProcedure};
+use crate::analysis::formula::Predicate;
+use crate::analysis::vocabulary::{EdgeId, NodeId, ProcedureName};
 use crate::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode};
 use crate::llvm_utils::program_graph::FunctionGraph;
 use std::collections::HashMap;

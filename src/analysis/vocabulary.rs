@@ -1,4 +1,13 @@
 //! Small paper-vocabulary identifiers.
+//!
+//! Paper correspondence:
+//!
+//! ```text
+//! ProcedureName -> procedure P
+//! NodeId        -> node n
+//! EdgeId        -> edge e
+//! RegionId      -> abstract partition block identifier
+//! ```
 
 use std::fmt;
 

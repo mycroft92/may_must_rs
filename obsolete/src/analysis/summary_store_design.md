@@ -1,5 +1,9 @@
 # Summary Store Design Notes
 
+Archived note: this document describes the old `obsolete/src/analysis`
+summary/query design. It is preserved for reference only. The active analysis
+path now lives under `src/analysis`.
+
 This note documents the current design intent for `summary_store.rs` and its
 relationship to `predicates.rs`, `smt_engine.rs`, and `smt_path.rs`.
 

@@ -1,5 +1,9 @@
 # Memory Updates: Moving Executable SMT Memory To StateEncoding
 
+Archived note: this document describes the old `obsolete/src/analysis`
+memory-migration plan. It is preserved for reference only. Any active memory
+design should be re-expressed in the paper-shaped `src/analysis` tree.
+
 This note records the current memory state and the next migration plan. It is
 intentionally explicit because the current executable SMT path has a temporary
 memory simplification that should not become the long-term design.

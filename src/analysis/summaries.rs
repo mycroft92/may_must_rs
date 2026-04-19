@@ -1,7 +1,18 @@
 //! Procedure summaries and top-level queries in paper vocabulary.
+//!
+//! Paper correspondence:
+//!
+//! ```text
+//! ProcedureSummary     -> boundary summary for a procedure
+//! SummaryKind::Must    -> must summary
+//! SummaryKind::NotMay  -> not-may summary
+//! ReachabilityQuery    -> query Q
+//! query.pre / query.post -> boundary predicates for the query
+//! ```
 
-use crate::analysis2::formula::Predicate;
-use crate::analysis2::vocabulary::ProcedureName;
+use crate::analysis::formula::Predicate;
+use crate::analysis::vocabulary::EdgeId;
+use crate::analysis::vocabulary::ProcedureName;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -63,6 +74,7 @@ pub struct ReachabilityQuery {
     pub procedure: ProcedureName,
     pub pre: Predicate,
     pub post: Predicate,
+    pub target_assertion: Option<EdgeId>,
 }
 
 impl ReachabilityQuery {
@@ -71,7 +83,13 @@ impl ReachabilityQuery {
             procedure: procedure.into(),
             pre,
             post,
+            target_assertion: None,
         }
+    }
+
+    pub fn with_target_assertion(mut self, target_assertion: EdgeId) -> Self {
+        self.target_assertion = Some(target_assertion);
+        self
     }
 }
 

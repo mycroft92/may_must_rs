@@ -11,8 +11,8 @@
  * It is kept as a target fixture for direct-call summary composition. The
  * paper writes this as main(int i1, int i2, int i3), but C only gives main a
  * few portable signatures, so the target procedure is named explicitly here.
- * The current --engine smt path is intraprocedural, so this file is built by
- * the IR target but not yet part of smt-smoke.
+ * The active paper driver does not support direct-call summary reuse yet, so
+ * this file is built by the IR target but not yet part of the smoke suite.
  */
 
 int g(int i) {

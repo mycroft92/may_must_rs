@@ -3,9 +3,23 @@
 //! The paper rules are written in terms of set operations.  This module keeps
 //! those decisions abstract so the same rules can later be backed by SMT,
 //! predicate abstraction, or hand-authored tests.
+//!
+//! Paper correspondence:
+//!
+//! ```text
+//! PredicateOracle::is_empty / intersects / subset
+//!   -> set reasoning over predicates
+//! TransitionOracle::post_under_approx
+//!   -> choose theta subset Post(Gamma_e, source)
+//! TransitionOracle::pre_over_approx
+//!   -> choose beta with Pre(Gamma_e, target) subset beta
+//! ```
+//!
+//! This file defines the interface the rules need. The future SMT-backed
+//! implementation should plug in here rather than changing `rules.rs`.
 
-use crate::analysis2::cfg::PaperEdge;
-use crate::analysis2::formula::Predicate;
+use crate::analysis::cfg::PaperEdge;
+use crate::analysis::formula::Predicate;
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,12 +58,53 @@ pub trait PredicateOracle {
 }
 
 pub trait TransitionOracle {
-    /// Returns a theta such that `theta` under-approximates
-    /// `Post(Gamma_e, source)`.
+    /// Returns a `theta` for the paper's forward rule step.
+    ///
+    /// Contract:
+    ///
+    /// ```text
+    /// theta subset Post(Gamma_e, source)
+    /// ```
+    ///
+    /// Inputs:
+    ///
+    /// - `edge` identifies the concrete edge relation `Gamma_e`;
+    /// - `source` is a predicate over source states, typically
+    ///   `Omega_n1 ∩ phi1`.
+    ///
+    /// Role in the paper:
+    ///
+    /// - `MUST-POST` needs some definitely reachable successor set;
+    /// - this method computes or chooses that under-approximate successor set.
+    ///
+    /// Allowed behavior:
+    ///
+    /// - it may return a smaller-than-ideal `theta`;
+    /// - it must not claim impossible successor states.
     fn post_under_approx(&self, edge: &PaperEdge, source: &Predicate) -> OracleResult<Predicate>;
 
-    /// Returns a beta such that `beta` over-approximates
-    /// `Pre(Gamma_e, target)`.
+    /// Returns a `beta` for the paper's backward rule step.
+    ///
+    /// Contract:
+    ///
+    /// ```text
+    /// Pre(Gamma_e, target) subset beta
+    /// ```
+    ///
+    /// Inputs:
+    ///
+    /// - `edge` identifies the concrete edge relation `Gamma_e`;
+    /// - `target` is a predicate over destination states, typically `phi2`.
+    ///
+    /// Role in the paper:
+    ///
+    /// - `NOTMAY-PRE` needs a safe predecessor over-approximation;
+    /// - this method computes or chooses that predecessor set.
+    ///
+    /// Allowed behavior:
+    ///
+    /// - it may return a larger-than-ideal `beta`;
+    /// - it must not exclude real predecessors that can reach `target`.
     fn pre_over_approx(&self, edge: &PaperEdge, target: &Predicate) -> OracleResult<Predicate>;
 }
 

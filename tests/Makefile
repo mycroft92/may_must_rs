@@ -1,4 +1,4 @@
-.PHONY: ir smoke smt-smoke clean
+.PHONY: ir smoke clean
 
 TEST_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 REPO_ROOT := $(abspath $(TEST_DIR)/..)
@@ -9,9 +9,6 @@ ir:
 
 smoke:
 	cd $(REPO_ROOT) && ./tests/smash_smoke.sh
-
-smt-smoke:
-	cd $(REPO_ROOT) && ./tests/smt_smoke.sh
 
 clean:
 	rm -rf $(OUT_DIR)
