@@ -33,7 +33,7 @@ assert_violation(site) && !assert_arg
 
 ```sh
 cargo test
-# 22 passed
+# 26 passed
 
 make -C tests smoke
 # passes
@@ -46,12 +46,12 @@ The active paper-shaped modules are:
 ```text
 src/analysis/vocabulary.rs   -> procedure, node, edge, and region IDs
 src/analysis/formula.rs      -> solver-independent predicates
-src/analysis/oracle.rs       -> PredicateOracle and TransitionOracle
+src/analysis/oracle.rs       -> PredicateOracle / TransitionOracle traits + SMT predicate oracle
 src/analysis/llvm_adapter.rs -> FunctionGraph -> (PaperProcedure, metadata)
 src/analysis/cfg.rs          -> PaperProcedure, PaperEdge, Gamma_e
 src/analysis/state.rs        -> Pi_n, Omega_n, regions, may edges
 src/analysis/summaries.rs    -> ReachabilityQuery, ProcedureSummary, SummaryTable
-src/analysis/transfer.rs     -> LlvmTransitionOracle and LlvmEdgeTransfer
+src/analysis/transfer.rs     -> LlvmTransitionOracle, SmtLlvmTransitionOracle, LlvmEdgeTransfer
 src/analysis/rules.rs        -> named paper rules
 src/analysis/driver.rs       -> summary reuse + intraprocedural worklist
 src/analysis/design.md       -> paper-to-code map
@@ -115,12 +115,10 @@ Use them for reference only when porting ideas into the active tree.
    - Next real step: resolve one explicit target assertion from the CLI/query.
 
 4. Strengthen the active oracle path.
-   - Add an analysis-level SMT encoding module under `src/analysis`.
-   - Prefer one combined `SmtOracle` implementing both `PredicateOracle` and
-     `TransitionOracle` unless the code gets too large.
-   - Add an SMT-backed `PredicateOracle`.
-   - Strengthen `LlvmTransitionOracle` beyond the current syntactic
-     guard/effect approximation.
+   - Keep improving `SmtPredicateOracle` and `SmtLlvmTransitionOracle`.
+   - Move from Boolean-atom encoding toward structured scalar/memory terms.
+   - Strengthen transition image reasoning beyond current guard/effect
+     conjunctions.
    - Make `theta subset Post(Gamma_e, source)` and
      `Pre(Gamma_e, target) subset beta` more faithful.
    - Keep LLVM metadata extraction in `llvm_adapter.rs`; do not put solver
@@ -167,7 +165,7 @@ cargo run --bin main -- tests/out/smash_must.bc
 
 ## Files To Start With Tomorrow
 
-- `src/analysis/analysis_flowq.md`
+- `src/analysis/analysis_flow.md`
 - `src/analysis/design.md`
 - `src/analysis/driver.rs`
 - `src/analysis/rules.rs`
@@ -192,6 +190,6 @@ Start the real paper path, not another local cleanup:
 1. route the driver through `answer_from_summaries`;
 2. add one end-to-end call-edge case that uses a callee summary;
 3. create the resulting `Must` or `NotMay` summary in the active table;
-4. after that, start `src/analysis/smt_encoding.rs` with a combined SMT-backed
-   oracle for both predicate and transition queries;
+4. after that, strengthen the SMT-backed oracles in `oracle.rs` and
+   `transfer.rs` with structured state encodings;
 5. keep `cargo test` and `make -C tests smoke` green.

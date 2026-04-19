@@ -3,11 +3,8 @@
 This file is the flow-heavy companion to `src/analysis/design.md`.
 
 `design.md` captures the stable module map. This document explains how a query
-is supposed to move through the active codebase, how that corresponds to the
-paper notation, and where SMT encoding should eventually sit.
-
-The filename is intentionally `analysis_flowq.md` because that is the active
-request for this repository.
+moves through the active codebase, how that corresponds to the paper notation,
+and where SMT encoding currently sits.
 
 ## 1. Current Active Flow
 
@@ -18,7 +15,8 @@ main.rs
   -> llvm_utils::program_graph::generate_program_graph(...)
   -> analysis::llvm_adapter::adapt_function_graph(...)
   -> build ReachabilityQuery
-  -> analysis::transfer::LlvmTransitionOracle
+  -> analysis::oracle::SmtPredicateOracle
+  -> analysis::transfer::SmtLlvmTransitionOracle
   -> analysis::driver::PaperDriver::run_intraprocedural(...)
   -> analysis::rules::{must_post_edge, not_may_pre_edge}
 ```
@@ -46,8 +44,8 @@ What is not active yet:
 
 - interprocedural summary-driven call handling;
 - summary creation lifecycle;
-- SMT-backed predicate reasoning;
-- SMT-backed transition images;
+- richer SMT encodings for scalar/memory terms;
+- faithful SMT transition images for LLVM effects;
 - paper-level memory;
 - full may/must alternation loop from the paper.
 
@@ -159,6 +157,13 @@ TransitionOracle::pre_over_approx
 
 This file is where solver-backed reasoning plugs into the rule layer without
 changing the rule APIs.
+
+Current implementations in this file:
+
+```text
+SyntacticOracle     -> tiny structural scaffold
+SmtPredicateOracle  -> SMT-backed emptiness/subset/intersection checks
+```
 
 ## 2.5. What `TransitionOracle` Actually Does
 
@@ -355,13 +360,15 @@ Owns LLVM-backed transition modeling:
 ```text
 LlvmEdgeTransfer            -> metadata -> guard/effect semantics
 LlvmTransitionOracle        -> TransitionOracle implementation
+SmtLlvmTransitionOracle     -> TransitionOracle implementation with SMT filtering
 edge_guard(...)             -> branch-side guard
 edge_effect(...)            -> current edge effect approximation
 ```
 
 Conceptually, this file is the LLVM-specific helper that approximates
-`Gamma_e`-based reasoning. Today it is syntactic. Later it should be backed by
-symbolic state and SMT, while still serving `TransitionOracle`.
+`Gamma_e`-based reasoning. Both transition oracles currently use the same
+guard/effect structure; the SMT variant rejects unsatisfiable candidates via
+`SmtPredicateOracle`.
 
 ### `src/analysis/driver.rs`
 
@@ -414,150 +421,48 @@ SmtEncodingContext -> symbol ownership and cached Z3 terms
 This file is not the paper-level oracle by itself. It is the backend utility
 that a future SMT encoding/oracle layer should use.
 
-## 3. Where SMT Should Enter
+## 3. Current SMT Layer
 
-The active tree does not yet have an SMT encoding layer in `src/analysis`.
-That is why the current rules are still backed by `SyntacticOracle` and the
-syntactic `LlvmTransitionOracle`.
-
-The clean layering is:
-
-```text
-formula.rs / state.rs
-  -> analysis-level vocabulary
-
-smt encoding layer
-  -> Predicate / state / Gamma_e into Z3 terms
-
-oracle implementation
-  -> emptiness / subset / intersection / post / pre
-
-rules.rs
-  -> unchanged paper rules
-```
-
-The important point is that `llvm_adapter.rs` should not set up SMT directly.
-It should only provide stable edge metadata.
-
-Likewise, `transfer.rs` should not own the raw solver lifecycle. It should
-describe or help build edge semantics that a solver-backed oracle can query.
-
-## 4. Do We Need A Separate `smt_oracle`?
-
-Not necessarily as a separate file or type name.
-
-What is required is:
-
-1. a way to encode `Predicate` and symbolic state into Z3;
-2. a way to answer `PredicateOracle` queries;
-3. a way to answer `TransitionOracle` queries.
-
-So there are two clean designs.
-
-### Option A: one combined SMT object
-
-```text
-SmtOracle
-  implements PredicateOracle
-  implements TransitionOracle
-```
-
-This is sufficient if the implementation stays readable.
-
-### Option B: split encoding from oracle
-
-```text
-SmtEncoding
-  -> owns Predicate/state/Gamma_e encoding
-
-SmtPredicateOracle
-  -> emptiness / subset / intersection
-
-SmtTransitionOracle
-  -> post_under_approx / pre_over_approx
-```
-
-This is better if state encoding and transition encoding become large.
-
-The crucial distinction is:
-
-```text
-formula -> SMT encoding
-```
-
-is not enough on its own, because the paper rules also need:
-
-```text
-Post(Gamma_e, ...)
-Pre(Gamma_e, ...)
-```
-
-So if by "formula SMT one" you mean only:
-
-```text
-Predicate -> Z3 Bool
-```
-
-then no, that is not sufficient for a full implementation.
-
-If instead you mean:
-
-```text
-one SMT-backed module that encodes both predicates and transition images
-and implements both oracle traits
-```
-
-then yes, that is sufficient. You do not need a separately named
-`smt_oracle.rs` if one module can own both responsibilities cleanly.
-
-## 5. Recommended Next SMT Shape
-
-The clean next step is:
-
-```text
-src/analysis/smt_encoding.rs
-```
-
-with responsibilities:
-
-```text
-StateVars / phase-local symbolic variables
-Predicate -> Z3 Bool encoding
-Gamma_e / edge relation encoding
-helpers for existential post-image and pre-image queries
-```
-
-Then either:
+The active tree now includes SMT-backed implementations without changing the
+paper-rule APIs:
 
 ```text
 src/analysis/oracle.rs
-  keep traits only
+  SmtPredicateOracle
+    -> PredicateOracle::is_empty / intersects / subset via Z3 SAT checks
 
-src/analysis/smt_encoding.rs
-  implement one SmtOracle for both traits
+src/analysis/transfer.rs
+  SmtLlvmTransitionOracle
+    -> TransitionOracle::post_under_approx / pre_over_approx
+       using metadata-derived guard/effect predicates and SMT emptiness checks
 ```
 
-or:
+The important boundary remains:
 
 ```text
-src/analysis/smt_oracle.rs
-  wrap SmtEncodingContext and implement the traits
+llvm_adapter.rs -> LLVM metadata extraction only
+transfer.rs     -> LLVM edge semantics and transition-oracle behavior
+oracle.rs       -> predicate set reasoning
+rules.rs        -> paper rule logic only
 ```
 
-The file split is a code-organization choice. The paper-level need is the
-trait behavior, not the filename.
+## 4. Current SMT Limits
 
-## 6. Recommended Next Implementation Order
+The current SMT encoding is intentionally lightweight:
 
-If the goal is to move toward a real SMT-backed implementation without
-confusing the paper mapping:
+- predicate atoms are encoded as Boolean symbols;
+- no structured scalar arithmetic or memory-state vocabulary is encoded yet;
+- transition images still come from guard/effect compositions and do not yet
+  encode full `Gamma_e` semantics.
 
-1. keep `llvm_adapter.rs` metadata-only;
-2. keep `rules.rs` unchanged;
-3. add a structured SMT encoding layer under `src/analysis`;
-4. make that layer implement `PredicateOracle` first;
-5. then make it implement `TransitionOracle`;
-6. only after that strengthen call-summary handling and memory.
+So the implementation is SMT-backed, but still approximation-heavy.
 
-That keeps the rule layer stable while the reasoning engine underneath becomes
-real.
+## 5. Recommended Next SMT Work
+
+1. Introduce structured SMT terms for scalar state (and later memory) instead
+   of pure Boolean atoms.
+2. Evolve transition encoding from guard/effect conjunctions toward relation
+   encodings that better approximate `Post(Gamma_e, source)` and
+   `Pre(Gamma_e, target)`.
+3. Keep rule interfaces and driver flow unchanged while strengthening oracle
+   precision under those interfaces.

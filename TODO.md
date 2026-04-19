@@ -73,21 +73,24 @@ Needed:
 Current state:
 
 - `src/analysis/oracle.rs` provides abstract oracle traits.
-- `SyntacticOracle` is the current predicate oracle.
-- `src/analysis/transfer.rs` provides a metadata-backed `LlvmTransitionOracle`
-  with syntactic guard/effect predicates.
-- `src/analysis/analysis_flowq.md` now documents that `TransitionOracle`
+- `src/analysis/oracle.rs` now includes an SMT-backed `SmtPredicateOracle`.
+- `src/analysis/transfer.rs` now includes an SMT-backed
+  `SmtLlvmTransitionOracle` over metadata guard/effect predicates.
+- `src/main.rs` now uses the SMT-backed predicate and transition oracles.
+- `src/analysis/analysis_flow.md` now documents that `TransitionOracle`
   should answer the paper's transition queries, not own the driver or summary
   logic.
 
 Needed:
 
-- Add an analysis-level SMT encoding module under `src/analysis`.
-- Decide whether one combined `SmtOracle` should implement both
-  `PredicateOracle` and `TransitionOracle`, or whether encoding and oracle
-  wrappers should be split across files.
-- Add an SMT-backed `PredicateOracle`.
-- Improve `LlvmTransitionOracle` so it computes more faithful approximations of:
+- Improve the SMT encoding vocabulary so atoms become structured terms
+  (integers/booleans/memory), not only Boolean symbols.
+- Improve transition image computation so `theta` and `beta` are closer to real
+  LLVM semantics than current guard/effect conjunctions.
+- Decide whether to retain both SMT and syntactic transition-oracle variants
+  long term.
+- Improve `SmtLlvmTransitionOracle` so it computes more faithful approximations
+  of:
 
 ```text
 theta subset Post(Gamma_e, source)
@@ -198,5 +201,5 @@ make -C tests smoke
 Current unit-test baseline:
 
 ```text
-22 passed
+26 passed
 ```

@@ -21,7 +21,9 @@
 use crate::analysis::cfg::PaperEdge;
 use crate::analysis::formula::Predicate;
 use crate::analysis::llvm_adapter::{LlvmEdgeMetadata, LlvmEdgeRegistry};
-use crate::analysis::oracle::{OracleError, OracleResult, TransitionOracle};
+use crate::analysis::oracle::{
+    OracleError, OracleResult, PredicateOracle, SmtPredicateOracle, TransitionOracle,
+};
 use crate::analysis::vocabulary::EdgeId;
 use crate::llvm_utils::llvm_wrap::InstructionOpcode;
 
@@ -139,6 +141,97 @@ where
         // Deliberately conservative: for branches this is the branch guard;
         // for non-branches this falls back to `true`.
         Ok(self.transfer.edge_guard(metadata))
+    }
+}
+
+/// SMT-backed LLVM transition oracle.
+///
+/// It uses the same metadata-driven guard/effect extraction as
+/// `LlvmTransitionOracle`, but validates candidates with SMT:
+///
+/// - `theta` is returned as `false` when `source ∧ guard ∧ effect` is UNSAT;
+/// - `beta` is returned as `false` when `guard` is UNSAT.
+#[derive(Clone, Debug)]
+pub struct SmtLlvmTransitionOracle<'a, T = SyntacticLlvmTransfer> {
+    registry: &'a LlvmEdgeRegistry,
+    transfer: T,
+    target_assertion: Option<EdgeId>,
+    predicates: SmtPredicateOracle,
+}
+
+impl<'a> SmtLlvmTransitionOracle<'a, SyntacticLlvmTransfer> {
+    pub fn new(registry: &'a LlvmEdgeRegistry) -> Self {
+        Self {
+            registry,
+            transfer: SyntacticLlvmTransfer,
+            target_assertion: None,
+            predicates: SmtPredicateOracle,
+        }
+    }
+
+    pub fn with_target_assertion(
+        registry: &'a LlvmEdgeRegistry,
+        target_assertion: Option<EdgeId>,
+    ) -> Self {
+        Self {
+            registry,
+            transfer: SyntacticLlvmTransfer,
+            target_assertion,
+            predicates: SmtPredicateOracle,
+        }
+    }
+}
+
+impl<'a, T> SmtLlvmTransitionOracle<'a, T> {
+    pub fn with_transfer(
+        registry: &'a LlvmEdgeRegistry,
+        transfer: T,
+        target_assertion: Option<EdgeId>,
+    ) -> Self {
+        Self {
+            registry,
+            transfer,
+            target_assertion,
+            predicates: SmtPredicateOracle,
+        }
+    }
+}
+
+impl<T> SmtLlvmTransitionOracle<'_, T>
+where
+    T: LlvmEdgeTransfer,
+{
+    fn metadata<'a>(&'a self, edge: &PaperEdge) -> OracleResult<&'a LlvmEdgeMetadata> {
+        self.registry.metadata(edge.id).ok_or_else(|| {
+            OracleError::UnknownTransition(format!("no LLVM metadata found for {}", edge.id))
+        })
+    }
+}
+
+impl<T> TransitionOracle for SmtLlvmTransitionOracle<'_, T>
+where
+    T: LlvmEdgeTransfer,
+{
+    fn post_under_approx(&self, edge: &PaperEdge, source: &Predicate) -> OracleResult<Predicate> {
+        let metadata = self.metadata(edge)?;
+        let guard = self.transfer.edge_guard(metadata);
+        let effect = self.transfer.edge_effect(metadata, self.target_assertion);
+        let theta = Predicate::and([source.clone(), guard, effect]);
+        if self.predicates.is_empty(&theta)? {
+            Ok(Predicate::False)
+        } else {
+            Ok(theta)
+        }
+    }
+
+    fn pre_over_approx(&self, edge: &PaperEdge, _target: &Predicate) -> OracleResult<Predicate> {
+        let metadata = self.metadata(edge)?;
+        let beta = self.transfer.edge_guard(metadata);
+        if self.predicates.is_empty(&beta)? {
+            Ok(Predicate::False)
+        } else {
+            Ok(beta)
+        }
     }
 }
 
@@ -360,6 +453,45 @@ mod tests {
             Predicate::atom(format!("take_branch({})", edge.id)),
         ]);
         assert_eq!(theta, expected);
+    }
+
+    #[test]
+    fn smt_post_under_approx_returns_false_for_unsat_source_and_guard() {
+        let edge = branch_edge(EdgeId(3), EdgeKind::BranchTrue);
+        let mut registry = LlvmEdgeRegistry::new();
+        registry.insert(branch_metadata(edge.id, 0));
+        let oracle = SmtLlvmTransitionOracle::new(&registry);
+
+        let theta = oracle
+            .post_under_approx(&edge, &Predicate::not(Predicate::atom("%c")))
+            .unwrap();
+
+        assert_eq!(theta, Predicate::False);
+    }
+
+    #[test]
+    fn smt_pre_over_approx_returns_false_for_unsat_guard() {
+        let edge = branch_edge(EdgeId(4), EdgeKind::BranchTrue);
+        let mut registry = LlvmEdgeRegistry::new();
+        registry.insert(LlvmEdgeMetadata {
+            edge_id: edge.id,
+            from: NodeId(0),
+            to: NodeId(1),
+            opcode: InstructionOpcode::Br,
+            instruction_text: "br i1 false, label %t, label %f".to_string(),
+            assignment: None,
+            called_function: None,
+            operands: vec!["false".to_string()],
+            branch_condition: Some("false".to_string()),
+            successor_index: Some(0),
+        });
+        let oracle = SmtLlvmTransitionOracle::new(&registry);
+
+        let beta = oracle
+            .pre_over_approx(&edge, &Predicate::atom("phi2"))
+            .unwrap();
+
+        assert_eq!(beta, Predicate::False);
     }
 
     #[test]

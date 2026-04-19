@@ -3,7 +3,7 @@
 //! This module exists so `cargo doc` and editor navigation can surface the
 //! paper-to-code contract.  The longer human-facing note lives in
 //! `src/analysis/design.md`, and the flow-oriented companion lives in
-//! `src/analysis/analysis_flowq.md`.
+//! `src/analysis/analysis_flow.md`.
 
 /// Short summary of the active analysis boundary.
 pub const DESIGN_SUMMARY: &str = "\

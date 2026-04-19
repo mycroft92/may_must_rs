@@ -17,9 +17,9 @@ mod llvm_utils;
 use crate::analysis::driver::{IntraproceduralConfig, PaperDriver};
 use crate::analysis::formula::Predicate;
 use crate::analysis::llvm_adapter::adapt_function_graph;
-use crate::analysis::oracle::SyntacticOracle;
+use crate::analysis::oracle::SmtPredicateOracle;
 use crate::analysis::summaries::ReachabilityQuery;
-use crate::analysis::transfer::{assertion_violation_predicate, LlvmTransitionOracle};
+use crate::analysis::transfer::{assertion_violation_predicate, SmtLlvmTransitionOracle};
 use crate::llvm_utils::llvm_wrap::*;
 use crate::llvm_utils::program_graph::FunctionGraph;
 use clap::{arg, command, value_parser};
@@ -53,7 +53,7 @@ fn run_analysis(graphs: &[FunctionGraph], assertion: Option<String>, max_obligat
         return;
     }
 
-    let predicates = SyntacticOracle;
+    let predicates = SmtPredicateOracle;
     let driver = PaperDriver::new();
 
     for graph in graphs {
@@ -65,8 +65,10 @@ fn run_analysis(graphs: &[FunctionGraph], assertion: Option<String>, max_obligat
             }
         };
         let query = default_query_for_graph(graph, &adapted.registry);
-        let transitions =
-            LlvmTransitionOracle::with_target_assertion(&adapted.registry, query.target_assertion);
+        let transitions = SmtLlvmTransitionOracle::with_target_assertion(
+            &adapted.registry,
+            query.target_assertion,
+        );
         let result = match driver.run_intraprocedural(
             &predicates,
             &transitions,

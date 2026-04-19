@@ -97,7 +97,7 @@ src/analysis/state.rs        -> Pi_n, Omega_n, regions, may edges
 src/analysis/rules.rs        -> named SMASH rules
 src/analysis/oracle.rs       -> PredicateOracle, TransitionOracle
 src/analysis/llvm_adapter.rs -> LLVM FunctionGraph -> paper procedure + metadata
-src/analysis/transfer.rs     -> metadata-backed transition oracle
+src/analysis/transfer.rs     -> metadata-backed transition oracles
 src/analysis/summaries.rs    -> reachability queries and summaries
 src/analysis/driver.rs       -> summary reuse + intraprocedural worklist
 src/analysis/design.md       -> paper-to-code map
@@ -129,7 +129,8 @@ FunctionGraph
 
 - explicit paper-shaped CFG, state, summary, and rule modules;
 - Option A LLVM adapter with external `EdgeId -> LlvmEdgeMetadata`;
-- metadata-backed transition oracle with syntactic guard/effect predicates;
+- SMT-backed `PredicateOracle` over active `Predicate` formulas;
+- SMT-backed LLVM transition oracle over transfer-derived guard/effect predicates;
 - intraprocedural worklist over `(edge, source region, destination region)`;
 - CLI wiring to the active paper driver;
 - unit tests for the paper-shaped modules;
@@ -139,15 +140,14 @@ Current unit-test baseline:
 
 ```text
 cargo test
-22 passed
+26 passed
 ```
 
 ## What Is Not Yet Implemented
 
 - summary use across call edges;
 - summary creation and reuse as a full interprocedural lifecycle;
-- an SMT-backed `PredicateOracle`;
-- SMT-backed post/pre image computation for `Gamma_e`;
+- richer SMT transition/image semantics beyond current Boolean-atom encoding;
 - memory modeling in paper-state terms;
 - full interprocedural may/must query flow from the paper;
 - explicit target selection when a function has multiple embedded assertions;

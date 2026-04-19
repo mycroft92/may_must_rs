@@ -12,7 +12,7 @@ At the start of a new session, read these files in order:
 3. `TASKVIEW.md`
 4. `AGENTS.md`
 5. `src/analysis/design.md`
-6. `src/analysis/analysis_flowq.md`
+6. `src/analysis/analysis_flow.md`
 
 If the task touches the archived implementation, also read:
 
@@ -85,6 +85,8 @@ deliberate migration step.
 LLVM bitcode
   -> llvm_utils::program_graph::generate_program_graph
   -> analysis::llvm_adapter::adapt_function_graph
+  -> analysis::oracle::SmtPredicateOracle
+  -> analysis::transfer::SmtLlvmTransitionOracle
   -> analysis::driver::PaperDriver::run_intraprocedural
 ```
 
@@ -187,7 +189,8 @@ The active transfer boundary is:
 ```text
 TransitionOracle
   backed by
-LlvmTransitionOracle
+SmtLlvmTransitionOracle (CLI default)
+LlvmTransitionOracle    (syntactic/fallback)
 ```
 
 Keep the design split:
@@ -220,7 +223,7 @@ TASKVIEW.md
 src/analysis/design.md
   Paper-to-code map for Pi, Omega, Gamma_e, summaries, and rule names.
 
-src/analysis/analysis_flowq.md
+src/analysis/analysis_flow.md
   Flow-oriented paper mapping, module correspondence, and SMT layering notes.
 
 AGENTS.md

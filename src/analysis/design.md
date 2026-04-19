@@ -6,7 +6,7 @@ paper's objects and rules visible in code, then connect them cleanly to LLVM.
 For the flow-oriented companion, including SMT layering guidance, see:
 
 ```text
-src/analysis/analysis_flowq.md
+src/analysis/analysis_flow.md
 ```
 
 The older mixed implementation was moved to:
@@ -106,7 +106,7 @@ src/analysis/llvm_adapter.rs
   FunctionGraph -> (PaperProcedure, LlvmEdgeRegistry)
 
 src/analysis/transfer.rs
-  LlvmTransitionOracle + LlvmEdgeTransfer
+  LlvmTransitionOracle + SmtLlvmTransitionOracle + LlvmEdgeTransfer
 ```
 
 ### Why this split
@@ -133,18 +133,18 @@ branch successor index
 
 ## Current Transition Approximation
 
-`transfer.rs` currently uses a conservative syntactic model:
+`transfer.rs` currently exposes two transition oracles over the same metadata:
 
 ```text
-theta = source ∧ guard(edge) ∧ effect(edge)
-beta  = guard(edge)
+LlvmTransitionOracle     -> syntactic guard/effect composition
+SmtLlvmTransitionOracle  -> same composition with SMT emptiness filtering
 ```
 
-where:
+Both currently use:
 
-- `guard(edge)` is branch-condition based for conditional branches and `true`
+- `guard(edge)`: branch-condition based for conditional branches and `true`
   otherwise;
-- `effect(edge)` is a symbolic atom derived from opcode and operands.
+- `effect(edge)`: symbolic atom derived from opcode and operands.
 
 This is scaffolding, not the final semantic precision.
 
@@ -217,8 +217,8 @@ first embedded assertion automatically.
 2. Create `Must` / `NotMay` summaries from completed analyses and reuse them.
 3. Resolve one explicit target assertion per query instead of taking the first
    embedded site.
-4. Add an SMT-backed `PredicateOracle`.
-5. Strengthen `LlvmTransitionOracle` beyond the current syntactic
-   guard/effect model.
+4. Strengthen `SmtPredicateOracle` beyond Boolean atom encoding.
+5. Strengthen `SmtLlvmTransitionOracle` beyond the current syntactic
+   guard/effect composition.
 6. Introduce a paper-level memory object in active state/query vocabulary.
 7. Expand LLVM coverage only as the active driver demands it.

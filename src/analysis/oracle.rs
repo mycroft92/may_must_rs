@@ -21,6 +21,8 @@
 use crate::analysis::cfg::PaperEdge;
 use crate::analysis::formula::Predicate;
 use std::fmt;
+use z3::ast::Bool;
+use z3::{SatResult, Solver};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OracleError {
@@ -152,6 +154,82 @@ impl TransitionOracle for SyntacticOracle {
     }
 }
 
+/// SMT-backed predicate oracle over `analysis::formula::Predicate`.
+///
+/// Current encoding model:
+///
+/// - `true` / `false` map to SMT Boolean constants;
+/// - predicate atoms map to SMT Boolean symbols;
+/// - `not` / `and` / `or` map structurally.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmtPredicateOracle;
+
+impl SmtPredicateOracle {
+    fn encode_predicate(predicate: &Predicate) -> Bool {
+        match predicate {
+            Predicate::True => Bool::from_bool(true),
+            Predicate::False => Bool::from_bool(false),
+            Predicate::Atom(name) => encode_atom(name),
+            Predicate::Not(inner) => Self::encode_predicate(inner).not(),
+            Predicate::And(parts) => {
+                let encoded = parts.iter().map(Self::encode_predicate).collect::<Vec<_>>();
+                let refs = encoded.iter().collect::<Vec<_>>();
+                Bool::and(&refs)
+            }
+            Predicate::Or(parts) => {
+                let encoded = parts.iter().map(Self::encode_predicate).collect::<Vec<_>>();
+                let refs = encoded.iter().collect::<Vec<_>>();
+                Bool::or(&refs)
+            }
+        }
+    }
+
+    fn satisfiable(&self, predicate: &Predicate) -> OracleResult<bool> {
+        let solver = Solver::new();
+        solver.assert(Self::encode_predicate(predicate));
+        match solver.check() {
+            SatResult::Sat => Ok(true),
+            SatResult::Unsat => Ok(false),
+            SatResult::Unknown => Err(OracleError::UnknownPredicate(format!(
+                "SMT returned unknown for {predicate}",
+            ))),
+        }
+    }
+}
+
+impl PredicateOracle for SmtPredicateOracle {
+    fn is_empty(&self, predicate: &Predicate) -> OracleResult<bool> {
+        self.satisfiable(predicate).map(|sat| !sat)
+    }
+}
+
+fn encode_atom(atom: &str) -> Bool {
+    if atom.eq_ignore_ascii_case("true") {
+        return Bool::from_bool(true);
+    }
+    if atom.eq_ignore_ascii_case("false") {
+        return Bool::from_bool(false);
+    }
+    Bool::new_const(atom_symbol(atom))
+}
+
+fn atom_symbol(atom: &str) -> String {
+    let mut symbol = String::from("pred_");
+    for byte in atom.as_bytes() {
+        let c = *byte as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            symbol.push(c);
+        } else {
+            symbol.push('_');
+            symbol.push_str(&format!("{byte:02x}"));
+        }
+    }
+    if symbol == "pred_" {
+        symbol.push_str("empty");
+    }
+    symbol
+}
+
 fn is_syntactically_empty(predicate: &Predicate) -> bool {
     match predicate {
         Predicate::False => true,
@@ -172,5 +250,26 @@ fn is_syntactically_empty(predicate: &Predicate) -> bool {
             }
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smt_predicate_oracle_detects_contradiction() {
+        let oracle = SmtPredicateOracle;
+        let p = Predicate::atom("p");
+        let contradictory = Predicate::and([p.clone(), Predicate::not(p)]);
+        assert!(oracle.is_empty(&contradictory).unwrap());
+    }
+
+    #[test]
+    fn smt_predicate_oracle_subset_uses_solver() {
+        let oracle = SmtPredicateOracle;
+        let p = Predicate::atom("p");
+        let p_or_q = Predicate::or([Predicate::atom("p"), Predicate::atom("q")]);
+        assert!(oracle.subset(&p, &p_or_q).unwrap());
     }
 }
