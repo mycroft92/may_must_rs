@@ -46,6 +46,12 @@ Check embedded `may_assert(...)` calls:
 cargo run --bin main -- tests/out/short_assert.bc
 ```
 
+Run the experimental SMT-backed path for embedded `may_assert(...)` calls:
+
+```sh
+cargo run --bin main -- tests/out/short_assert.bc --engine smt
+```
+
 Check a command-line postcondition at function return:
 
 ```sh
@@ -80,10 +86,10 @@ to a violation.
 `UNKNOWN`: the current engine could not decide, usually because an assertion
 argument stayed symbolic or an execution bound was reached.
 
-## Today's Session Report
+## Recent Session Reports
 
-Today's session made the current SMASH-style prototype easier to reproduce,
-test, and resume.
+Earlier workflow work made the current SMASH-style prototype easier to
+reproduce, test, and resume.
 
 Repository workflow updates:
 
@@ -115,8 +121,50 @@ Run it with:
 make -C tests smoke
 ```
 
+The experimental SMT route has its own smoke target:
+
+```sh
+make -C tests smt-smoke
+```
+
+That target currently checks:
+
+- `tests/smash_must.c`: direct `may_assert(false)` creates a `Must` summary;
+- `tests/smt_assert_safe.c`: direct `may_assert(true)` creates a `NotMay`
+  summary;
+- `tests/smt_assert_branch_prune.c`: SMT branch/path reasoning prunes the
+  infeasible assertion-violation path.
+
 Use `CARGO_FLAGS=--offline make -C tests smoke` when the local dependency cache
 is available but the network is not.
+
+The April 19, 2026 SMT scaffolding and wiring sessions added a parallel typed
+implementation path. The legacy analyzer remains the default, and
+`--engine smt` selects the experimental SMT engine:
+
+- added `src/analysis/predicates.rs` with solver-independent `IntTerm` and
+  `Formula` types plus SMT-backed satisfiability, entailment, and intersection
+  checks;
+- added `src/analysis/smt_path.rs` with cloneable path-local state over typed
+  formulas, simple stack-memory bindings, formal parameters mapped to
+  `SummaryPhase::Pre`, and scalar return relations mapped to
+  `SummaryPhase::Post`;
+- added `src/analysis/summary_store.rs` with typed `Must` and `NotMay`
+  function-boundary summaries, explicit `SummaryTarget`s, and SMT-backed
+  applicability checks;
+- added `src/analysis/smt_engine.rs` as the analysis coordinator that performs
+  the SMASH summary lookup order, runs an intraprocedural worklist for direct
+  embedded assertions, and records typed summaries;
+- added `src/analysis/transfer.rs` with the first forward SMT transfer layer
+  for simple stack `alloca`/`store`/`load`, scalar `add`, `sub`, `mul`,
+  `icmp`, conditional/unconditional `br`, and `ret`;
+- added Section 2 summary-level tests for Figure 1's not-may summary and
+  Figure 2's must summary;
+- added `tests/paper_section2_fig1_not_may.c` as a target fixture for future
+  direct-call summary composition;
+- kept `src/analysis/may_must.rs` intact as the executable toy/reference
+  implementation;
+- kept `cargo test` green with 35 unit tests.
 
 ## What Is Implemented
 
@@ -172,13 +220,30 @@ building blocks:
 - unit-tested Z3 variable creation, assertions, satisfiability checks, and
   model extraction.
 
-These SMT pieces are tested, but they are not yet wired into the active
-`may_must.rs` engine.
+The typed SMT-side analysis scaffold is split across:
+
+- `src/analysis/predicates.rs`: cloneable integer terms and Boolean formulas
+  that encode into `StateEncoding`;
+- `src/analysis/smt_path.rs`: cloneable path-local state, path assumptions,
+  return binding, and feasibility checks;
+- `src/analysis/summary_store.rs`: function-boundary `Must` and `NotMay`
+  summary storage plus SMT-backed applicability checks;
+- `src/analysis/smt_engine.rs`: summary-cache orchestration plus the first
+  intraprocedural SMT worklist for direct embedded assertions;
+- `src/analysis/transfer.rs`: first scalar and simple stack-memory forward
+  transfer functions.
+
+These SMT pieces are wired behind `--engine smt`. The default command still
+runs `src/analysis/may_must.rs` so the old toy/reference implementation stays
+usable while the SMT path is incomplete.
 
 `src/main.rs` invokes the analyzer through the CLI:
 
 - no `-a`: analyze embedded `may_assert(...)` calls;
 - with `-a`: analyze the provided assertion at returns from the named function;
+- `--engine legacy`: run the existing toy/reference analyzer;
+- `--engine smt`: run the experimental SMT-backed analyzer for direct embedded
+  assertions;
 - always dumps DOT graphs into `graph_dot/<input-stem>/`;
 - prints the query, result, trace when available, and summary counts.
 
@@ -226,8 +291,8 @@ The paper's Section 5.1 says the original SMASH implementation used Z3 for
 predicates over linear arithmetic and uninterpreted functions, with theorem
 prover queries deciding satisfiability and validity.
 
-This repository has a Z3 layer in `src/smt/solver.rs`, but the current
-SMASH-style analyzer does not yet invoke it. The analyzer currently uses:
+This repository has a Z3 layer in `src/smt/solver.rs`, plus a typed SMT
+analysis path under `src/analysis/`. The default CLI analyzer still uses:
 
 - concrete integer folding for LLVM arithmetic and comparisons;
 - simple string-backed symbolic values when operands are not concrete;
@@ -235,13 +300,25 @@ SMASH-style analyzer does not yet invoke it. The analyzer currently uses:
   applicability;
 - `UNKNOWN` when those lightweight checks are insufficient.
 
-The SMT layer is deliberately split:
+The experimental `--engine smt` path invokes the typed SMT layer for direct
+embedded assertions. The SMT layer is deliberately split:
 
 - `Z3Interface` owns the raw Z3 `Solver` and low-level operations such as
   `assert`, `check`, `push`, `pop`, constants, and sorts.
 - `SmtEncodingContext` owns analysis-level symbols and caches created Z3
   variables. That is where names such as `%7`, `%7_pre`, `%7_post`, or
   function-scoped symbols should live.
+- `StateEncoding` gives transfer/summary code function-scoped SSA,
+  memory-version, path-condition, and summary-boundary symbols.
+- `predicates.rs` stores terms and formulas independent of a particular Z3
+  solver instance.
+- `smt_path.rs` carries cloneable symbolic path state and creates fresh SMT
+  encodings only when feasibility needs to be checked.
+- `summary_store.rs` owns typed procedure summaries and their SMT applicability
+  checks.
+- `smt_engine.rs` owns analysis-level orchestration. It is separate from
+  `solver.rs` because `solver.rs` knows Z3 mechanics, while `smt_engine.rs`
+  knows query and summary semantics.
 
 The existing SMT call pattern is:
 
@@ -255,24 +332,38 @@ The existing SMT call pattern is:
 6. If satisfiable, call `get_model()` for the raw Z3 model or
    `get_model_values()` for variables owned by that encoding context.
 
-Today that pattern is exercised only by unit tests in `src/smt/solver.rs`.
-The next integration point is to create an `SmtEncodingContext` from
-`analysis::may_must` when deciding `Predicate::entails`,
-`Predicate::intersects`, and path feasibility in `with_condition`.
+That pattern is exercised by unit tests in `src/smt/solver.rs`,
+`src/analysis/state.rs`, and the SMT analysis modules. The first integration
+point now uses `SmtPathState` and `TransferFunctions` from
+`SmtAnalysisEngine`, then records `Must` or `NotMay` summaries in
+`SummaryStore`.
 
 ## Current Limitations
 
 This is not yet the full SMASH algorithm from the paper.
 
-The current may side is bounded symbolic execution, not predicate abstraction.
-The current must side is symbolic trace search, not full DART-style generated
-tests. Predicate implication and intersection are lightweight and mostly
-syntactic; the existing Z3 wrapper is not yet integrated into summary
-applicability or path feasibility.
+The legacy CLI may side is bounded symbolic execution, not predicate
+abstraction. The legacy CLI must side is symbolic trace search, not full
+DART-style generated tests. Predicate implication and intersection in the
+legacy path are lightweight and mostly syntactic. SMT-backed predicate checks
+are used by the experimental `--engine smt` path, but that path is still a
+small intraprocedural subset.
 
-Memory modeling is intentionally simple. It handles common unoptimized LLVM IR
-patterns with `alloca`, `store`, and `load`, but not full aliasing, heap objects,
-struct fields, arrays, or pointer arithmetic.
+Memory modeling is intentionally simplified in the executable SMT path:
+
+- `StateEncoding` already has a versioned SMT-array memory vocabulary and unit
+  tests for `store`/`load` composition.
+- `SmtPathState`, which is what `--engine smt` currently executes, uses a
+  temporary `HashMap<pointer-key, IntTerm>` instead.
+- `alloca` is a no-op except that its SSA name can be used as a pointer key.
+- `store` writes one integer term to that key.
+- `load` reads that key, or creates an uninterpreted scalar `load(key)` term if
+  no prior store is known on the path.
+
+This simplification was added so unoptimized LLVM test IR with stack slots can
+reach the assertion checks. It does not model aliasing, object identity,
+offsets, byte layout, arrays, structs, globals, heap objects, `getelementptr`,
+or function-boundary memory summaries.
 
 Unsupported or undecidable cases return `UNKNOWN`. This is deliberate: a
 bounded prototype should not report safety when it has only failed to explore
@@ -281,8 +372,12 @@ enough.
 ## Next Work
 
 Use `TASKVIEW.md` as the live resume document for the next implementation
-session. The immediate next engineering step is to extract LLVM instruction
-semantics from `src/analysis/may_must.rs` into `src/analysis/transfer.rs`
-without changing behavior. After that, the planned direction is to wire
-`src/analysis/state.rs` and `src/smt/solver.rs` into path feasibility and
-summary applicability.
+session. The immediate next engineering step is to extend the experimental SMT
+engine beyond direct intraprocedural assertions:
+
+1. add focused SMT-engine regression tests;
+2. implement direct-call summary composition;
+3. support command-line assertions or route them explicitly to legacy only;
+4. replace the simple memory map with the planned SMT-array/object memory
+   model;
+5. add `phi`, `switch`, casts, division/remainder, and `getelementptr`.

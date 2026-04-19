@@ -8,16 +8,33 @@ our responsibility.
 
 ## 1. Define A Real Predicate Domain
 
-Current state: `Predicate` is mostly syntactic.
+Current state: the default CLI still uses the syntactic `Predicate` in
+`src/analysis/domain.rs`. The experimental `--engine smt` path uses the new
+solver-independent predicate layer in `src/analysis/predicates.rs`:
+
+- `IntTerm` represents scalar integer terms, including SSA values and
+  summary-boundary parameters/returns;
+- `Formula` represents Boolean formulas over integer terms and Boolean SSA
+  values;
+- formulas encode into `StateEncoding`;
+- `Formula::is_satisfiable_in`, `Formula::entails_in`, and
+  `Formula::intersects_in` use Z3-backed checks.
 
 Needed:
 
-- Represent predicates over actual program states, not just strings.
+- Extend predicates beyond scalar integers to memory, globals, heap objects,
+  arrays, structs, bitvectors, and pointer/object terms.
 - Encode LLVM values, memory, globals, parameters, return values, and path
   conditions as SMT terms.
-- Track pre-state and post-state versions explicitly.
-- Replace syntactic `Predicate::entails` with SMT validity checks.
-- Replace syntactic `Predicate::intersects` with SMT satisfiability checks.
+- Track pre-state and post-state memory versions explicitly.
+- Broaden the typed predicate layer beyond the first `--engine smt`
+  intraprocedural assertion path.
+- Replace syntactic `Predicate::entails` in the legacy/default CLI with SMT
+  validity checks if the legacy path is kept long term, or retire the old
+  syntactic `Predicate` from the SMT path.
+- Replace syntactic `Predicate::intersects` in the legacy/default CLI with SMT
+  satisfiability checks if the legacy path is kept long term, or retire the
+  old syntactic `Predicate` from the SMT path.
 - Use `SmtEncodingContext` as the owner of analysis symbols for each query,
   path, or summary encoding.
 
@@ -31,15 +48,21 @@ path_feasible(path)  := SAT(path_condition)
 
 ## 2. Add A Typed Symbolic State
 
-Current state: `SymbolicState` is a `HashMap<String, String>` plus simple
-memory.
+Current state: the default CLI still uses `SymbolicState` in
+`src/analysis/may_must.rs`, which is a `HashMap<String, String>` plus simple
+memory. The SMT side now has:
+
+- `src/analysis/state.rs`: `StateEncoding`, summary-boundary symbols, path
+  conditions, and versioned SMT memory arrays;
+- `src/analysis/smt_path.rs`: cloneable `SmtPathState` with integer bindings,
+  Boolean bindings, simple stack-memory bindings, path conditions, return
+  binding, trace, and feasibility checks.
 
 Needed:
 
-- Add `src/analysis/state.rs`.
-- Represent scalar LLVM values as typed symbolic expressions.
-- Represent memory as an SMT array or a custom object model.
-- Track path condition as a Boolean expression.
+- Follow `src/analysis/memory_updates.md` and replace the first simple
+  `SmtPathState` memory map with solver-independent memory terms that encode
+  through `StateEncoding`.
 - Track value versions across instruction transfer.
 - Distinguish:
   - function parameters;
@@ -76,16 +99,36 @@ pub struct SymbolId {
 
 ## 3. Implement LLVM Transfer Functions
 
-Current state: `analysis::may_must` implements a small concrete/symbolic subset
-inline.
+Current state: `analysis::may_must` still implements the default toy
+concrete/symbolic subset inline. `src/analysis/transfer.rs` exists for the SMT
+path and currently supports:
+
+- simple `alloca`;
+- simple `store`;
+- simple `load`;
+- scalar `add`;
+- scalar `sub`;
+- scalar `mul`;
+- `icmp` predicates exposed by `llvm_wrap`;
+- unconditional `br`;
+- conditional `br` with SMT feasibility pruning;
+- scalar `ret`.
+
+Unsupported instructions return explicit `TransferError::UnsupportedOpcode`.
 
 Needed:
 
-- Add `src/analysis/transfer.rs`.
-- Move all per-instruction semantics out of `may_must.rs`.
+- Decide whether the old toy analyzer should stay intact permanently as a
+  reference or whether shared transfer helpers should eventually be factored.
 - Define each transfer as a relation between pre-state and post-state.
-- Use SMT terms instead of string expressions.
-- Return `Unsupported` or `Unknown` explicitly for instructions not yet modeled.
+- Replace simple stack-memory transfer with `MemoryTerm::Store` and
+  `IntTerm::Load`, then add summary-boundary memory relations and
+  `getelementptr`.
+- Add bitvector/bit-operation transfer or decide to keep integer arithmetic
+  only for the first SMASH milestone.
+- Add casts/conversions.
+- Add calls, actual/formal binding, return binding, and memory side effects.
+- Add `phi`, `switch`, and predecessor-sensitive edge handling.
 
 General form:
 
@@ -126,9 +169,9 @@ mem_post = mem_pre
 
 Scalar arithmetic:
 
-- `add`
-- `sub`
-- `mul`
+- `add` - implemented for SMT scalar path
+- `sub` - implemented for SMT scalar path
+- `mul` - implemented for SMT scalar path
 - `sdiv`
 - `udiv`
 - `srem`
@@ -145,16 +188,18 @@ Bit operations:
 
 Comparisons:
 
-- `icmp eq`
-- `icmp ne`
-- signed predicates: `sgt`, `sge`, `slt`, `sle`
-- unsigned predicates: `ugt`, `uge`, `ult`, `ule`
+- `icmp eq` - implemented through LLVM predicate wrapper
+- `icmp ne` - implemented through LLVM predicate wrapper
+- signed predicates: `sgt`, `sge`, `slt`, `sle` - currently normalized by
+  `llvm_wrap` to `>`, `>=`, `<`, `<=`
+- unsigned predicates: `ugt`, `uge`, `ult`, `ule` - currently normalized by
+  `llvm_wrap` to `>`, `>=`, `<`, `<=`; signedness is not yet modeled
 
 Memory:
 
-- `alloca`
-- `load`
-- `store`
+- `alloca` - implemented as a simple stack-memory operation in the SMT path
+- `load` - implemented as a simple stack-memory operation in the SMT path
+- `store` - implemented as a simple stack-memory operation in the SMT path
 - `getelementptr`
 - globals
 - heap objects
@@ -172,10 +217,10 @@ Casts and conversions:
 
 Terminators:
 
-- unconditional `br`
-- conditional `br`
+- unconditional `br` - implemented as `Continue`
+- conditional `br` - implemented with true/false SMT feasibility pruning
 - `switch`
-- `ret`
+- `ret` - implemented for scalar return values
 - `unreachable`
 
 SSA joins:
@@ -194,18 +239,21 @@ Calls:
 
 ## 5. Implement Z3-Backed Path Feasibility
 
-Current state: branch feasibility is mostly concrete folding plus syntactic
-contradiction checks.
+Current state: the default CLI still uses concrete folding plus syntactic
+contradiction checks. The experimental SMT path has feasibility support:
+
+- `SmtPathState::is_feasible` checks `SAT(path_condition)`;
+- `SmtPathState::fork_with_assumption` prunes infeasible forks;
+- `transfer::fork_branch_states` checks both `cond` and `!cond`.
 
 Needed:
 
-- Encode branch conditions into `SmtEncodingContext`.
-- Check feasibility before adding a successor state.
-- Prune infeasible paths.
+- Add regression tests for SMT branch pruning through the CLI or direct engine
+  fixtures.
 - Return `Unknown` only when encoding is unsupported, not when a path is simply
   infeasible.
 
-Target code path:
+Old CLI target code path, if the toy analyzer is upgraded instead of replaced:
 
 - Replace `with_condition` in `analysis::may_must`.
 - Use `SAT(path_condition & branch_condition)`.
@@ -213,13 +261,21 @@ Target code path:
 
 ## 6. Implement Z3-Backed Summary Applicability
 
-Current state: summary matching uses simple syntactic `entails` and
-`intersects`.
+Current state: the default CLI summary matching uses simple syntactic
+`entails` and `intersects`. The SMT path has `src/analysis/summary_store.rs`:
+
+- `FunctionSummary` stores `Must` and `NotMay` summaries over typed formulas;
+- `SummaryTarget` distinguishes returns from assertion violations;
+- `SmtQuery` stores typed pre/post query formulas;
+- `SummaryStore::find_applicable_must` and
+  `SummaryStore::find_applicable_not_may` use SMT-backed formula checks.
 
 Needed:
 
-- Encode query pre/post predicates into SMT.
-- Encode summary pre/post predicates into SMT.
+- Re-check the exact must/not-may entailment directions against the SMASH
+  rules before freezing the API.
+- Extend `SummaryStore` use beyond direct intraprocedural assertion summaries.
+- Add summary instantiation/substitution for caller/callee contexts.
 - Must summary applicability:
 
 ```text
@@ -234,8 +290,69 @@ query.pre entails summary.pre
 query.post entails summary.post
 ```
 
-The exact entailment direction should be reviewed against the paper's summary
+The exact entailment direction still needs review against the paper's summary
 rules before finalizing.
+
+## 6.25 Add Explicit Named Paper Rules
+
+Current state: `src/analysis/may_must_rules.rs` contains the first explicit
+named summary-applicability rule checks. `summary_store.rs` now delegates
+summary applicability to this rule module.
+
+Design goal: keep the implementation close to the SMASH paper by giving the
+named proof obligations explicit functions, while using the existing typed
+predicate and summary infrastructure.
+
+Needed:
+
+- Continue using `src/analysis/may_must_rules.rs` as a thin named-rule facade.
+- Do not put raw Z3 operations or LLVM transfer semantics in this module.
+- Rule functions should call into `Formula::entails_in`,
+  `Formula::intersects_in`, and summary/query types from `summary_store.rs`.
+- Current summary applicability rules:
+  - `must_pre`;
+  - `must_post`;
+  - `not_may_pre`;
+  - `not_may_post`;
+  - `applicable_must_summary`;
+  - `applicable_not_may_summary`.
+- Structured rule-check results currently contain rule name, Boolean result,
+  and a short explanation.
+- Add more rule-specific tests as more paper obligations are implemented.
+- Keep exact entailment directions marked for review until checked against the
+  paper.
+
+Suggested module boundary:
+
+```text
+may_must_rules.rs -> names and composes paper proof obligations
+summary_store.rs  -> searches cached summaries
+smt_engine.rs     -> decides when to apply/create summaries
+predicates.rs     -> discharges SMT formula checks
+transfer.rs       -> models LLVM instructions only
+```
+
+## 6.5 Extend The SMT Analysis Engine Worklist
+
+Current state: `src/analysis/smt_engine.rs` owns config, summary storage, the
+SMASH summary lookup order, and a first intraprocedural worklist for direct
+embedded assertions:
+
+1. applicable `Must` summary;
+2. applicable `NotMay` summary;
+3. otherwise execute the function body for the supported subset.
+
+Needed next:
+
+- Add direct tests for the SMT engine worklist.
+- Convert `TransferOutcome::Return` into scalar return summaries for return
+  queries.
+- Add command-line assertion support or keep it explicitly legacy-only.
+- Add direct-call summary composition.
+- Return `UNKNOWN` for unsupported calls, `phi`, `switch`, casts,
+  `getelementptr`, and undecidable solver results.
+- Keep `src/analysis/may_must.rs` untouched until this SMT engine has its own
+  tests.
 
 ## 7. Replace Bounded Path Search With Real May Analysis
 
@@ -268,8 +385,9 @@ Needed:
 
 ## 9. Implement Procedure Summary Composition
 
-Current state: calls only query whether a callee can transitively reach an
-embedded `may_assert`.
+Current state: the legacy path queries whether a callee can transitively reach
+an embedded `may_assert`; the SMT path treats non-`may_assert` calls as
+`UNKNOWN`.
 
 Needed:
 
@@ -286,8 +404,21 @@ Needed:
 
 ## 10. Improve Memory Modeling
 
-Current state: memory is a simple map from symbolic pointer names to symbolic
-values.
+Current state: memory is simplified in both executable paths:
+
+- Legacy path: `HashMap<String, String>` from symbolic pointer names to string
+  values.
+- Executable SMT path: `SmtPathState` has `HashMap<String, IntTerm>` from a
+  syntactic pointer key to a scalar integer term.
+- `StateEncoding` has versioned SMT arrays, but those arrays are not yet used
+  by the `--engine smt` worklist.
+- `alloca` is a no-op in `transfer.rs`; it only provides a named stack slot for
+  later `store`/`load` map entries.
+- Unknown `load` creates an uninterpreted scalar `load(ptr)` term.
+
+This was a deliberate first-pass simplification to let unoptimized LLVM stack
+traffic pass through the SMT smoke tests. It is not alias-aware and should not
+be treated as the final memory semantics.
 
 Needed:
 
@@ -302,7 +433,11 @@ Needed:
 
 Early practical option:
 
-- Use an object/field model rather than byte-accurate memory.
+- First migrate to the `MemoryTerm` plan in
+  `src/analysis/memory_updates.md`, so the executable worklist no longer has a
+  separate toy memory map.
+- Then use an object/field model rather than byte-accurate memory if arrays are
+  too broad for the next milestone.
 - Treat unsupported aliasing as `Unknown`.
 
 ## 11. Improve CFG And Path Semantics
@@ -364,26 +499,22 @@ This document should become the implementation contract for
 ## 14. Suggested Implementation Order
 
 1. Keep `make -C tests smoke` green as the minimal current SMASH regression.
-2. Add a safe not-may smoke test and an `UNKNOWN` smoke test.
-3. Add `analysis/transfer.rs` with a small supported LLVM subset:
-   - integer arithmetic;
-   - `icmp`;
-   - `alloca`;
-   - `load`;
-   - `store`;
-   - conditional/unconditional `br`;
-   - `ret`.
-4. Move current string-based transfer behavior out of `may_must.rs` before
-   changing semantics.
-5. Use `SmtEncodingContext` for symbolic values.
-6. Replace string-based `SymbolicState` in `may_must.rs`.
-7. Add `docs/llvm-transfer-semantics.md`.
-8. Add Z3-backed path feasibility.
-9. Add Z3-backed summary applicability.
-10. Implement actual/formal and return binding for direct calls.
-11. Add external summaries for common functions.
-12. Start predicate abstraction/refinement for the may side.
-13. Start DART-style model-to-input generation for the must side.
+2. Keep `cargo test` green; current count after the SMT test additions is 35
+   tests.
+3. Review the exact entailment directions in `src/analysis/may_must_rules.rs`
+   against the SMASH paper before relying on the SMT path for CLI results.
+4. Add one test showing unsupported `phi`, `switch`, or unsupported call
+   returns `UNKNOWN`.
+5. Add `docs/llvm-transfer-semantics.md`.
+6. Replace simple stack memory with the `MemoryTerm`/`StateEncoding` plan in
+   `src/analysis/memory_updates.md`.
+7. Add `getelementptr` or return `UNKNOWN` for it explicitly.
+8. Implement actual/formal and return binding for direct calls.
+9. Enable `tests/paper_section2_fig1_not_may.c` as an executable regression
+   once direct-call composition exists.
+10. Add external summaries for common functions.
+11. Start predicate abstraction/refinement for the may side.
+12. Start DART-style model-to-input generation for the must side.
 
 ## 15. Near-Term Test Plan
 
