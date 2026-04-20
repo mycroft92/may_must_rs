@@ -22,6 +22,7 @@ use crate::analysis::formula::Predicate;
 use crate::analysis::vocabulary::{EdgeId, NodeId, ProcedureName};
 use crate::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode};
 use crate::llvm_utils::program_graph::FunctionGraph;
+use log::debug;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -145,20 +146,43 @@ pub fn adapt_function_graph(graph: &FunctionGraph) -> AdapterResult<AdaptedProce
     let mut next_edge = 0usize;
 
     for src in &graph.vertices {
+        debug!(
+            "Adapting instruction in {}: {}",
+            graph.name,
+            one_line_instruction(*src)
+        );
         let Some(node) = graph.edges.get(src) else {
             continue;
         };
 
         let opcode = src.get_opcode();
-        let ordered_successors = src.get_successors();
+        let successor_count = node.successors.len();
+        let is_conditional_branch = opcode == InstructionOpcode::Br && successor_count == 2;
+        let ordered_successors = if is_conditional_branch {
+            Some(src.get_successors())
+        } else {
+            None
+        };
         for dst in &node.successors {
+            debug!(
+                "Adapting edge candidate in {}: {} -> {}",
+                graph.name,
+                one_line_instruction(*src),
+                one_line_instruction(*dst)
+            );
             let edge_id = EdgeId(next_edge);
             let from = node_id_for(&node_ids, *src, graph)?;
+            debug!("Resolved source node {} for edge {}", from, edge_id);
             let to = node_id_for(&node_ids, *dst, graph)?;
-            let successor_index = ordered_successors
-                .iter()
-                .position(|candidate| candidate == dst);
-            let edge_kind = classify_edge(opcode, src, successor_index);
+            debug!("Resolved target node {} for edge {}", to, edge_id);
+            let successor_index = if is_conditional_branch {
+                ordered_successors
+                    .as_ref()
+                    .and_then(|ordered| ordered.iter().position(|candidate| candidate == dst))
+            } else {
+                None
+            };
+            let edge_kind = classify_edge(opcode, successor_count, src, successor_index);
 
             let edge = PaperEdge {
                 id: edge_id,
@@ -173,19 +197,29 @@ pub fn adapt_function_graph(graph: &FunctionGraph) -> AdapterResult<AdaptedProce
             };
             procedure.add_edge(edge);
 
+            let instruction_text = one_line_instruction(*src);
+            let assignment = src.get_assignment_var().map(normalize_name);
+            let called_function = src.get_called_function();
+            let operands = src.get_operands().into_iter().map(display_value).collect();
+            let branch_condition = if is_conditional_branch {
+                src.get_branch_condition().map(display_value)
+            } else {
+                None
+            };
             let metadata = LlvmEdgeMetadata {
                 edge_id,
                 from,
                 to,
                 opcode,
-                instruction_text: one_line_instruction(*src),
-                assignment: src.get_assignment_var().map(normalize_name),
-                called_function: src.get_called_function(),
-                operands: src.get_operands().into_iter().map(display_value).collect(),
-                branch_condition: src.get_branch_condition().map(display_value),
+                instruction_text,
+                assignment,
+                called_function,
+                operands,
+                branch_condition,
                 successor_index,
             };
             registry.insert(metadata);
+            debug!("Adapted edge {} in {}", edge_id, graph.name);
             next_edge += 1;
         }
     }
@@ -220,13 +254,13 @@ fn node_id_for(
 
 fn classify_edge(
     opcode: InstructionOpcode,
+    successor_count: usize,
     src: &Instruction,
     successor_index: Option<usize>,
 ) -> EdgeKind {
     match opcode {
         InstructionOpcode::Br => {
-            let count = src.get_successors().len();
-            if count == 2 {
+            if successor_count == 2 {
                 match successor_index {
                     Some(0) => EdgeKind::BranchTrue,
                     Some(1) => EdgeKind::BranchFalse,

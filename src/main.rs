@@ -38,8 +38,13 @@ mod smt;
 fn handle(module: Module, input_file: &str, assertion: Option<String>, max_obligations: usize) {
     match llvm_utils::program_graph::generate_program_graph(&module) {
         Ok(graphs) => {
-            let graph_dir = graph_output_dir(input_file);
-            llvm_utils::program_graph::dump_graphs(&graphs, &graph_dir);
+            if should_dump_graphs() {
+                let graph_dir = graph_output_dir(input_file);
+                debug!("Dumping DOT graphs to {graph_dir}");
+                llvm_utils::program_graph::dump_graphs(&graphs, &graph_dir);
+            } else {
+                debug!("Skipping DOT graph dump because MAY_MUST_SKIP_DOT=1");
+            }
             run_analysis(&graphs, assertion, max_obligations);
         }
         Err(err) => error!("{err}"),
@@ -61,10 +66,12 @@ fn run_analysis(graphs: &[FunctionGraph], assertion: Option<String>, max_obligat
     let mut driver = PaperDriver::new();
     let mut adapted = BTreeMap::<ProcedureName, AdaptedProcedure>::new();
     for graph in graphs {
+        debug!("Adapting graph {}", graph.name);
         let procedure_name = ProcedureName::new(graph.name.clone());
         match adapt_function_graph(graph) {
             Ok(adapted_procedure) => {
                 adapted.insert(procedure_name, adapted_procedure);
+                debug!("Adapted graph {}", graph.name);
             }
             Err(err) => {
                 println!("Unable to adapt {}: {err}", graph.name);
@@ -95,6 +102,17 @@ fn run_analysis(graphs: &[FunctionGraph], assertion: Option<String>, max_obligat
             continue;
         };
         let query = default_query_for_graph(graph, registry);
+        if query.target_assertion.is_none() {
+            debug!(
+                "Skipping top-level query for {}: no embedded may_assert target",
+                query.procedure
+            );
+            continue;
+        }
+        debug!(
+            "Running interprocedural query for {} with target {:?}",
+            query.procedure, query.target_assertion
+        );
         let result = match driver.run_interprocedural(
             &predicates,
             &provider,
@@ -135,6 +153,32 @@ fn run_analysis(graphs: &[FunctionGraph], assertion: Option<String>, max_obligat
             result.stats.refinement_steps,
             result.state.may_edges().count(),
         );
+        debug_dump_summaries(&driver, &procedures);
+    }
+}
+
+fn should_dump_graphs() -> bool {
+    std::env::var("MAY_MUST_SKIP_DOT")
+        .map(|value| value != "1")
+        .unwrap_or(true)
+}
+
+fn debug_dump_summaries(
+    driver: &PaperDriver,
+    procedures: &BTreeMap<ProcedureName, PaperProcedure>,
+) {
+    let mut total = 0usize;
+    for procedure in procedures.keys() {
+        for summary in driver.summaries().for_procedure(procedure) {
+            total += 1;
+            debug!(
+                "Summary[{}] procedure={}, kind={:?}, pre={}, post={}, evidence={:?}",
+                total, summary.procedure, summary.kind, summary.pre, summary.post, summary.evidence
+            );
+        }
+    }
+    if total == 0 {
+        debug!("Summary table is currently empty");
     }
 }
 
@@ -185,15 +229,22 @@ impl InterproceduralOracleProvider for LlvmInterproceduralProvider<'_> {
                 }
             }
         }
-        if shared.is_empty() {
-            return None;
-        }
 
-        let call_pre = project_predicate(
+        let call_pre = sanitize_call_boundary_predicate(project_predicate(
             &Predicate::and([omega_n1.clone(), source_region.clone()]),
             &shared,
+        ));
+        let projected_post =
+            sanitize_call_boundary_predicate(project_predicate(dest_region, &shared));
+        let call_post = if projected_post == Predicate::True {
+            fallback_call_return_post(callee)
+        } else {
+            projected_post
+        };
+        debug!(
+            "Projected MayCall query for {} via {}: pre={}, post={}",
+            callee, call_edge.id, call_pre, call_post
         );
-        let call_post = project_predicate(dest_region, &shared);
         Some(ReachabilityQuery::new(callee.clone(), call_pre, call_post))
     }
 }
@@ -217,6 +268,31 @@ fn project_predicate(predicate: &Predicate, shared: &BTreeSet<String>) -> Predic
             Predicate::or(parts.iter().map(|part| project_predicate(part, shared)))
         }
     }
+}
+
+fn sanitize_call_boundary_predicate(predicate: Predicate) -> Predicate {
+    match predicate {
+        Predicate::True => Predicate::True,
+        Predicate::False => Predicate::False,
+        Predicate::Atom(atom) => {
+            if atom.contains(" @e") {
+                Predicate::True
+            } else {
+                Predicate::atom(atom)
+            }
+        }
+        Predicate::Not(inner) => Predicate::not(sanitize_call_boundary_predicate(*inner)),
+        Predicate::And(parts) => {
+            Predicate::and(parts.into_iter().map(sanitize_call_boundary_predicate))
+        }
+        Predicate::Or(parts) => {
+            Predicate::or(parts.into_iter().map(sanitize_call_boundary_predicate))
+        }
+    }
+}
+
+fn fallback_call_return_post(callee: &ProcedureName) -> Predicate {
+    Predicate::atom(format!("retval_{callee} > 0"))
 }
 
 fn atom_uses_shared_symbol(atom: &str, shared: &BTreeSet<String>) -> bool {
@@ -306,5 +382,26 @@ fn main() {
     match context.parse_bc_file(inpfile) {
         Some(module) => handle(module, inpfile, assertion_ast, max_steps),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_call_boundary_predicate_drops_edge_local_atoms() {
+        let predicate = Predicate::and([
+            Predicate::atom("%tmp' = load(%p) @e9"),
+            Predicate::atom("global_ok"),
+        ]);
+        let sanitized = sanitize_call_boundary_predicate(predicate);
+        assert_eq!(sanitized, Predicate::atom("global_ok"));
+    }
+
+    #[test]
+    fn fallback_call_return_post_uses_return_boundary_name() {
+        let post = fallback_call_return_post(&ProcedureName::new("g"));
+        assert_eq!(post, Predicate::atom("retval_g > 0"));
     }
 }

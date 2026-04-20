@@ -175,6 +175,16 @@ internal calls without an applicable summary
   -> project callee query (MayCall), recurse, create summary, retry summary rules
 ```
 
+Current MayCall projection notes:
+
+```text
+projected call pre/post currently strip edge-local atoms (e.g. "... @eK")
+vacuous projected call post -> fallback atom "retval_<callee> > 0"
+```
+
+This keeps summaries in a procedure-boundary vocabulary, but it is still a
+heuristic and not yet the final semantic projection design.
+
 Current initialization:
 
 ```text
@@ -223,7 +233,7 @@ first embedded assertion automatically.
 2. Strengthen `SmtPredicateOracle` beyond Boolean atom encoding.
 3. Strengthen `SmtLlvmTransitionOracle` beyond the current syntactic
    guard/effect composition.
-4. Improve projection precision for MayCall queries (arguments/globals are
-   currently projected with lightweight symbolic filtering).
+4. Replace the current MayCall post fallback (`retval_<callee> > 0`) with
+   semantic return-demand projection derived from caller constraints.
 5. Introduce a paper-level memory object in active state/query vocabulary.
 6. Expand LLVM coverage only as the active driver demands it.

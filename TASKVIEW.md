@@ -28,6 +28,16 @@ assert_violation(site) && !assert_arg
 
 - Only that selected target site is treated as a violation target; other
   `may_assert(...)` calls stay as ordinary call effects.
+- MayCall boundary projection now strips edge-local atoms (`... @eK`) so call
+  summaries are not polluted with caller-edge SSA effects.
+- When a projected call postcondition is vacuous, the active fallback now uses
+  a return-boundary predicate of the shape:
+
+```text
+retval_<callee> > 0
+```
+
+  (current heuristic; not the final semantic projection design).
 - Initial memory modeling is now started in the SMT predicate oracle:
   memory atoms are interpreted with integer-array `select/store`.
 - Explicit target selection is not implemented yet.
@@ -122,14 +132,27 @@ Use them for reference only when porting ideas into the active tree.
    - Keep LLVM metadata extraction in `llvm_adapter.rs`; do not put solver
      setup there.
 
-4. Clarify memory in paper terms.
+4. Replace the current call-post fallback heuristic with semantic return
+   projection.
+   - Current stopgap for vacuous projected postconditions:
+
+```text
+retval_<callee> > 0
+```
+
+   - Next step: derive call-post predicates from real caller demand and callee
+     return semantics (including `<`, `<=`, `>`, `>=`, and equality constraints).
+   - Keep summary predicates in procedure-boundary vocabulary, not caller-edge
+     SSA atoms.
+
+5. Clarify memory in paper terms.
    - Decide what memory object should live in the active state/query language.
    - Extend the initial integer-array encoding into transition/query/summaries
      with stable memory-version naming.
    - Port only the useful ideas from `obsolete/src/analysis/memory_updates.md`.
    - Keep the active tree paper-readable while doing it.
 
-5. Expand LLVM coverage when needed by the active driver.
+6. Expand LLVM coverage when needed by the active driver.
    - calls with summaries
    - `phi`
    - `switch`

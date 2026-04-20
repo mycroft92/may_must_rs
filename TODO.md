@@ -37,11 +37,19 @@ Current state:
   - `NotMay` summaries from completed non-reachable callee runs.
 - Created summaries are now persisted and reused on subsequent call edges.
 - `SummaryTable::add` now de-duplicates identical summaries.
+- MayCall projection now drops edge-local atoms at call boundaries.
+- When projected call postconditions are vacuous, the active fallback uses:
+
+```text
+retval_<callee> > 0
+```
 
 Needed:
 
 - Add broader summary applicability/coverage tests across different projected
   predicates and repeated call contexts.
+- Replace the current call-post fallback with semantic caller-demand to callee
+  return projection.
 - Add provenance metadata that can explain why a summary was reused/rejected.
 - Keep persisted summaries restricted to `Must` and `NotMay`.
 

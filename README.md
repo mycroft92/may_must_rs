@@ -139,6 +139,9 @@ FunctionGraph
   summary applicability, call-query projection, MayCall recursion, summary
   creation, and call-edge summary reuse via
   `MUST-POST-USE-SUMMARY` / `NOTMAY-PRE-USE-SUMMARY`;
+- call-query projection now drops edge-local SSA effect atoms at callee
+  boundaries and uses a return-boundary fallback predicate
+  `retval_<callee> > 0` when projected postconditions are vacuous;
 - per-procedure local worklist over `(edge, source region, destination region)`;
 - CLI wiring to the active paper driver;
 - unit tests for the paper-shaped modules;
@@ -158,8 +161,8 @@ cargo test
 - richer SMT transition/image semantics beyond current Boolean-atom encoding;
 - full memory modeling in paper-state/query/summaries
   (current array semantics are atom-level and still lightweight);
-- richer call-query projection semantics (currently symbolic-name projection over
-  call operands and globals);
+- richer call-query projection semantics beyond the current boundary heuristic
+  (edge-local atom stripping + `retval_<callee> > 0` fallback);
 - explicit target selection when a function has multiple embedded assertions;
 - command-line `--assert` queries in the paper driver;
 - rich LLVM coverage (`phi`, `switch`, `getelementptr`, casts, calls with

@@ -49,7 +49,9 @@ What is not active yet:
 - richer SMT encodings for scalar/memory terms;
 - faithful SMT transition images for LLVM effects;
 - paper-level memory;
-- richer projection semantics for call-query boundaries.
+- semantic call-query projection beyond the current boundary heuristic
+  (edge-local atom stripping + `retval_<callee> > 0` fallback for vacuous
+  call posts).
 
 ## 2. File-To-Paper Correspondence
 

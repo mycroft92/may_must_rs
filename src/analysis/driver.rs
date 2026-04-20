@@ -27,6 +27,7 @@ use crate::analysis::rules::{
 use crate::analysis::state::{MayEdge, PaperAnalysisState, Partition, Region};
 use crate::analysis::summaries::{ProcedureSummary, ReachabilityQuery, SummaryTable};
 use crate::analysis::vocabulary::{EdgeId, NodeId, ProcedureName, RegionId};
+use log::debug;
 use std::collections::{BTreeSet, VecDeque};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -483,6 +484,14 @@ impl PaperDriver {
                         config,
                         call_stack,
                     )? {
+                        debug!(
+                            "Generated summary for {}: kind={:?}, pre={}, post={}, evidence={:?}",
+                            summary.procedure,
+                            summary.kind,
+                            summary.pre,
+                            summary.post,
+                            summary.evidence
+                        );
                         self.summaries.add(summary);
                     }
 
