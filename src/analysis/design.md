@@ -155,9 +155,10 @@ This is scaffolding, not the final semantic precision.
 ```text
 answer_from_summaries(query)
 run_intraprocedural(procedure, query)
+run_interprocedural(query)
 ```
 
-The intraprocedural worklist unit is:
+The local worklist unit is:
 
 ```text
 (edge, source region, destination region)
@@ -168,6 +169,10 @@ Current rule use:
 ```text
 MUST-POST   -> grows Omega_n
 NOTMAY-PRE  -> splits Pi_n and records a may edge
+call edges with summaries
+  -> MUST-POST-USE-SUMMARY / NOTMAY-PRE-USE-SUMMARY
+internal calls without an applicable summary
+  -> project callee query (MayCall), recurse, create summary, retry summary rules
 ```
 
 Current initialization:
@@ -194,7 +199,7 @@ bitcode
   -> generate_program_graph
   -> adapt_function_graph
   -> build default query
-  -> run_intraprocedural
+  -> run_interprocedural
 ```
 
 The current default query builder is still provisional. It targets a single
@@ -213,12 +218,12 @@ first embedded assertion automatically.
 
 ## Next Implementation Steps
 
-1. Wire summaries into call-edge handling and make the driver interprocedural.
-2. Create `Must` / `NotMay` summaries from completed analyses and reuse them.
-3. Resolve one explicit target assertion per query instead of taking the first
+1. Resolve one explicit target assertion per query instead of taking the first
    embedded site.
-4. Strengthen `SmtPredicateOracle` beyond Boolean atom encoding.
-5. Strengthen `SmtLlvmTransitionOracle` beyond the current syntactic
+2. Strengthen `SmtPredicateOracle` beyond Boolean atom encoding.
+3. Strengthen `SmtLlvmTransitionOracle` beyond the current syntactic
    guard/effect composition.
-6. Introduce a paper-level memory object in active state/query vocabulary.
-7. Expand LLVM coverage only as the active driver demands it.
+4. Improve projection precision for MayCall queries (arguments/globals are
+   currently projected with lightweight symbolic filtering).
+5. Introduce a paper-level memory object in active state/query vocabulary.
+6. Expand LLVM coverage only as the active driver demands it.

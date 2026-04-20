@@ -27,13 +27,13 @@ Generate LLVM IR and bitcode from the C test inputs:
 make -C tests ir
 ```
 
-Run the active paper-shaped driver on a bitcode file:
+Run the active paper-shaped interprocedural driver on a bitcode file:
 
 ```sh
 cargo run --bin main -- tests/out/smash_must.bc
 ```
 
-Bound the intraprocedural obligation worklist:
+Bound per-query obligation processing:
 
 ```sh
 cargo run --bin main -- tests/out/smash_must.bc --max-steps 50000
@@ -63,7 +63,7 @@ Every run writes DOT graphs to `graph_dot/<input-stem>/`.
 ## Current CLI Behavior
 
 The binary adapts LLVM `FunctionGraph`s into paper-shaped procedures and then
-runs the intraprocedural driver in `src/analysis/driver.rs`.
+runs the interprocedural driver in `src/analysis/driver.rs`.
 
 For each function, the CLI currently chooses a single target assertion by
 taking the first embedded `may_assert(...)`. The query postcondition is that
@@ -99,7 +99,7 @@ src/analysis/oracle.rs       -> PredicateOracle, TransitionOracle
 src/analysis/llvm_adapter.rs -> LLVM FunctionGraph -> paper procedure + metadata
 src/analysis/transfer.rs     -> metadata-backed transition oracles
 src/analysis/summaries.rs    -> reachability queries and summaries
-src/analysis/driver.rs       -> summary reuse + intraprocedural worklist
+src/analysis/driver.rs       -> interprocedural orchestration + local worklist
 src/analysis/design.md       -> paper-to-code map
 ```
 
@@ -119,10 +119,12 @@ The current driver shape is:
 FunctionGraph
   -> adapt_function_graph(...)
   -> ReachabilityQuery
-  -> PaperDriver::run_intraprocedural(...)
-       worklist element = (edge, source region, destination region)
-       MUST-POST        = grows Omega_n
-       NOTMAY-PRE       = splits Pi_n and records may edges
+  -> PaperDriver::run_interprocedural(...)
+       summary applicability check
+       MayCall recursion on internal call edges
+       summary creation (Must / NotMay)
+       local worklist over (edge, source region, destination region)
+       MUST-POST and NOTMAY-PRE in each procedure
 ```
 
 ## What Is Implemented
@@ -130,8 +132,14 @@ FunctionGraph
 - explicit paper-shaped CFG, state, summary, and rule modules;
 - Option A LLVM adapter with external `EdgeId -> LlvmEdgeMetadata`;
 - SMT-backed `PredicateOracle` over active `Predicate` formulas;
+- initial SMT memory semantics in `SmtPredicateOracle` for
+  `store/load`-shaped atoms using `Array[Int -> Int]`;
 - SMT-backed LLVM transition oracle over transfer-derived guard/effect predicates;
-- intraprocedural worklist over `(edge, source region, destination region)`;
+- interprocedural driver (`run_interprocedural`) with:
+  summary applicability, call-query projection, MayCall recursion, summary
+  creation, and call-edge summary reuse via
+  `MUST-POST-USE-SUMMARY` / `NOTMAY-PRE-USE-SUMMARY`;
+- per-procedure local worklist over `(edge, source region, destination region)`;
 - CLI wiring to the active paper driver;
 - unit tests for the paper-shaped modules;
 - smoke coverage for direct bug and direct safe cases.
@@ -140,16 +148,18 @@ Current unit-test baseline:
 
 ```text
 cargo test
-26 passed
+34 passed
 ```
 
 ## What Is Not Yet Implemented
 
-- summary use across call edges;
-- summary creation and reuse as a full interprocedural lifecycle;
+- full SMASH alternation strategy (current implementation uses a pragmatic
+  summary/apply/recurse loop, not the full paper schedule);
 - richer SMT transition/image semantics beyond current Boolean-atom encoding;
-- memory modeling in paper-state terms;
-- full interprocedural may/must query flow from the paper;
+- full memory modeling in paper-state/query/summaries
+  (current array semantics are atom-level and still lightweight);
+- richer call-query projection semantics (currently symbolic-name projection over
+  call operands and globals);
 - explicit target selection when a function has multiple embedded assertions;
 - command-line `--assert` queries in the paper driver;
 - rich LLVM coverage (`phi`, `switch`, `getelementptr`, casts, calls with
@@ -159,13 +169,12 @@ cargo test
 Recommended next milestone:
 
 ```text
-call-edge summary reuse + summary creation
+strengthen SMT transition/predicate encodings and call projection precision
 ```
 
-That is the first step that moves the active tree from an intraprocedural
-paper skeleton toward a real interprocedural SMASH-style implementation.
-
-The repository should not be described as a full SMASH implementation yet.
+The repository should still not be described as a full SMASH implementation.
+The current version is interprocedural and summary-aware, but still
+approximation-heavy.
 
 ## Archived Implementation
 

@@ -121,8 +121,8 @@ pub fn must_post_edge<P, T>(
     omega_n2: &Predicate,
 ) -> OracleResult<RuleApplication>
 where
-    P: PredicateOracle,
-    T: TransitionOracle,
+    P: PredicateOracle + ?Sized,
+    T: TransitionOracle + ?Sized,
 {
     let source = Predicate::and([omega_n1.clone(), source_region.clone()]);
     if predicates.is_empty(&source)? {
@@ -167,8 +167,8 @@ pub fn not_may_pre_edge<P, T>(
     omega_n2: &Predicate,
 ) -> OracleResult<RuleApplication>
 where
-    P: PredicateOracle,
-    T: TransitionOracle,
+    P: PredicateOracle + ?Sized,
+    T: TransitionOracle + ?Sized,
 {
     let source = Predicate::and([omega_n1.clone(), source_region.clone()]);
     if predicates.is_empty(&source)? {

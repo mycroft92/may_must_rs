@@ -21,8 +21,8 @@
 use crate::analysis::cfg::PaperEdge;
 use crate::analysis::formula::Predicate;
 use std::fmt;
-use z3::ast::Bool;
-use z3::{SatResult, Solver};
+use z3::ast::{Array, Bool, Int};
+use z3::{SatResult, Solver, Sort};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OracleError {
@@ -159,7 +159,9 @@ impl TransitionOracle for SyntacticOracle {
 /// Current encoding model:
 ///
 /// - `true` / `false` map to SMT Boolean constants;
-/// - predicate atoms map to SMT Boolean symbols;
+/// - most predicate atoms map to SMT Boolean symbols;
+/// - memory-shaped atoms such as `store/load` are mapped to
+///   `Array[Int -> Int]` constraints;
 /// - `not` / `and` / `or` map structurally.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SmtPredicateOracle;
@@ -210,12 +212,27 @@ fn encode_atom(atom: &str) -> Bool {
     if atom.eq_ignore_ascii_case("false") {
         return Bool::from_bool(false);
     }
+    if let Some(encoded) = encode_semantic_atom(atom) {
+        return encoded;
+    }
     Bool::new_const(atom_symbol(atom))
 }
 
 fn atom_symbol(atom: &str) -> String {
-    let mut symbol = String::from("pred_");
-    for byte in atom.as_bytes() {
+    symbol_with_prefix("pred_", atom)
+}
+
+fn int_symbol(name: &str) -> String {
+    symbol_with_prefix("int_", name)
+}
+
+fn array_symbol(name: &str) -> String {
+    symbol_with_prefix("arr_", name)
+}
+
+fn symbol_with_prefix(prefix: &str, raw: &str) -> String {
+    let mut symbol = String::from(prefix);
+    for byte in raw.as_bytes() {
         let c = *byte as char;
         if c.is_ascii_alphanumeric() || c == '_' {
             symbol.push(c);
@@ -224,10 +241,108 @@ fn atom_symbol(atom: &str) -> String {
             symbol.push_str(&format!("{byte:02x}"));
         }
     }
-    if symbol == "pred_" {
+    if symbol == prefix {
         symbol.push_str("empty");
     }
     symbol
+}
+
+fn encode_semantic_atom(atom: &str) -> Option<Bool> {
+    let core = strip_edge_suffix(atom);
+    let (lhs, rhs) = parse_assignment(core)?;
+    if let Some((func, args)) = parse_call(rhs) {
+        return match func {
+            "store" => encode_store_assignment(lhs, &args),
+            "load" => encode_load_assignment(lhs, &args),
+            _ => None,
+        };
+    }
+
+    if looks_like_memory_name(lhs) && looks_like_memory_name(rhs) {
+        return Some(array_var(lhs).eq(&array_var(rhs)));
+    }
+
+    Some(int_var(lhs).eq(&int_term(rhs)))
+}
+
+fn strip_edge_suffix(atom: &str) -> &str {
+    atom.rsplit_once(" @")
+        .map(|(core, _)| core)
+        .unwrap_or(atom)
+        .trim()
+}
+
+fn parse_assignment(atom: &str) -> Option<(&str, &str)> {
+    let (lhs, rhs) = atom.split_once('=')?;
+    Some((lhs.trim(), rhs.trim()))
+}
+
+fn parse_call(rhs: &str) -> Option<(&str, Vec<&str>)> {
+    let open = rhs.find('(')?;
+    if !rhs.ends_with(')') || open + 1 > rhs.len() {
+        return None;
+    }
+    let func = rhs[..open].trim();
+    let args = rhs[open + 1..rhs.len() - 1]
+        .split(',')
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>();
+    Some((func, args))
+}
+
+fn encode_store_assignment(lhs: &str, args: &[&str]) -> Option<Bool> {
+    if args.len() != 2 {
+        return None;
+    }
+    let post_mem = array_var(lhs);
+    let pre_mem_name = unprimed_name(lhs).unwrap_or(lhs);
+    let pre_mem = array_var(pre_mem_name);
+    let ptr = int_term(args[0]);
+    let value = int_term(args[1]);
+    Some(post_mem.eq(&pre_mem.store(&ptr, &value)))
+}
+
+fn encode_load_assignment(lhs: &str, args: &[&str]) -> Option<Bool> {
+    let (mem_name, ptr_name) = match args {
+        [ptr] => ("mem", *ptr),
+        [mem, ptr] => (*mem, *ptr),
+        _ => return None,
+    };
+    let mem = array_var(mem_name);
+    let ptr = int_term(ptr_name);
+    let lhs_val = int_var(lhs);
+    Some(mem.select(&ptr).eq(&lhs_val))
+}
+
+fn unprimed_name(name: &str) -> Option<&str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.strip_suffix('\'').or(Some(trimmed))
+}
+
+fn looks_like_memory_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed == "mem" || trimmed.starts_with("mem")
+}
+
+fn int_term(token: &str) -> Int {
+    let trimmed = token.trim();
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return Int::from_i64(value);
+    }
+    Int::new_const(int_symbol(trimmed))
+}
+
+fn int_var(name: &str) -> Int {
+    Int::new_const(int_symbol(name.trim()))
+}
+
+fn array_var(name: &str) -> Array {
+    let int_sort = Sort::int();
+    Array::new_const(array_symbol(name.trim()), &int_sort, &int_sort)
 }
 
 fn is_syntactically_empty(predicate: &Predicate) -> bool {
@@ -271,5 +386,26 @@ mod tests {
         let p = Predicate::atom("p");
         let p_or_q = Predicate::or([Predicate::atom("p"), Predicate::atom("q")]);
         assert!(oracle.subset(&p, &p_or_q).unwrap());
+    }
+
+    #[test]
+    fn smt_predicate_oracle_uses_array_store_load_semantics() {
+        let oracle = SmtPredicateOracle;
+        let memory_step = Predicate::atom("mem' = store(%p, 7) @e0");
+        let load_step = Predicate::atom("%x = load(mem', %p) @e1");
+        let not_expected_value = Predicate::not(Predicate::atom("%x = 7"));
+        let contradictory = Predicate::and([memory_step, load_step, not_expected_value]);
+        assert!(oracle.is_empty(&contradictory).unwrap());
+    }
+
+    #[test]
+    fn smt_predicate_oracle_subset_with_array_reasoning() {
+        let oracle = SmtPredicateOracle;
+        let left = Predicate::and([
+            Predicate::atom("mem' = store(%p, 7) @e0"),
+            Predicate::atom("%x = load(mem', %p) @e1"),
+        ]);
+        let right = Predicate::atom("%x = 7");
+        assert!(oracle.subset(&left, &right).unwrap());
     }
 }

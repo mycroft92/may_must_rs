@@ -11,38 +11,38 @@ Current state:
 - `src/analysis/summaries.rs` defines `Must`, `NotMay`, and `SummaryTable`.
 - `src/analysis/driver.rs` has `answer_from_summaries`.
 - Summary-use rules already exist in `src/analysis/rules.rs`.
-- The active worklist is still intraprocedural.
-- Call-edge summary reuse is not yet active in the worklist.
+- `src/analysis/driver.rs` now has `run_interprocedural`.
+- Internal call edges now use:
+  summary reuse -> MayCall query projection/recursion -> summary creation ->
+  summary reuse retry.
+- Unresolved internal calls now return `UNKNOWN` instead of unsound
+  `NOT REACHED`.
+- The local worklist inside each analyzed procedure is still intraprocedural.
 
 Needed:
 
-- Reuse applicable summaries before intraprocedural work.
-- Add call-edge handling through:
-  - `must_post_use_summary`
-  - `not_may_pre_use_summary`
-- Instantiate callee queries from caller state.
-- Resume caller analysis from callee postconditions/proofs.
+- Tighten the interprocedural alternation policy to match the paper more
+  closely (current schedule is pragmatic, not a full formal alternation pass).
+- Improve recursive-call handling beyond the current depth/stack cutoff.
+- Add stronger evidence payloads for persisted summaries.
 - Keep persisted summaries restricted to `Must` and `NotMay`.
-
-This is the next place to start if the goal is a full paper-level
-implementation. Without this, the active tree is still only an intraprocedural
-paper skeleton.
 
 ## 2. Create And Reuse Summaries As A Full Lifecycle
 
 Current state:
 
-- Summary data structures exist.
-- Applicability checks exist.
-- The active driver does not yet learn summaries from completed analyses.
+- Summary data structures and applicability checks exist.
+- The interprocedural driver now creates:
+  - `Must` summaries from reachable callee runs;
+  - `NotMay` summaries from completed non-reachable callee runs.
+- Created summaries are now persisted and reused on subsequent call edges.
+- `SummaryTable::add` now de-duplicates identical summaries.
 
 Needed:
 
-- Create `Must` summaries when a target is shown reachable.
-- Create `NotMay` summaries when a target is shown unreachable over the
-  supported fragment.
-- Store summaries in a way that stays target-specific.
-- Reuse stored summaries across repeated procedure queries.
+- Add broader summary applicability/coverage tests across different projected
+  predicates and repeated call contexts.
+- Add provenance metadata that can explain why a summary was reused/rejected.
 - Keep persisted summaries restricted to `Must` and `NotMay`.
 
 ## 3. Add Explicit Target Selection And Query Resolution
@@ -129,6 +129,12 @@ Needed:
 Current state:
 
 - The active tree does not yet have a real paper-level memory object.
+- `SmtPredicateOracle` now has an initial integer-array encoding for
+  memory-shaped atoms:
+  - `mem' = store(ptr, value)` is encoded with SMT `store`;
+  - `x = load(mem', ptr)` (and `x = load(ptr)`) is encoded with SMT `select`.
+- This is currently an atom-level encoding improvement, not a full memory
+  state tracked through `Pi_n`, `Omega_n`, summaries, and query boundaries.
 - The archived memory notes live in:
 
 ```text
@@ -138,6 +144,8 @@ obsolete/src/analysis/memory_updates.md
 Needed:
 
 - Decide what memory term belongs in active query/state vocabulary.
+- Thread memory-state naming/versioning consistently through edge transfer and
+  interprocedural projection (avoid ad-hoc `mem`/`mem'` conventions).
 - Track memory through `Gamma_e`, summaries, and rule applications.
 - Port only the useful ideas from the archived SMT memory plan.
 - Keep `src/analysis` readable in paper vocabulary while doing this.
@@ -201,5 +209,5 @@ make -C tests smoke
 Current unit-test baseline:
 
 ```text
-26 passed
+34 passed
 ```

@@ -12,7 +12,7 @@ obsolete/src/analysis
 obsolete/src/analysis.rs
 ```
 
-- The CLI now runs the paper-shaped intraprocedural driver:
+- The CLI now runs the paper-shaped interprocedural driver:
 
 ```sh
 cargo run --bin main -- <bitcode.bc>
@@ -28,12 +28,14 @@ assert_violation(site) && !assert_arg
 
 - Only that selected target site is treated as a violation target; other
   `may_assert(...)` calls stay as ordinary call effects.
+- Initial memory modeling is now started in the SMT predicate oracle:
+  memory atoms are interpreted with integer-array `select/store`.
 - Explicit target selection is not implemented yet.
 - Current test status:
 
 ```sh
 cargo test
-# 26 passed
+# 34 passed
 
 make -C tests smoke
 # passes
@@ -53,7 +55,7 @@ src/analysis/state.rs        -> Pi_n, Omega_n, regions, may edges
 src/analysis/summaries.rs    -> ReachabilityQuery, ProcedureSummary, SummaryTable
 src/analysis/transfer.rs     -> LlvmTransitionOracle, SmtLlvmTransitionOracle, LlvmEdgeTransfer
 src/analysis/rules.rs        -> named paper rules
-src/analysis/driver.rs       -> summary reuse + intraprocedural worklist
+src/analysis/driver.rs       -> interprocedural orchestration + local worklist
 src/analysis/design.md       -> paper-to-code map
 ```
 
@@ -62,6 +64,9 @@ The current driver already has:
 ```text
 answer_from_summaries
 run_intraprocedural
+run_interprocedural
+MayCall recursion + summary creation
+call-edge summary reuse inside local worklists
 ```
 
 The worklist unit is:
@@ -96,25 +101,18 @@ Use them for reference only when porting ideas into the active tree.
 
 ## Immediate Next Work
 
-1. Make the driver genuinely interprocedural.
-   - Use `answer_from_summaries` before fresh analysis.
-   - Add call-edge handling through:
-     - `must_post_use_summary`
-     - `not_may_pre_use_summary`
-   - Instantiate callee queries from caller state and resume the caller from
-     callee summaries.
+1. Tighten interprocedural behavior toward paper parity.
+   - Formalize the alternation schedule beyond the current pragmatic
+     summary/apply/recurse loop.
+   - Improve recursion handling beyond depth/stack cutoffs.
+   - Keep unresolved internal calls mapped to `UNKNOWN`, never unsound
+     `NOT REACHED`.
 
-2. Add summary creation, not just summary lookup.
-   - Emit `Must` when the target is shown reachable.
-   - Emit `NotMay` when the target is shown unreachable over the supported
-     fragment.
-   - Keep summaries target-specific.
-
-3. Keep target selection honest while doing the interprocedural work.
+2. Keep target selection honest while doing interprocedural work.
    - Current stopgap: first embedded `may_assert(...)`.
    - Next real step: resolve one explicit target assertion from the CLI/query.
 
-4. Strengthen the active oracle path.
+3. Strengthen the active oracle path.
    - Keep improving `SmtPredicateOracle` and `SmtLlvmTransitionOracle`.
    - Move from Boolean-atom encoding toward structured scalar/memory terms.
    - Strengthen transition image reasoning beyond current guard/effect
@@ -124,12 +122,14 @@ Use them for reference only when porting ideas into the active tree.
    - Keep LLVM metadata extraction in `llvm_adapter.rs`; do not put solver
      setup there.
 
-5. Clarify memory in paper terms.
+4. Clarify memory in paper terms.
    - Decide what memory object should live in the active state/query language.
+   - Extend the initial integer-array encoding into transition/query/summaries
+     with stable memory-version naming.
    - Port only the useful ideas from `obsolete/src/analysis/memory_updates.md`.
    - Keep the active tree paper-readable while doing it.
 
-6. Expand LLVM coverage when needed by the active driver.
+5. Expand LLVM coverage when needed by the active driver.
    - calls with summaries
    - `phi`
    - `switch`
@@ -185,11 +185,9 @@ Use the archived tree only when you need old implementation ideas:
 
 ## First Concrete Commit Next Session
 
-Start the real paper path, not another local cleanup:
-
-1. route the driver through `answer_from_summaries`;
-2. add one end-to-end call-edge case that uses a callee summary;
-3. create the resulting `Must` or `NotMay` summary in the active table;
-4. after that, strengthen the SMT-backed oracles in `oracle.rs` and
-   `transfer.rs` with structured state encodings;
-5. keep `cargo test` and `make -C tests smoke` green.
+1. Add one end-to-end multi-call smoke case (`main -> f -> g`) that exercises:
+   call projection, summary creation, and summary reuse in one run.
+2. Add an explicit regression for unresolved internal calls returning `UNKNOWN`.
+3. Strengthen projection logic so argument/global matching is symbol-aware, not
+   substring-based.
+4. Keep `cargo test` and `make -C tests smoke` green.

@@ -17,7 +17,7 @@ main.rs
   -> build ReachabilityQuery
   -> analysis::oracle::SmtPredicateOracle
   -> analysis::transfer::SmtLlvmTransitionOracle
-  -> analysis::driver::PaperDriver::run_intraprocedural(...)
+  -> analysis::driver::PaperDriver::run_interprocedural(...)
   -> analysis::rules::{must_post_edge, not_may_pre_edge}
 ```
 
@@ -28,7 +28,8 @@ LLVM bitcode
   -> procedure P with nodes n and edges e
   -> edge relation placeholders Gamma_e
   -> query <pre, post>
-  -> intraprocedural rule loop over (e, phi1, phi2)
+  -> interprocedural summary/apply/recurse loop
+  -> local rule loop over (e, phi1, phi2) in each visited procedure
   -> update Omega_n and Pi_n
 ```
 
@@ -38,16 +39,17 @@ What is active today:
 - explicit `Pi_n`, `Omega_n`, and may edges `N_e`;
 - explicit named rule functions;
 - LLVM metadata-backed transition approximation;
+- interprocedural call handling with summary reuse + MayCall recursion +
+  summary creation for `Must`/`NotMay`;
 - one target assertion per query.
 
 What is not active yet:
 
-- interprocedural summary-driven call handling;
-- summary creation lifecycle;
+- full SMASH alternation schedule (current flow is pragmatic and bounded);
 - richer SMT encodings for scalar/memory terms;
 - faithful SMT transition images for LLVM effects;
 - paper-level memory;
-- full may/must alternation loop from the paper.
+- richer projection semantics for call-query boundaries.
 
 ## 2. File-To-Paper Correspondence
 
@@ -113,8 +115,7 @@ query.pre/query.post     -> boundary pre/post predicates
 target_assertion         -> currently selected assertion site
 ```
 
-When the implementation becomes fully interprocedural, this file remains the
-boundary vocabulary for procedure calls.
+This file is the boundary vocabulary for current interprocedural calls.
 
 ### `src/analysis/rules.rs`
 
@@ -378,6 +379,7 @@ Owns orchestration:
 PaperDriver                 -> top-level analysis driver
 answer_from_summaries(...)  -> summary applicability stage
 run_intraprocedural(...)    -> local worklist over (e, phi1, phi2)
+run_interprocedural(...)    -> summary/apply/recurse orchestration
 ```
 
 Current rule loop:
@@ -450,8 +452,11 @@ rules.rs        -> paper rule logic only
 
 The current SMT encoding is intentionally lightweight:
 
-- predicate atoms are encoded as Boolean symbols;
-- no structured scalar arithmetic or memory-state vocabulary is encoded yet;
+- most predicate atoms are encoded as Boolean symbols;
+- an initial memory-shaped encoding exists in `SmtPredicateOracle`:
+  `store/load`-style atoms are mapped to SMT `Array[Int -> Int]`
+  `store/select` constraints;
+- scalar arithmetic/state is still mostly symbolic and not fully typed;
 - transition images still come from guard/effect compositions and do not yet
   encode full `Gamma_e` semantics.
 

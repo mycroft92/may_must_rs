@@ -100,10 +100,14 @@ pub struct SummaryTable {
 
 impl SummaryTable {
     pub fn add(&mut self, summary: ProcedureSummary) {
-        self.by_procedure
+        let summaries = self
+            .by_procedure
             .entry(summary.procedure.clone())
-            .or_default()
-            .push(summary);
+            .or_default();
+        if summaries.iter().any(|existing| existing == &summary) {
+            return;
+        }
+        summaries.push(summary);
     }
 
     pub fn for_procedure(&self, procedure: &ProcedureName) -> &[ProcedureSummary] {

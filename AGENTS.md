@@ -87,7 +87,7 @@ LLVM bitcode
   -> analysis::llvm_adapter::adapt_function_graph
   -> analysis::oracle::SmtPredicateOracle
   -> analysis::transfer::SmtLlvmTransitionOracle
-  -> analysis::driver::PaperDriver::run_intraprocedural
+  -> analysis::driver::PaperDriver::run_interprocedural
 ```
 
 Current default query policy:
@@ -105,16 +105,21 @@ non-target `may_assert(...)` calls stay as ordinary call effects.
 
 ## Flow Rules
 
-The active intraprocedural flow is:
+The active flow is interprocedural with local intraprocedural worklists:
 
 ```text
-run_intraprocedural(procedure, query)
-  1. initialize Pi_n and Omega_n from the query
-  2. enqueue (edge, source region, destination region) obligations
-  3. apply MUST-POST to grow Omega_n
-  4. apply NOTMAY-PRE to split Pi_n and record may edges
-  5. requeue obligations affected by Omega growth or partition refinement
-  6. stop at REACHABLE, obligation limit, or worklist exhaustion
+run_interprocedural(query)
+  1. try top-level summary applicability
+  2. initialize local Pi_n and Omega_n from the query
+  3. enqueue (edge, source region, destination region) obligations
+  4. on internal call edge:
+       try summary-use rules
+       else project callee query (MayCall), recurse, and create Must/NotMay summary
+       then retry summary-use rules
+  5. on non-call or unresolved external edge:
+       apply MUST-POST / NOTMAY-PRE
+  6. requeue obligations affected by Omega growth or partition refinement
+  7. stop at REACHABLE, UNKNOWN (limit/unresolved internal call), or exhaustion
 ```
 
 Current initialization:
@@ -178,9 +183,10 @@ NotMay : no supported path reaches the queried target
 
 Do not add persistent May summaries.
 
-The active `SummaryTable` is part of the paper tree, but summary use is not
-yet wired into call-edge execution. Keep summary types aligned with the paper
-even before that integration exists.
+The active `SummaryTable` is part of the paper tree, and summary use is wired
+into call-edge execution inside the interprocedural driver.
+Summary creation and reuse are active for `Must` and `NotMay`.
+Keep summary types aligned with the paper while extending coverage.
 
 ## Transfer Policy
 
