@@ -140,8 +140,11 @@ FunctionGraph
   creation, and call-edge summary reuse via
   `MUST-POST-USE-SUMMARY` / `NOTMAY-PRE-USE-SUMMARY`;
 - call-query projection now drops edge-local SSA effect atoms at callee
-  boundaries and uses a return-boundary fallback predicate
-  `retval_<callee> > 0` when projected postconditions are vacuous;
+  boundaries and uses a return-boundary fallback target predicate
+  `retval_<callee> < 0` when projected postconditions are vacuous;
+- current Figure-1 heuristic: when a callee matches a non-negative-return shape
+  (`icmp sgt` + negation step), the driver synthesizes a direct not-may summary
+  `true => retval_<callee> < 0`;
 - per-procedure local worklist over `(edge, source region, destination region)`;
 - CLI wiring to the active paper driver;
 - unit tests for the paper-shaped modules;
@@ -162,7 +165,8 @@ cargo test
 - full memory modeling in paper-state/query/summaries
   (current array semantics are atom-level and still lightweight);
 - richer call-query projection semantics beyond the current boundary heuristic
-  (edge-local atom stripping + `retval_<callee> > 0` fallback);
+  (edge-local atom stripping + `retval_<callee> < 0` fallback + shape-based
+  not-may synthesis);
 - explicit target selection when a function has multiple embedded assertions;
 - command-line `--assert` queries in the paper driver;
 - rich LLVM coverage (`phi`, `switch`, `getelementptr`, casts, calls with

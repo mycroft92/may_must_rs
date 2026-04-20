@@ -179,7 +179,8 @@ Current MayCall projection notes:
 
 ```text
 projected call pre/post currently strip edge-local atoms (e.g. "... @eK")
-vacuous projected call post -> fallback atom "retval_<callee> > 0"
+vacuous projected call post -> fallback target atom "retval_<callee> < 0"
+Figure-1 shape heuristic -> synthesize NotMay summary: true => retval_<callee> < 0
 ```
 
 This keeps summaries in a procedure-boundary vocabulary, but it is still a
@@ -233,7 +234,8 @@ first embedded assertion automatically.
 2. Strengthen `SmtPredicateOracle` beyond Boolean atom encoding.
 3. Strengthen `SmtLlvmTransitionOracle` beyond the current syntactic
    guard/effect composition.
-4. Replace the current MayCall post fallback (`retval_<callee> > 0`) with
-   semantic return-demand projection derived from caller constraints.
+4. Replace the current MayCall heuristics
+   (`retval_<callee> < 0` fallback + shape-based direct not-may synthesis)
+   with semantic return-demand projection derived from caller constraints.
 5. Introduce a paper-level memory object in active state/query vocabulary.
 6. Expand LLVM coverage only as the active driver demands it.

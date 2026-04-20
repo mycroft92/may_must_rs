@@ -34,10 +34,18 @@ assert_violation(site) && !assert_arg
   a return-boundary predicate of the shape:
 
 ```text
-retval_<callee> > 0
+retval_<callee> < 0
 ```
 
   (current heuristic; not the final semantic projection design).
+- For Figure-1 style non-negative-return callees, the current provider also
+  synthesizes a direct not-may summary:
+
+```text
+true => (NotMay) retval_<callee> < 0
+```
+
+  (shape-based heuristic; this is not yet a general semantic proof engine).
 - Initial memory modeling is now started in the SMT predicate oracle:
   memory atoms are interpreted with integer-array `select/store`.
 - Explicit target selection is not implemented yet.
@@ -137,13 +145,15 @@ Use them for reference only when porting ideas into the active tree.
    - Current stopgap for vacuous projected postconditions:
 
 ```text
-retval_<callee> > 0
+retval_<callee> < 0
 ```
 
    - Next step: derive call-post predicates from real caller demand and callee
      return semantics (including `<`, `<=`, `>`, `>=`, and equality constraints).
    - Keep summary predicates in procedure-boundary vocabulary, not caller-edge
      SSA atoms.
+   - Retire the current shape-based direct not-may synthesis once transition
+     semantics can prove the same obligations.
 
 5. Clarify memory in paper terms.
    - Decide what memory object should live in the active state/query language.

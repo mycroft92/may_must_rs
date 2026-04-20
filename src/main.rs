@@ -20,7 +20,7 @@ use crate::analysis::driver::{IntraproceduralConfig, PaperDriver};
 use crate::analysis::formula::Predicate;
 use crate::analysis::llvm_adapter::{adapt_function_graph, AdaptedProcedure, LlvmEdgeRegistry};
 use crate::analysis::oracle::SmtPredicateOracle;
-use crate::analysis::summaries::ReachabilityQuery;
+use crate::analysis::summaries::{ProcedureSummary, ReachabilityQuery};
 use crate::analysis::transfer::{assertion_violation_predicate, SmtLlvmTransitionOracle};
 use crate::analysis::vocabulary::ProcedureName;
 use crate::llvm_utils::llvm_wrap::*;
@@ -247,6 +247,37 @@ impl InterproceduralOracleProvider for LlvmInterproceduralProvider<'_> {
         );
         Some(ReachabilityQuery::new(callee.clone(), call_pre, call_post))
     }
+
+    fn synthesize_call_summary(
+        &self,
+        call_edge: &PaperEdge,
+        callee_query: &ReachabilityQuery,
+    ) -> Option<ProcedureSummary> {
+        let EdgeKind::Call { callee } = &call_edge.transition.kind else {
+            return None;
+        };
+        if callee_query.pre != Predicate::True {
+            return None;
+        }
+        let expected_negative_post = Predicate::atom(format!("retval_{callee} < 0"));
+        if callee_query.post != expected_negative_post {
+            return None;
+        }
+        let registry = self.registries.get(callee)?;
+        if !has_non_negative_return_pattern(registry) {
+            return None;
+        }
+        debug!(
+            "synthesize_call_summary: generating NotMay summary for {} with post {}",
+            callee, expected_negative_post
+        );
+        Some(ProcedureSummary::not_may(
+            callee.clone(),
+            Predicate::True,
+            expected_negative_post,
+            format!("syntactic non-negative return pattern in {callee}"),
+        ))
+    }
 }
 
 fn project_predicate(predicate: &Predicate, shared: &BTreeSet<String>) -> Predicate {
@@ -292,7 +323,20 @@ fn sanitize_call_boundary_predicate(predicate: Predicate) -> Predicate {
 }
 
 fn fallback_call_return_post(callee: &ProcedureName) -> Predicate {
-    Predicate::atom(format!("retval_{callee} > 0"))
+    Predicate::atom(format!("retval_{callee} < 0"))
+}
+
+fn has_non_negative_return_pattern(registry: &LlvmEdgeRegistry) -> bool {
+    let has_signed_gt_zero_guard = registry.iter().any(|metadata| {
+        metadata.opcode == InstructionOpcode::ICmp && metadata.instruction_text.contains("icmp sgt")
+    });
+    let has_negation_step = registry.iter().any(|metadata| {
+        metadata.opcode == InstructionOpcode::Sub
+            && (metadata.instruction_text.contains("sub nsw i32 0")
+                || metadata.instruction_text.contains("sub i32 0")
+                || metadata.operands.iter().any(|operand| operand == "0"))
+    });
+    has_signed_gt_zero_guard && has_negation_step
 }
 
 fn atom_uses_shared_symbol(atom: &str, shared: &BTreeSet<String>) -> bool {
@@ -402,6 +446,49 @@ mod tests {
     #[test]
     fn fallback_call_return_post_uses_return_boundary_name() {
         let post = fallback_call_return_post(&ProcedureName::new("g"));
-        assert_eq!(post, Predicate::atom("retval_g > 0"));
+        assert_eq!(post, Predicate::atom("retval_g < 0"));
+    }
+
+    #[test]
+    fn non_negative_return_pattern_is_detected_from_registry_shape() {
+        let mut registry = LlvmEdgeRegistry::new();
+        registry.insert(crate::analysis::llvm_adapter::LlvmEdgeMetadata {
+            edge_id: crate::analysis::vocabulary::EdgeId(0),
+            from: crate::analysis::vocabulary::NodeId(0),
+            to: crate::analysis::vocabulary::NodeId(1),
+            opcode: InstructionOpcode::ICmp,
+            instruction_text: "%5 = icmp sgt i32 %4, 0".to_string(),
+            assignment: Some("%5".to_string()),
+            called_function: None,
+            operands: vec!["%4".to_string(), "0".to_string()],
+            branch_condition: None,
+            successor_index: None,
+        });
+        registry.insert(crate::analysis::llvm_adapter::LlvmEdgeMetadata {
+            edge_id: crate::analysis::vocabulary::EdgeId(1),
+            from: crate::analysis::vocabulary::NodeId(1),
+            to: crate::analysis::vocabulary::NodeId(2),
+            opcode: InstructionOpcode::Sub,
+            instruction_text: "%10 = sub nsw i32 0, %9".to_string(),
+            assignment: Some("%10".to_string()),
+            called_function: None,
+            operands: vec!["0".to_string(), "%9".to_string()],
+            branch_condition: None,
+            successor_index: None,
+        });
+        registry.insert(crate::analysis::llvm_adapter::LlvmEdgeMetadata {
+            edge_id: crate::analysis::vocabulary::EdgeId(2),
+            from: crate::analysis::vocabulary::NodeId(2),
+            to: crate::analysis::vocabulary::NodeId(3),
+            opcode: InstructionOpcode::Ret,
+            instruction_text: "ret i32 %12".to_string(),
+            assignment: None,
+            called_function: None,
+            operands: vec!["%12".to_string()],
+            branch_condition: None,
+            successor_index: None,
+        });
+
+        assert!(has_non_negative_return_pattern(&registry));
     }
 }

@@ -50,8 +50,9 @@ What is not active yet:
 - faithful SMT transition images for LLVM effects;
 - paper-level memory;
 - semantic call-query projection beyond the current boundary heuristic
-  (edge-local atom stripping + `retval_<callee> > 0` fallback for vacuous
-  call posts).
+  (edge-local atom stripping + `retval_<callee> < 0` fallback for vacuous
+  call posts + shape-based direct not-may synthesis for Figure-1 style
+  non-negative-return callees).
 
 ## 2. File-To-Paper Correspondence
 

@@ -41,7 +41,14 @@ Current state:
 - When projected call postconditions are vacuous, the active fallback uses:
 
 ```text
-retval_<callee> > 0
+retval_<callee> < 0
+```
+
+- For the Figure-1 shape (`g`-like non-negative return pattern), the provider
+  now synthesizes:
+
+```text
+NotMay: true => retval_<callee> < 0
 ```
 
 Needed:
@@ -50,6 +57,8 @@ Needed:
   predicates and repeated call contexts.
 - Replace the current call-post fallback with semantic caller-demand to callee
   return projection.
+- Replace the current shape-based direct not-may synthesis with transition-level
+  semantic proof obligations.
 - Add provenance metadata that can explain why a summary was reused/rejected.
 - Keep persisted summaries restricted to `Must` and `NotMay`.
 
