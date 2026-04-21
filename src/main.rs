@@ -19,12 +19,14 @@ use crate::analysis::driver::{
     InterproceduralConfig, InterproceduralOracleProvider, IntraproceduralConfig,
     IntraproceduralResult, PaperDriver,
 };
-use crate::analysis::formula::Predicate;
+use crate::analysis::formula::{
+    collect_predicate_symbols, looks_like_memory_symbol, substitute_predicate_symbols, Predicate,
+};
 use crate::analysis::llvm_adapter::{
     adapt_function_graph, AdaptedProcedure, LlvmEdgeMetadata, LlvmEdgeRegistry,
 };
 use crate::analysis::oracle::SmtPredicateOracle;
-use crate::analysis::summaries::{ProcedureSummary, ReachabilityQuery};
+use crate::analysis::summaries::ReachabilityQuery;
 use crate::analysis::transfer::{
     assertion_site_predicate, assertion_violation_predicate, AssertionTargetMode,
     SmtLlvmTransitionOracle,
@@ -359,13 +361,12 @@ impl InterproceduralOracleProvider for LlvmInterproceduralProvider<'_> {
             }
         }
 
-        let call_pre = sanitize_call_boundary_predicate(project_predicate(
+        let call_pre = project_predicate(
             &Predicate::and([omega_n1.clone(), source_region.clone()]),
             &shared,
-        ));
-        let projected_post =
-            sanitize_call_boundary_predicate(project_predicate(dest_region, &shared));
-        // APPROX_HEAVY: When projection/sanitization collapses post to `true`,
+        );
+        let projected_post = project_predicate(dest_region, &shared);
+        // APPROX_HEAVY: When projection collapses post to `true`,
         // we inject a synthetic return-boundary predicate instead of deriving a
         // semantic caller-demand projection through call/return relations.
         let call_post = if projected_post == Predicate::True {
@@ -394,37 +395,37 @@ impl InterproceduralOracleProvider for LlvmInterproceduralProvider<'_> {
         Some(ReachabilityQuery::new(callee.clone(), call_pre, call_post))
     }
 
-    fn synthesize_call_summary(
+    fn normalize_projected_callee_query(
         &self,
+        caller_query: &ReachabilityQuery,
         call_edge: &PaperEdge,
-        callee_query: &ReachabilityQuery,
-    ) -> Option<ProcedureSummary> {
+        projected: ReachabilityQuery,
+    ) -> ReachabilityQuery {
         let EdgeKind::Call { callee } = &call_edge.transition.kind else {
-            return None;
+            return projected;
         };
-        if callee_query.pre != Predicate::True {
-            return None;
-        }
-        let expected_negative_post = Predicate::atom(format!("retval_{callee} < 0"));
-        if callee_query.post != expected_negative_post {
-            return None;
-        }
-        let registry = self.registries.get(callee)?;
-        // APPROX_HEAVY: Shape-based summary synthesis is a heuristic shortcut.
-        // It is not a transition-level proof that the query post is NotMay.
-        if !has_non_negative_return_pattern(registry) {
-            return None;
-        }
-        debug!(
-            "synthesize_call_summary: generating NotMay summary for {} with post {}",
-            callee, expected_negative_post
+        let Some(caller_registry) = self.registries.get(&caller_query.procedure) else {
+            return projected;
+        };
+        let Some(call_metadata) = caller_registry.metadata(call_edge.id) else {
+            return projected;
+        };
+        let callee_parameters = self
+            .parameters
+            .get(callee)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let normalized = normalize_projected_query_to_callee_boundary(
+            callee,
+            call_metadata,
+            callee_parameters,
+            projected,
         );
-        Some(ProcedureSummary::not_may(
-            callee.clone(),
-            Predicate::True,
-            expected_negative_post,
-            format!("syntactic non-negative return pattern in {callee}"),
-        ))
+        debug!(
+            "Normalized callee query for summary generation {} via {}: pre={}, post={}",
+            callee, call_edge.id, normalized.pre, normalized.post
+        );
+        normalized
     }
 }
 
@@ -452,48 +453,10 @@ fn project_predicate(predicate: &Predicate, shared: &BTreeSet<String>) -> Predic
     }
 }
 
-fn sanitize_call_boundary_predicate(predicate: Predicate) -> Predicate {
-    match predicate {
-        Predicate::True => Predicate::True,
-        Predicate::False => Predicate::False,
-        Predicate::Atom(atom) => {
-            // APPROX_HEAVY: Edge-local SSA/effect atoms are erased by pattern.
-            // This can make projected boundary predicates vacuous.
-            if atom.contains(" @e") {
-                Predicate::True
-            } else {
-                Predicate::atom(atom)
-            }
-        }
-        Predicate::Not(inner) => Predicate::not(sanitize_call_boundary_predicate(*inner)),
-        Predicate::And(parts) => {
-            Predicate::and(parts.into_iter().map(sanitize_call_boundary_predicate))
-        }
-        Predicate::Or(parts) => {
-            Predicate::or(parts.into_iter().map(sanitize_call_boundary_predicate))
-        }
-    }
-}
-
 fn fallback_call_return_post(callee: &ProcedureName) -> Predicate {
     // APPROX_HEAVY: Synthetic fallback target used when projected call post is
     // vacuous after boundary sanitization.
     Predicate::atom(format!("retval_{callee} < 0"))
-}
-
-fn has_non_negative_return_pattern(registry: &LlvmEdgeRegistry) -> bool {
-    // APPROX_HEAVY: Structural pattern detector (icmp sgt + negation-like sub)
-    // approximates semantic non-negative return reasoning.
-    let has_signed_gt_zero_guard = registry.iter().any(|metadata| {
-        metadata.opcode == InstructionOpcode::ICmp && metadata.instruction_text.contains("icmp sgt")
-    });
-    let has_negation_step = registry.iter().any(|metadata| {
-        metadata.opcode == InstructionOpcode::Sub
-            && (metadata.instruction_text.contains("sub nsw i32 0")
-                || metadata.instruction_text.contains("sub i32 0")
-                || metadata.operands.iter().any(|operand| operand == "0"))
-    });
-    has_signed_gt_zero_guard && has_negation_step
 }
 
 fn atom_uses_shared_symbol(atom: &str, shared: &BTreeSet<String>) -> bool {
@@ -536,8 +499,9 @@ fn instantiate_call_query_with_renaming_and_havoc(
 
     // APPROX_HEAVY: Formal/actual binding is derived from parameter-index
     // pairing, not from a typed call/return relation object.
-    // Bind renamed formals to actual call arguments.
-    let mut formal_bindings = Vec::new();
+    // ALPHA_RENAME: bind formals by substitution (renamed formal -> actual)
+    // instead of adding extra equality conjuncts.
+    let mut formal_substitutions = BTreeMap::new();
     for (index, formal) in callee_parameters.iter().enumerate() {
         let Some(actual) = call_metadata.operands.get(index) else {
             continue;
@@ -546,24 +510,21 @@ fn instantiate_call_query_with_renaming_and_havoc(
             .get(formal)
             .cloned()
             .unwrap_or_else(|| format!("{formal}__{call_tag}"));
-        formal_bindings.push(Predicate::atom(format!("{renamed_formal} = {actual}")));
+        formal_substitutions.insert(renamed_formal, actual.clone());
     }
-    if !formal_bindings.is_empty() {
-        renamed_pre =
-            Predicate::and(std::iter::once(renamed_pre).chain(formal_bindings.into_iter()));
-    }
+    renamed_pre = substitute_predicate_symbols(renamed_pre, &formal_substitutions);
+    renamed_post = substitute_predicate_symbols(renamed_post, &formal_substitutions);
 
-    // Bind renamed callee return boundary to caller lhs when present.
+    // ALPHA_RENAME: bind callee return boundary by substitution (retval -> lhs)
+    // instead of adding extra equality conjuncts.
     if let Some(lhs) = &call_metadata.assignment {
         let retval_name = format!("retval_{callee}");
         let renamed_retval = rename_map
             .get(&retval_name)
             .cloned()
             .unwrap_or_else(|| format!("{retval_name}__{call_tag}"));
-        renamed_post = Predicate::and([
-            renamed_post,
-            Predicate::atom(format!("{renamed_retval} = {lhs}")),
-        ]);
+        let return_substitutions = BTreeMap::from([(renamed_retval, lhs.to_string())]);
+        renamed_post = substitute_predicate_symbols(renamed_post, &return_substitutions);
     }
 
     // APPROX_HEAVY: Global/memory havoc is syntactic token-based renaming in
@@ -578,6 +539,38 @@ fn instantiate_call_query_with_renaming_and_havoc(
     let havoced_post = substitute_predicate_symbols(renamed_post, &havoc_map);
 
     (renamed_pre, havoced_post)
+}
+
+fn normalize_projected_query_to_callee_boundary(
+    callee: &ProcedureName,
+    call_metadata: &LlvmEdgeMetadata,
+    callee_parameters: &[String],
+    projected: ReachabilityQuery,
+) -> ReachabilityQuery {
+    // ALPHA_RENAME: Reverse callsite substitutions for persisted summaries:
+    // actual -> formal, caller lhs -> callee retval.
+    let mut replacements = BTreeMap::new();
+    for (index, formal) in callee_parameters.iter().enumerate() {
+        let Some(actual) = call_metadata.operands.get(index) else {
+            continue;
+        };
+        if is_boundary_symbol(actual) {
+            replacements.insert(actual.clone(), formal.clone());
+        }
+    }
+    if let Some(lhs) = &call_metadata.assignment {
+        if is_boundary_symbol(lhs) {
+            replacements.insert(lhs.clone(), format!("retval_{callee}"));
+        }
+    }
+    if replacements.is_empty() {
+        return projected;
+    }
+    ReachabilityQuery::new(
+        projected.procedure,
+        substitute_predicate_symbols(projected.pre, &replacements),
+        substitute_predicate_symbols(projected.post, &replacements),
+    )
 }
 
 fn callsite_tag(caller: &ProcedureName, call_edge: EdgeId) -> String {
@@ -600,131 +593,11 @@ fn sanitize_symbol_fragment(raw: &str) -> String {
     }
 }
 
-fn substitute_predicate_symbols(
-    predicate: Predicate,
-    replacements: &BTreeMap<String, String>,
-) -> Predicate {
-    if replacements.is_empty() {
-        return predicate;
-    }
-    match predicate {
-        Predicate::True => Predicate::True,
-        Predicate::False => Predicate::False,
-        Predicate::Atom(atom) => Predicate::atom(substitute_atom_symbols(&atom, replacements)),
-        Predicate::Not(inner) => Predicate::not(substitute_predicate_symbols(*inner, replacements)),
-        Predicate::And(parts) => Predicate::and(
-            parts
-                .into_iter()
-                .map(|part| substitute_predicate_symbols(part, replacements)),
-        ),
-        Predicate::Or(parts) => Predicate::or(
-            parts
-                .into_iter()
-                .map(|part| substitute_predicate_symbols(part, replacements)),
-        ),
-    }
-}
-
-fn substitute_atom_symbols(atom: &str, replacements: &BTreeMap<String, String>) -> String {
-    let mut rewritten = atom.to_string();
-    let mut ordered = replacements.iter().collect::<Vec<_>>();
-    ordered.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
-    for (from, to) in ordered {
-        rewritten = replace_symbol_exact(&rewritten, from, to);
-    }
-    rewritten
-}
-
-fn replace_symbol_exact(input: &str, from: &str, to: &str) -> String {
-    if from.is_empty() || from == to {
-        return input.to_string();
-    }
-    let mut out = String::new();
-    let mut index = 0usize;
-    while index < input.len() {
-        let Some(relative) = input[index..].find(from) else {
-            out.push_str(&input[index..]);
-            break;
-        };
-        let found = index + relative;
-        let end = found + from.len();
-        let left_boundary = if found == 0 {
-            true
-        } else {
-            !is_symbol_body_char(input[..found].chars().next_back().unwrap_or(' '))
-        };
-        let right_boundary = if end >= input.len() {
-            true
-        } else {
-            !is_symbol_body_char(input[end..].chars().next().unwrap_or(' '))
-        };
-        if left_boundary && right_boundary {
-            out.push_str(&input[index..found]);
-            out.push_str(to);
-            index = end;
-        } else {
-            out.push_str(&input[index..end]);
-            index = end;
-        }
-    }
-    out
-}
-
-fn is_symbol_body_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '\'' | '.')
-}
-
-fn collect_predicate_symbols(predicate: &Predicate) -> BTreeSet<String> {
-    let mut symbols = BTreeSet::new();
-    collect_predicate_symbols_into(predicate, &mut symbols);
-    symbols
-}
-
-fn collect_predicate_symbols_into(predicate: &Predicate, symbols: &mut BTreeSet<String>) {
-    match predicate {
-        Predicate::True | Predicate::False => {}
-        Predicate::Atom(atom) => collect_atom_symbols(atom, symbols),
-        Predicate::Not(inner) => collect_predicate_symbols_into(inner, symbols),
-        Predicate::And(parts) | Predicate::Or(parts) => {
-            for part in parts {
-                collect_predicate_symbols_into(part, symbols);
-            }
-        }
-    }
-}
-
-fn collect_atom_symbols(atom: &str, symbols: &mut BTreeSet<String>) {
-    let chars = atom.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    while index < chars.len() {
-        let c = chars[index];
-        if c == '%' || c == '@' {
-            let start = index;
-            index += 1;
-            while index < chars.len() && is_symbol_body_char(chars[index]) {
-                index += 1;
-            }
-            symbols.insert(chars[start..index].iter().collect());
-            continue;
-        }
-        if c.is_ascii_alphabetic() {
-            let start = index;
-            index += 1;
-            while index < chars.len() && is_symbol_body_char(chars[index]) {
-                index += 1;
-            }
-            let token = chars[start..index].iter().collect::<String>();
-            if token.starts_with("retval_") || looks_like_memory_symbol(&token) {
-                symbols.insert(token);
-            }
-            continue;
-        }
-        index += 1;
-    }
-}
-
-fn looks_like_memory_symbol(token: &str) -> bool {
-    token == "mem" || token == "mem'" || token.starts_with("mem_")
+fn is_boundary_symbol(token: &str) -> bool {
+    token.starts_with('%')
+        || token.starts_with('@')
+        || token.starts_with("retval_")
+        || looks_like_memory_symbol(token)
 }
 
 fn graph_output_dir(input_file: &str) -> String {
@@ -796,62 +669,9 @@ mod tests {
     use crate::analysis::vocabulary::NodeId;
 
     #[test]
-    fn sanitize_call_boundary_predicate_drops_edge_local_atoms() {
-        let predicate = Predicate::and([
-            Predicate::atom("%tmp' = load(%p) @e9"),
-            Predicate::atom("global_ok"),
-        ]);
-        let sanitized = sanitize_call_boundary_predicate(predicate);
-        assert_eq!(sanitized, Predicate::atom("global_ok"));
-    }
-
-    #[test]
     fn fallback_call_return_post_uses_return_boundary_name() {
         let post = fallback_call_return_post(&ProcedureName::new("g"));
         assert_eq!(post, Predicate::atom("retval_g < 0"));
-    }
-
-    #[test]
-    fn non_negative_return_pattern_is_detected_from_registry_shape() {
-        let mut registry = LlvmEdgeRegistry::new();
-        registry.insert(crate::analysis::llvm_adapter::LlvmEdgeMetadata {
-            edge_id: crate::analysis::vocabulary::EdgeId(0),
-            from: crate::analysis::vocabulary::NodeId(0),
-            to: crate::analysis::vocabulary::NodeId(1),
-            opcode: InstructionOpcode::ICmp,
-            instruction_text: "%5 = icmp sgt i32 %4, 0".to_string(),
-            assignment: Some("%5".to_string()),
-            called_function: None,
-            operands: vec!["%4".to_string(), "0".to_string()],
-            branch_condition: None,
-            successor_index: None,
-        });
-        registry.insert(crate::analysis::llvm_adapter::LlvmEdgeMetadata {
-            edge_id: crate::analysis::vocabulary::EdgeId(1),
-            from: crate::analysis::vocabulary::NodeId(1),
-            to: crate::analysis::vocabulary::NodeId(2),
-            opcode: InstructionOpcode::Sub,
-            instruction_text: "%10 = sub nsw i32 0, %9".to_string(),
-            assignment: Some("%10".to_string()),
-            called_function: None,
-            operands: vec!["0".to_string(), "%9".to_string()],
-            branch_condition: None,
-            successor_index: None,
-        });
-        registry.insert(crate::analysis::llvm_adapter::LlvmEdgeMetadata {
-            edge_id: crate::analysis::vocabulary::EdgeId(2),
-            from: crate::analysis::vocabulary::NodeId(2),
-            to: crate::analysis::vocabulary::NodeId(3),
-            opcode: InstructionOpcode::Ret,
-            instruction_text: "ret i32 %12".to_string(),
-            assignment: None,
-            called_function: None,
-            operands: vec!["%12".to_string()],
-            branch_condition: None,
-            successor_index: None,
-        });
-
-        assert!(has_non_negative_return_pattern(&registry));
     }
 
     #[test]
@@ -918,15 +738,41 @@ mod tests {
         );
 
         let pre_text = inst_pre.to_string();
-        assert!(pre_text.contains("%0__f_e9 > 0"));
-        assert!(pre_text.contains("%0__f_e9 = %x"));
-        assert!(pre_text.contains("%1__f_e9 = @G"));
+        assert!(pre_text.contains("%x > 0"));
         assert!(pre_text.contains("@G == 1"));
 
         let post_text = inst_post.to_string();
-        assert!(post_text.contains("retval_g__f_e9 > 0"));
-        assert!(post_text.contains("retval_g__f_e9 = %r"));
+        assert!(post_text.contains("%r > 0"));
         assert!(post_text.contains("@G__havoc_f_e9 = 2"));
         assert!(post_text.contains("mem'__havoc_f_e9 = store(%p__f_e9, 1)"));
+    }
+
+    #[test]
+    fn projected_query_normalization_restores_callee_boundary_symbols() {
+        let callee = ProcedureName::new("g");
+        let metadata = LlvmEdgeMetadata {
+            edge_id: EdgeId(10),
+            from: NodeId(0),
+            to: NodeId(1),
+            opcode: InstructionOpcode::Call,
+            instruction_text: "%11 = call i32 @g(i32 %10)".to_string(),
+            assignment: Some("%11".to_string()),
+            called_function: Some("g".to_string()),
+            operands: vec!["%10".to_string()],
+            branch_condition: None,
+            successor_index: None,
+        };
+        let projected =
+            ReachabilityQuery::new("g", Predicate::atom("%10 >= 0"), Predicate::atom("%11 < 0"));
+
+        let normalized = normalize_projected_query_to_callee_boundary(
+            &callee,
+            &metadata,
+            &["%0".to_string()],
+            projected,
+        );
+
+        assert_eq!(normalized.pre, Predicate::atom("%0 >= 0"));
+        assert_eq!(normalized.post, Predicate::atom("retval_g < 0"));
     }
 }

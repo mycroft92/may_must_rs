@@ -112,12 +112,13 @@ pub trait InterproceduralOracleProvider {
         dest_region: &Predicate,
     ) -> Option<ReachabilityQuery>;
 
-    fn synthesize_call_summary(
+    fn normalize_projected_callee_query(
         &self,
+        _caller_query: &ReachabilityQuery,
         _call_edge: &PaperEdge,
-        _callee_query: &ReachabilityQuery,
-    ) -> Option<ProcedureSummary> {
-        None
+        projected: ReachabilityQuery,
+    ) -> ReachabilityQuery {
+        projected
     }
 }
 
@@ -673,18 +674,16 @@ impl PaperDriver {
             return Ok(None);
         }
 
-        let Some(callee_query) =
+        let Some(projected_query) =
             provider.project_call_query(caller_query, edge, omega_n1, source_region, dest_region)
         else {
             return Ok(None);
         };
+        let callee_query =
+            provider.normalize_projected_callee_query(caller_query, edge, projected_query);
         if predicates.is_empty(&callee_query.pre)? {
             return Ok(None);
         }
-        if let Some(summary) = provider.synthesize_call_summary(edge, &callee_query) {
-            return Ok(Some(summary));
-        }
-
         let result = self.run_interprocedural_inner(
             predicates,
             provider,
