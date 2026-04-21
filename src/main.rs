@@ -455,7 +455,7 @@ fn project_predicate(predicate: &Predicate, shared: &BTreeSet<String>) -> Predic
 
 fn fallback_call_return_post(callee: &ProcedureName) -> Predicate {
     // APPROX_HEAVY: Synthetic fallback target used when projected call post is
-    // vacuous after boundary sanitization.
+    // vacuous after boundary projection.
     Predicate::atom(format!("retval_{callee} < 0"))
 }
 
