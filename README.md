@@ -106,6 +106,7 @@ src/analysis/state.rs        -> Pi_n, Omega_n, regions, may edges
 src/analysis/rules.rs        -> named SMASH rules
 src/analysis/oracle.rs       -> PredicateOracle, TransitionOracle
 src/analysis/llvm_adapter.rs -> LLVM FunctionGraph -> paper procedure + metadata
+src/analysis/call_projection.rs -> call-boundary query projection/renaming
 src/analysis/transfer.rs     -> metadata-backed transition oracles
 src/analysis/summaries.rs    -> reachability queries and summaries
 src/analysis/driver.rs       -> interprocedural orchestration + local worklist
@@ -148,15 +149,16 @@ FunctionGraph
   summary applicability, call-query projection, MayCall recursion, summary
   creation, and call-edge summary reuse via
   `MUST-POST-USE-SUMMARY` / `NOTMAY-PRE-USE-SUMMARY`;
-- call-query projection now drops edge-local SSA effect atoms at callee
-  boundaries and uses a return-boundary fallback target predicate
-  `retval_<callee> < 0` when projected postconditions are vacuous;
-- call-query instantiation now renames call-instance locals/retvals, adds
-  formal-to-actual and retval-to-lhs bindings, and havocs global/memory-shaped
+- call-query projection/renaming now lives in `analysis::call_projection`;
+- call-query instantiation now renames call-instance locals/retvals, applies
+  formal/actual and retval/lhs substitutions, and havocs global/memory-shaped
   post symbols at the caller boundary;
-- current Figure-1 heuristic: when a callee matches a non-negative-return shape
-  (`icmp sgt` + negation step), the driver synthesizes a direct not-may summary
-  `true => retval_<callee> < 0`;
+- projected caller-shaped queries are normalized back to callee-boundary
+  symbols before summary creation/reuse checks;
+- projected call postconditions still use a return-boundary fallback target
+  `retval_<callee> < 0` when projection becomes vacuous;
+- fallback summary synthesis heuristics were removed; summaries are created only
+  from recursive query results (`Must` / `NotMay`);
 - per-procedure local worklist over `(edge, source region, destination region)`;
 - CLI wiring to the active paper driver;
 - unit tests for the paper-shaped modules;
@@ -166,7 +168,7 @@ Current unit-test baseline:
 
 ```text
 cargo test
-39 passed
+40 passed
 ```
 
 ## What Is Not Yet Implemented
@@ -177,8 +179,7 @@ cargo test
 - full memory modeling in paper-state/query/summaries
   (current array semantics are atom-level and still lightweight);
 - richer call-query projection semantics beyond the current boundary heuristic
-  (edge-local atom stripping + `retval_<callee> < 0` fallback + shape-based
-  not-may synthesis);
+  (symbol-membership projection + `retval_<callee> < 0` fallback);
 - explicit CLI target-selection (`--assert`) in the active driver;
 - command-line `--assert` queries in the paper driver;
 - rich LLVM coverage (`phi`, `switch`, `getelementptr`, casts, calls with

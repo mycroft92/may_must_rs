@@ -37,20 +37,16 @@ Current state:
   - `NotMay` summaries from completed non-reachable callee runs.
 - Created summaries are now persisted and reused on subsequent call edges.
 - `SummaryTable::add` now de-duplicates identical summaries.
-- MayCall projection now drops edge-local atoms at call boundaries.
+- Call-query projection/renaming now lives in
+  `src/analysis/call_projection.rs`.
 - MayCall instantiation now applies call-instance renaming, formal/actual and
-  retval/lhs bindings, and global/memory post-havoc at call boundaries.
+  retval/lhs substitutions, and global/memory post-havoc at call boundaries.
+- Projected caller-shaped queries are normalized back to callee-boundary
+  symbols before summary creation/reuse checks.
 - When projected call postconditions are vacuous, the active fallback uses:
 
 ```text
 retval_<callee> < 0
-```
-
-- For the Figure-1 shape (`g`-like non-negative return pattern), the provider
-  now synthesizes:
-
-```text
-NotMay: true => retval_<callee> < 0
 ```
 
 Needed:
@@ -59,8 +55,6 @@ Needed:
   predicates and repeated call contexts.
 - Replace the current call-post fallback with semantic caller-demand to callee
   return projection.
-- Replace the current shape-based direct not-may synthesis with transition-level
-  semantic proof obligations.
 - Add provenance metadata that can explain why a summary was reused/rejected.
 - Keep persisted summaries restricted to `Must` and `NotMay`.
 
@@ -234,5 +228,5 @@ make -C tests smoke
 Current unit-test baseline:
 
 ```text
-39 passed
+40 passed
 ```

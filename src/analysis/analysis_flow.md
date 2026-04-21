@@ -51,9 +51,8 @@ What is not active yet:
 - faithful SMT transition images for LLVM effects;
 - paper-level memory;
 - semantic call-query projection beyond the current boundary heuristic
-  (edge-local atom stripping + `retval_<callee> < 0` fallback for vacuous
-  call posts + shape-based direct not-may synthesis for Figure-1 style
-  non-negative-return callees).
+  (symbol-membership projection + `retval_<callee> < 0` fallback for vacuous
+  call posts).
 
 ## 2. File-To-Paper Correspondence
 
@@ -120,6 +119,19 @@ target_assertion         -> currently selected assertion site
 ```
 
 This file is the boundary vocabulary for current interprocedural calls.
+
+### `src/analysis/call_projection.rs`
+
+Owns LLVM-aware call-boundary query transforms:
+
+```text
+caller obligation -> projected callee ReachabilityQuery
+callsite renaming/substitution/havoc
+caller-shaped query -> callee-boundary normalization for summary persistence
+```
+
+This keeps call projection logic out of CLI wiring and makes the transformation
+reusable by analysis modules.
 
 ### `src/analysis/rules.rs`
 

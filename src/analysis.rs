@@ -12,6 +12,7 @@
 //! cfg.rs          -> P, e, Gamma_e
 //! state.rs        -> Pi_n, Omega_n, N_e
 //! summaries.rs    -> queries and procedure summaries
+//! call_projection.rs -> LLVM call-boundary query projection/renaming helpers
 //! rules.rs        -> named paper rules
 //! oracle.rs       -> abstract set / transition reasoning boundary
 //! llvm_adapter.rs -> LLVM -> (P, e, metadata)
@@ -24,6 +25,7 @@
 //! but `cfg`, `state`, `rules`, `summaries`, and `oracle` should stay readable
 //! in paper vocabulary.
 
+pub mod call_projection;
 pub mod cfg;
 pub mod design;
 pub mod driver;

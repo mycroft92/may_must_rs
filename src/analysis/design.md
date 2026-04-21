@@ -189,11 +189,12 @@ internal calls without an applicable summary
 Current MayCall projection notes:
 
 ```text
-projected call pre/post currently strip edge-local atoms (e.g. "... @eK")
-callsite instantiation renames locals/retvals and adds formal/actual + retval/lhs bindings
+projection/instantiation lives in src/analysis/call_projection.rs
+projection keeps shared-symbol atoms (no edge-local sanitization pass)
+callsite instantiation renames locals/retvals and applies formal/actual + retval/lhs substitutions
 global/memory-shaped post symbols are currently havoced per callsite
 vacuous projected call post -> fallback target atom "retval_<callee> < 0"
-Figure-1 shape heuristic -> synthesize NotMay summary: true => retval_<callee> < 0
+projected caller-shaped queries are normalized back to callee-boundary symbols before summary creation
 ```
 
 This keeps summaries in a procedure-boundary vocabulary, but it is still a
@@ -251,8 +252,8 @@ runs all embedded assertion sites and does not yet implement `--assert`.
 2. Strengthen `SmtPredicateOracle` beyond Boolean atom encoding.
 3. Strengthen `SmtLlvmTransitionOracle` beyond the current syntactic
    guard/effect composition.
-4. Replace the current MayCall heuristics
-   (`retval_<callee> < 0` fallback + shape-based direct not-may synthesis)
+4. Replace the current MayCall fallback
+   (`retval_<callee> < 0` when projection becomes vacuous)
    with semantic return-demand projection derived from caller constraints.
 5. Introduce a paper-level memory object in active state/query vocabulary.
 6. Expand LLVM coverage only as the active driver demands it.

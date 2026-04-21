@@ -2,242 +2,129 @@
 
 This is the resume point for the next session.
 
-## Current Working Baseline
+## Completed This Session
 
-- `src/analysis` is now the active analysis tree.
-- The old toy analyzer and experimental SMT path were moved to:
+1. Removed fallback summary synthesis heuristics.
+   - Deleted provider-level synthetic summary hook from driver flow.
+   - Summary creation now only comes from recursive MayCall results:
+     `Must` when callee query is reachable, `NotMay` when completed and not
+     reachable.
+
+2. Enforced assertion-primitive call behavior.
+   - `may_assert` calls are summary-exempt in the interprocedural driver.
+   - They are handled by transition effects only; no call-summary projection,
+     creation, or reuse for `may_assert`.
+
+3. Reworked alpha-renaming/binding at call boundaries.
+   - Formal/actual and retval/lhs are now substitutions, not added equality
+     conjuncts.
+   - Projected caller-shaped call queries normalize back to callee-boundary
+     symbols before summary persistence checks.
+
+4. Removed boundary sanitize pass.
+   - The edge-local atom scrub pass was removed.
+   - Current projection is shared-symbol based (still approximate).
+
+5. Moved query transformation logic out of CLI wiring.
+   - Added `src/analysis/call_projection.rs` with:
+     - caller-to-callee query projection,
+     - callsite renaming/substitution/havoc,
+     - projected-query normalization for summaries.
+   - `main.rs` now delegates call projection to this analysis module.
+
+6. Centralized predicate symbol rewrite utilities.
+   - Moved symbol substitution/symbol collection helpers into
+     `src/analysis/formula.rs` as reusable analysis-level utilities.
+   - Added comments explaining why these belong in analysis, not CLI.
+
+7. Added/updated diagnostics and tests.
+   - Driver logs summary-rule rejection reasons on call edges.
+   - Driver logs unresolved internal-call context.
+   - Added regression that `may_assert` does not participate in summary flow.
+   - Moved call-projection tests into `analysis::call_projection`.
+
+## Current Baseline
+
+- Active architecture remains under `src/analysis`.
+- New analysis module:
 
 ```text
-obsolete/src/analysis
-obsolete/src/analysis.rs
+src/analysis/call_projection.rs
 ```
 
-- The CLI now runs the paper-shaped interprocedural driver:
-
-```sh
-cargo run --bin main -- <bitcode.bc>
-```
-
-- `--assert` is not implemented in the active driver.
-- The active query builder now creates assertion jobs for every embedded
-  `may_assert(...)` site:
+- Current unit-test baseline:
 
 ```text
-site reachability:      assert_violation(site)
-violation reachability: assert_violation(site) && !assert_arg
-```
-
-- Per-site verdicts are now:
-  `ASSERTION UNREACHABLE`, `ASSERTION TRUE WHEN REACHED`,
-  `ASSERTION VIOLATION REACHABLE`, or `UNKNOWN`.
-- MayCall boundary projection now strips edge-local atoms (`... @eK`) so call
-  summaries are not polluted with caller-edge SSA effects.
-- MayCall instantiation now renames call-instance locals/retvals, adds
-  formal/actual and retval/lhs bindings, and havocs global/memory-shaped post
-  symbols at call boundaries.
-- When a projected call postcondition is vacuous, the active fallback now uses
-  a return-boundary predicate of the shape:
-
-```text
-retval_<callee> < 0
-```
-
-  (current heuristic; not the final semantic projection design).
-- For Figure-1 style non-negative-return callees, the current provider also
-  synthesizes a direct not-may summary:
-
-```text
-true => (NotMay) retval_<callee> < 0
-```
-
-  (shape-based heuristic; this is not yet a general semantic proof engine).
-- Initial memory modeling is now started in the SMT predicate oracle:
-  memory atoms are interpreted with integer-array `select/store`.
-- Explicit target selection is not implemented yet.
-- Current test status:
-
-```sh
 cargo test
-# 39 passed
+# 40 passed
+```
 
+- Smoke baseline:
+
+```text
 make -C tests smoke
 # passes
 ```
 
-## What The Active Tree Contains
+## Known Behavior: `paper_section2_fig1_not_may`
 
-The active paper-shaped modules are:
+Running:
 
-```text
-src/analysis/vocabulary.rs   -> procedure, node, edge, and region IDs
-src/analysis/formula.rs      -> solver-independent predicates
-src/analysis/oracle.rs       -> PredicateOracle / TransitionOracle traits + SMT predicate oracle
-src/analysis/llvm_adapter.rs -> FunctionGraph -> (PaperProcedure, metadata)
-src/analysis/cfg.rs          -> PaperProcedure, PaperEdge, Gamma_e
-src/analysis/state.rs        -> Pi_n, Omega_n, regions, may edges
-src/analysis/summaries.rs    -> ReachabilityQuery, ProcedureSummary, SummaryTable
-src/analysis/transfer.rs     -> LlvmTransitionOracle, SmtLlvmTransitionOracle, LlvmEdgeTransfer
-src/analysis/rules.rs        -> named paper rules
-src/analysis/driver.rs       -> interprocedural orchestration + local worklist
-src/analysis/design.md       -> paper-to-code map
+```sh
+CRICK_LOG='main=debug,main::analysis::driver=debug' MAY_MUST_SKIP_DOT=1 \
+cargo run --bin main -- tests/out/paper_section2_fig1_not_may.bc --max-steps 20000
 ```
 
-The current driver already has:
+still yields `UNKNOWN`.
 
-```text
-answer_from_summaries
-run_intraprocedural
-run_interprocedural
-MayCall recursion + summary creation
-call-edge summary reuse inside local worklists
-```
+Current observed chain:
 
-The worklist unit is:
-
-```text
-(edge, source region, destination region)
-```
-
-Current rule use inside the worklist:
-
-```text
-MUST-POST   -> grows Omega_n
-NOTMAY-PRE  -> splits Pi_n and records may edges
-```
-
-## What Is Archived
-
-The following are archived only and should not be treated as active behavior:
-
-```text
-obsolete/src/analysis/may_must.rs
-obsolete/src/analysis/summary_store.rs
-obsolete/src/analysis/may_must_rules.rs
-obsolete/src/analysis/predicates.rs
-obsolete/src/analysis/smt_path.rs
-obsolete/src/analysis/analysis_flow.md
-obsolete/src/analysis/summary_store_design.md
-obsolete/src/analysis/memory_updates.md
-```
-
-Use them for reference only when porting ideas into the active tree.
+- projected call query at `e10` now appears caller-shaped:
+  `post=%11 < 0`;
+- normalized query for summary storage becomes callee-boundary:
+  `post=retval_g < 0`;
+- a `Must` summary is created for `g`;
+- summary reuse fails at later call obligations because summary precondition is
+  not covered by current `Omega_n1`;
+- unresolved internal call is marked, driving `UNKNOWN`.
 
 ## Immediate Next Work
 
-1. Tighten interprocedural behavior toward paper parity.
-   - Formalize the alternation schedule beyond the current pragmatic
-     summary/apply/recurse loop.
-   - Improve recursion handling beyond depth/stack cutoffs.
-   - Keep unresolved internal calls mapped to `UNKNOWN`, never unsound
-     `NOT REACHED`.
+1. Resolve summary-pre / `Omega_n1` mismatch for repeated call sites.
+   - Investigate whether the stored `Must` summary pre should be generalized or
+     projected differently at callee entry.
+   - Add targeted tests for repeated same-callee calls with different caller
+     SSA contexts.
 
-2. Implement explicit CLI target selection.
-   - Current behavior runs all embedded `may_assert(...)` sites.
-   - Next real step: implement `--assert` to select one resolved assertion/site.
+2. Replace vacuous-post fallback with semantic return-demand projection.
+   - Current fallback remains `retval_<callee> < 0`.
+   - Next step: derive post from caller demand over return relation.
 
-3. Strengthen the active oracle path.
-   - Keep improving `SmtPredicateOracle` and `SmtLlvmTransitionOracle`.
-   - Move from Boolean-atom encoding toward structured scalar/memory terms.
-   - Strengthen transition image reasoning beyond current guard/effect
-     conjunctions.
-   - Make `theta subset Post(Gamma_e, source)` and
-     `Pre(Gamma_e, target) subset beta` more faithful.
-   - Keep LLVM metadata extraction in `llvm_adapter.rs`; do not put solver
-     setup there.
+3. Implement explicit `--assert` selection in active driver.
 
-4. Replace the current call-post fallback heuristic with semantic return
-   projection.
-   - Current stopgap for vacuous projected postconditions:
+4. Continue strengthening transition/image precision in SMT transfer/oracle.
 
-```text
-retval_<callee> < 0
-```
+## Files To Start With
 
-   - Next step: derive call-post predicates from real caller demand and callee
-     return semantics (including `<`, `<=`, `>`, `>=`, and equality constraints).
-   - Keep summary predicates in procedure-boundary vocabulary, not caller-edge
-     SSA atoms.
-   - Retire the current shape-based direct not-may synthesis once transition
-     semantics can prove the same obligations.
-
-5. Clarify memory in paper terms.
-   - Decide what memory object should live in the active state/query language.
-   - Extend the initial integer-array encoding into transition/query/summaries
-     with stable memory-version naming.
-   - Adopt conditional frame vs havoc at call boundaries:
-     pure/no-write callees may use `mem_out = mem_in`; otherwise havoc
-     modified memory and constrain only by summary-supported effects.
-   - Read how Boogie models `modifies`/havoc frame conditions and capture
-     concrete adaptation notes for `src/analysis` before implementing.
-   - Port only the useful ideas from `obsolete/src/analysis/memory_updates.md`.
-   - Keep the active tree paper-readable while doing it.
-
-7. Enable user-provided summary overrides.
-   - Add a mechanism to inject user specification summaries (Must/NotMay-style)
-     per procedure/call boundary.
-   - Define precedence and safety policy between inferred summaries and
-     user-provided overrides.
-   - Ensure overrides are auditable in CLI output/debug summary dumps.
-
-6. Expand LLVM coverage when needed by the active driver.
-   - calls with summaries
-   - `phi`
-   - `switch`
-   - `getelementptr`
-   - casts/conversions
-   - richer return/query handling
+- `src/analysis/call_projection.rs`
+- `src/analysis/driver.rs`
+- `src/analysis/formula.rs`
+- `src/analysis/rules.rs`
+- `src/main.rs`
+- `src/analysis/design.md`
+- `src/analysis/analysis_flow.md`
 
 ## Commands To Re-Establish Context
 
-Run unit tests:
-
 ```sh
+cargo fmt
 cargo test
-```
-
-Generate bitcode and readable LLVM IR:
-
-```sh
-make -C tests ir
-```
-
-Run the active smoke test:
-
-```sh
 make -C tests smoke
 ```
 
-Run the current driver directly:
+Focused repro:
 
 ```sh
-cargo run --bin main -- tests/out/smash_must.bc
+CRICK_LOG='main=debug,main::analysis::driver=debug' MAY_MUST_SKIP_DOT=1 \
+cargo run --bin main -- tests/out/paper_section2_fig1_not_may.bc --max-steps 20000
 ```
-
-## Files To Start With Tomorrow
-
-- `src/analysis/analysis_flow.md`
-- `src/analysis/design.md`
-- `src/analysis/driver.rs`
-- `src/analysis/rules.rs`
-- `src/analysis/state.rs`
-- `src/analysis/cfg.rs`
-- `src/analysis/oracle.rs`
-- `src/analysis/llvm_adapter.rs`
-- `src/analysis/transfer.rs`
-- `src/analysis/summaries.rs`
-- `src/main.rs`
-
-Use the archived tree only when you need old implementation ideas:
-
-- `obsolete/src/analysis/analysis_flow.md`
-- `obsolete/src/analysis/summary_store_design.md`
-- `obsolete/src/analysis/memory_updates.md`
-
-## First Concrete Commit Next Session
-
-1. Add one end-to-end multi-call smoke case (`main -> f -> g`) that exercises:
-   call projection, summary creation, and summary reuse in one run.
-2. Add an explicit regression for unresolved internal calls returning `UNKNOWN`.
-3. Strengthen projection logic so argument/global matching is symbol-aware, not
-   substring-based.
-4. Keep `cargo test` and `make -C tests smoke` green.
