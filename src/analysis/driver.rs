@@ -121,6 +121,10 @@ pub trait InterproceduralOracleProvider {
     }
 }
 
+fn is_summary_exempt_call(callee: &ProcedureName) -> bool {
+    callee.as_str() == "may_assert"
+}
+
 impl PaperDriver {
     pub fn new() -> Self {
         Self::default()
@@ -481,10 +485,20 @@ impl PaperDriver {
                 continue;
             }
             if let EdgeKind::Call { callee } = &edge.transition.kind {
+                if is_summary_exempt_call(callee) {
+                    debug!(
+                        "Skipping summary pipeline for assertion primitive call {} on {}",
+                        callee, edge.id
+                    );
+                }
                 // Internal calls are handled compositionally via summaries and
                 // may-call recursion. External/unresolved calls still use the
                 // transition layer (e.g. direct may_assert effects).
-                if provider.procedure(callee).is_some() {
+                if !is_summary_exempt_call(callee) && provider.procedure(callee).is_some() {
+                    let call_source = Predicate::and([omega_n1.clone(), source_region.clone()]);
+                    if predicates.is_empty(&call_source)? {
+                        continue;
+                    }
                     if let Some(summary) = self.may_call_summary(
                         predicates,
                         provider,
@@ -542,6 +556,10 @@ impl PaperDriver {
                     // APPROX_HEAVY: If no applicable summary is obtained after
                     // projection/recursion, unresolved internal call is marked
                     // and the query may terminate as UNKNOWN.
+                    debug!(
+                        "Unresolved internal call for {} on {} with call_source={}, dest_region={}, omega_n1={}",
+                        callee, edge.id, call_source, dest_region, omega_n1
+                    );
                     unresolved_internal_call = true;
                     continue;
                 }
@@ -648,9 +666,12 @@ impl PaperDriver {
         P: PredicateOracle,
         I: InterproceduralOracleProvider,
     {
-        let EdgeKind::Call { callee: _ } = &edge.transition.kind else {
+        let EdgeKind::Call { callee } = &edge.transition.kind else {
             return Ok(None);
         };
+        if is_summary_exempt_call(callee) {
+            return Ok(None);
+        }
 
         let Some(callee_query) =
             provider.project_call_query(caller_query, edge, omega_n1, source_region, dest_region)
@@ -720,12 +741,19 @@ impl PaperDriver {
         let EdgeKind::Call { callee } = &edge.transition.kind else {
             return Ok(None);
         };
+        if is_summary_exempt_call(callee) {
+            return Ok(None);
+        }
 
         for summary in self.summaries.for_procedure(callee) {
             let application =
                 must_post_use_summary(predicates, summary, dest_region, omega_n1, omega_n2)?;
-            if let RuleApplication::Applied { conclusion, .. } = application {
-                return Ok(Some(conclusion));
+            match application {
+                RuleApplication::Applied { conclusion, .. } => return Ok(Some(conclusion)),
+                RuleApplication::NotApplicable { rule, reason } => debug!(
+                    "Call edge {} summary {} for {} not applicable: {} (kind={:?}, pre={}, post={})",
+                    edge.id, rule, callee, reason, summary.kind, summary.pre, summary.post
+                ),
             }
         }
 
@@ -740,8 +768,12 @@ impl PaperDriver {
                 dest_region,
                 omega_n1,
             )?;
-            if let RuleApplication::Applied { conclusion, .. } = application {
-                return Ok(Some(conclusion));
+            match application {
+                RuleApplication::Applied { conclusion, .. } => return Ok(Some(conclusion)),
+                RuleApplication::NotApplicable { rule, reason } => debug!(
+                    "Call edge {} summary {} for {} not applicable: {} (kind={:?}, pre={}, post={})",
+                    edge.id, rule, callee, reason, summary.kind, summary.pre, summary.post
+                ),
             }
         }
 
@@ -1001,7 +1033,7 @@ fn enqueue_edge_obligations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::cfg::PaperEdge;
+    use crate::analysis::cfg::{EdgeTransition, PaperEdge};
     use crate::analysis::oracle::SyntacticOracle;
     use crate::analysis::summaries::ProcedureSummary;
     use crate::analysis::vocabulary::{EdgeId, NodeId, ProcedureName};
@@ -1029,6 +1061,24 @@ mod tests {
             "callee",
             Predicate::atom("Gamma_call"),
         ));
+        procedure
+    }
+
+    fn call_only_may_assert_procedure() -> PaperProcedure {
+        let mut procedure = PaperProcedure::new("caller", NodeId(0), NodeId(1));
+        procedure.add_edge(PaperEdge {
+            id: EdgeId(0),
+            from: NodeId(0),
+            to: NodeId(1),
+            gamma: Predicate::atom("Gamma_assert_call"),
+            transition: EdgeTransition {
+                kind: EdgeKind::Call {
+                    callee: ProcedureName::new("may_assert"),
+                },
+                post_under_approx: Some(Predicate::atom("goal")),
+                pre_over_approx: Some(Predicate::True),
+            },
+        });
         procedure
     }
 
@@ -1170,6 +1220,27 @@ mod tests {
             procedures: BTreeMap::from([
                 (ProcedureName::new("caller"), caller),
                 (ProcedureName::new("callee"), callee),
+            ]),
+        }
+    }
+
+    fn interprocedural_may_assert_internal_pair() -> StaticInterproceduralProvider {
+        let caller = call_only_may_assert_procedure();
+
+        let mut may_assert = PaperProcedure::new("may_assert", NodeId(0), NodeId(1));
+        may_assert.add_edge(PaperEdge::local(
+            EdgeId(0),
+            NodeId(0),
+            NodeId(1),
+            Predicate::atom("Gamma_local_assert"),
+            Some(Predicate::atom("goal")),
+            Some(Predicate::True),
+        ));
+
+        StaticInterproceduralProvider {
+            procedures: BTreeMap::from([
+                (ProcedureName::new("caller"), caller),
+                (ProcedureName::new("may_assert"), may_assert),
             ]),
         }
     }
@@ -1390,5 +1461,25 @@ mod tests {
 
         assert!(!result.reached_target);
         assert!(result.stopped_by_limit);
+    }
+
+    #[test]
+    fn may_assert_calls_do_not_participate_in_summary_flow() {
+        let mut driver = PaperDriver::new();
+        let oracle = SyntacticOracle;
+        let provider = interprocedural_may_assert_internal_pair();
+        let query =
+            ReachabilityQuery::new("caller", Predicate::atom("start"), Predicate::atom("goal"));
+
+        let result = driver
+            .run_interprocedural(&oracle, &provider, &query, InterproceduralConfig::default())
+            .unwrap();
+
+        assert!(result.reached_target);
+        assert!(!result.stopped_by_limit);
+        assert!(driver
+            .summaries()
+            .for_procedure(&ProcedureName::new("may_assert"))
+            .is_empty());
     }
 }
