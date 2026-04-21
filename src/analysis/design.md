@@ -148,6 +148,17 @@ Both currently use:
 
 This is scaffolding, not the final semantic precision.
 
+## Approximation Annotations
+
+Deliberate approximation-heavy code paths should be tagged inline with:
+
+```text
+APPROX_HEAVY:
+```
+
+This marker is used for heuristics and boundary-lossy shortcuts that are
+intended to be replaced by semantic projection/transition reasoning.
+
 ## Driver Shape
 
 `driver::PaperDriver` currently has:
@@ -179,6 +190,8 @@ Current MayCall projection notes:
 
 ```text
 projected call pre/post currently strip edge-local atoms (e.g. "... @eK")
+callsite instantiation renames locals/retvals and adds formal/actual + retval/lhs bindings
+global/memory-shaped post symbols are currently havoced per callsite
 vacuous projected call post -> fallback target atom "retval_<callee> < 0"
 Figure-1 shape heuristic -> synthesize NotMay summary: true => retval_<callee> < 0
 ```
@@ -213,24 +226,28 @@ bitcode
   -> run_interprocedural
 ```
 
-The current default query builder is still provisional. It targets a single
-embedded `may_assert(...)` by taking the first one and builds:
+The current default query builder is still provisional. It currently runs
+per-site assertion jobs for each embedded `may_assert(...)`:
 
 ```text
-assert_violation(site) && !assert_arg
+job 1 (site):      assert_violation(site)
+job 2 (violation): assert_violation(site) && !assert_arg
 ```
 
-Only that selected target site is encoded as `assert_violation(site)` inside
-the transition layer. Other `may_assert(...)` calls remain ordinary call
-effects.
+The transition layer now exposes two target modes:
 
-The remaining limitation is target selection: the active CLI still chooses the
-first embedded assertion automatically.
+```text
+SiteReachability -> targeted may_assert emits assert_violation(site)
+Violation        -> targeted may_assert emits assert_violation(site) && !assert_arg
+```
+
+The remaining limitation is explicit CLI selection: the active driver still
+runs all embedded assertion sites and does not yet implement `--assert`.
 
 ## Next Implementation Steps
 
-1. Resolve one explicit target assertion per query instead of taking the first
-   embedded site.
+1. Implement explicit `--assert` target resolution for the active per-site
+   assertion jobs.
 2. Strengthen `SmtPredicateOracle` beyond Boolean atom encoding.
 3. Strengthen `SmtLlvmTransitionOracle` beyond the current syntactic
    guard/effect composition.

@@ -27,6 +27,12 @@ use crate::analysis::oracle::{
 use crate::analysis::vocabulary::EdgeId;
 use crate::llvm_utils::llvm_wrap::InstructionOpcode;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssertionTargetMode {
+    Violation,
+    SiteReachability,
+}
+
 /// Transfer-function-like interface over adapted LLVM edge metadata.
 ///
 /// `analysis::rules` calls `TransitionOracle`; this trait is the LLVM-backed
@@ -38,6 +44,7 @@ pub trait LlvmEdgeTransfer {
         &self,
         metadata: &LlvmEdgeMetadata,
         target_assertion: Option<EdgeId>,
+        target_mode: AssertionTargetMode,
     ) -> Predicate;
 }
 
@@ -46,6 +53,8 @@ pub struct SyntacticLlvmTransfer;
 
 impl LlvmEdgeTransfer for SyntacticLlvmTransfer {
     fn edge_guard(&self, metadata: &LlvmEdgeMetadata) -> Predicate {
+        // APPROX_HEAVY: Branch guards are extracted syntactically from edge
+        // metadata, without modeling full SSA/dataflow dependencies.
         if metadata.opcode != InstructionOpcode::Br {
             return Predicate::True;
         }
@@ -67,8 +76,9 @@ impl LlvmEdgeTransfer for SyntacticLlvmTransfer {
         &self,
         metadata: &LlvmEdgeMetadata,
         target_assertion: Option<EdgeId>,
+        target_mode: AssertionTargetMode,
     ) -> Predicate {
-        edge_effect_predicate(metadata, target_assertion)
+        edge_effect_predicate(metadata, target_assertion, target_mode)
     }
 }
 
@@ -77,6 +87,7 @@ pub struct LlvmTransitionOracle<'a, T = SyntacticLlvmTransfer> {
     registry: &'a LlvmEdgeRegistry,
     transfer: T,
     target_assertion: Option<EdgeId>,
+    target_assertion_mode: AssertionTargetMode,
 }
 
 impl<'a> LlvmTransitionOracle<'a, SyntacticLlvmTransfer> {
@@ -85,6 +96,7 @@ impl<'a> LlvmTransitionOracle<'a, SyntacticLlvmTransfer> {
             registry,
             transfer: SyntacticLlvmTransfer,
             target_assertion: None,
+            target_assertion_mode: AssertionTargetMode::Violation,
         }
     }
 
@@ -92,10 +104,19 @@ impl<'a> LlvmTransitionOracle<'a, SyntacticLlvmTransfer> {
         registry: &'a LlvmEdgeRegistry,
         target_assertion: Option<EdgeId>,
     ) -> Self {
+        Self::with_target_assertion_mode(registry, target_assertion, AssertionTargetMode::Violation)
+    }
+
+    pub fn with_target_assertion_mode(
+        registry: &'a LlvmEdgeRegistry,
+        target_assertion: Option<EdgeId>,
+        target_assertion_mode: AssertionTargetMode,
+    ) -> Self {
         Self {
             registry,
             transfer: SyntacticLlvmTransfer,
             target_assertion,
+            target_assertion_mode,
         }
     }
 }
@@ -105,11 +126,13 @@ impl<'a, T> LlvmTransitionOracle<'a, T> {
         registry: &'a LlvmEdgeRegistry,
         transfer: T,
         target_assertion: Option<EdgeId>,
+        target_assertion_mode: AssertionTargetMode,
     ) -> Self {
         Self {
             registry,
             transfer,
             target_assertion,
+            target_assertion_mode,
         }
     }
 }
@@ -132,12 +155,17 @@ where
     fn post_under_approx(&self, edge: &PaperEdge, source: &Predicate) -> OracleResult<Predicate> {
         let metadata = self.metadata(edge)?;
         let guard = self.transfer.edge_guard(metadata);
-        let effect = self.transfer.edge_effect(metadata, self.target_assertion);
+        // APPROX_HEAVY: Uses guard/effect conjunction as an under-approximate
+        // post image instead of a full transition-relation image.
+        let effect =
+            self.transfer
+                .edge_effect(metadata, self.target_assertion, self.target_assertion_mode);
         Ok(Predicate::and([source.clone(), guard, effect]))
     }
 
     fn pre_over_approx(&self, edge: &PaperEdge, _target: &Predicate) -> OracleResult<Predicate> {
         let metadata = self.metadata(edge)?;
+        // APPROX_HEAVY: Ignores `target` and returns guard-only beta.
         // Deliberately conservative: for branches this is the branch guard;
         // for non-branches this falls back to `true`.
         Ok(self.transfer.edge_guard(metadata))
@@ -156,6 +184,7 @@ pub struct SmtLlvmTransitionOracle<'a, T = SyntacticLlvmTransfer> {
     registry: &'a LlvmEdgeRegistry,
     transfer: T,
     target_assertion: Option<EdgeId>,
+    target_assertion_mode: AssertionTargetMode,
     predicates: SmtPredicateOracle,
 }
 
@@ -165,6 +194,7 @@ impl<'a> SmtLlvmTransitionOracle<'a, SyntacticLlvmTransfer> {
             registry,
             transfer: SyntacticLlvmTransfer,
             target_assertion: None,
+            target_assertion_mode: AssertionTargetMode::Violation,
             predicates: SmtPredicateOracle,
         }
     }
@@ -173,10 +203,19 @@ impl<'a> SmtLlvmTransitionOracle<'a, SyntacticLlvmTransfer> {
         registry: &'a LlvmEdgeRegistry,
         target_assertion: Option<EdgeId>,
     ) -> Self {
+        Self::with_target_assertion_mode(registry, target_assertion, AssertionTargetMode::Violation)
+    }
+
+    pub fn with_target_assertion_mode(
+        registry: &'a LlvmEdgeRegistry,
+        target_assertion: Option<EdgeId>,
+        target_assertion_mode: AssertionTargetMode,
+    ) -> Self {
         Self {
             registry,
             transfer: SyntacticLlvmTransfer,
             target_assertion,
+            target_assertion_mode,
             predicates: SmtPredicateOracle,
         }
     }
@@ -187,11 +226,13 @@ impl<'a, T> SmtLlvmTransitionOracle<'a, T> {
         registry: &'a LlvmEdgeRegistry,
         transfer: T,
         target_assertion: Option<EdgeId>,
+        target_assertion_mode: AssertionTargetMode,
     ) -> Self {
         Self {
             registry,
             transfer,
             target_assertion,
+            target_assertion_mode,
             predicates: SmtPredicateOracle,
         }
     }
@@ -215,7 +256,11 @@ where
     fn post_under_approx(&self, edge: &PaperEdge, source: &Predicate) -> OracleResult<Predicate> {
         let metadata = self.metadata(edge)?;
         let guard = self.transfer.edge_guard(metadata);
-        let effect = self.transfer.edge_effect(metadata, self.target_assertion);
+        let effect =
+            self.transfer
+                .edge_effect(metadata, self.target_assertion, self.target_assertion_mode);
+        // APPROX_HEAVY: Same guard/effect approximation as syntactic oracle,
+        // with only an SMT SAT/UNSAT filter for pruning impossible theta.
         let theta = Predicate::and([source.clone(), guard, effect]);
         if self.predicates.is_empty(&theta)? {
             Ok(Predicate::False)
@@ -226,6 +271,8 @@ where
 
     fn pre_over_approx(&self, edge: &PaperEdge, _target: &Predicate) -> OracleResult<Predicate> {
         let metadata = self.metadata(edge)?;
+        // APPROX_HEAVY: Same guard-only beta approximation; `_target` is
+        // currently unused in the over-approximate predecessor calculation.
         let beta = self.transfer.edge_guard(metadata);
         if self.predicates.is_empty(&beta)? {
             Ok(Predicate::False)
@@ -238,13 +285,35 @@ where
 pub fn edge_effect_predicate(
     metadata: &LlvmEdgeMetadata,
     target_assertion: Option<EdgeId>,
+    target_mode: AssertionTargetMode,
 ) -> Predicate {
     if target_assertion == Some(metadata.edge_id) {
-        if let Some(violation) = assertion_violation_predicate(metadata) {
-            return violation;
+        match target_mode {
+            AssertionTargetMode::Violation => {
+                if let Some(violation) = assertion_violation_predicate(metadata) {
+                    return violation;
+                }
+            }
+            AssertionTargetMode::SiteReachability => {
+                if let Some(site) = assertion_site_predicate(metadata) {
+                    return site;
+                }
+            }
         }
     }
+    // APPROX_HEAVY: Non-target edges fall back to opcode-derived symbolic
+    // effect labels rather than a precise relational update.
     Predicate::atom(effect_label(metadata))
+}
+
+pub fn assertion_site_predicate(metadata: &LlvmEdgeMetadata) -> Option<Predicate> {
+    if metadata.called_function.as_deref() != Some("may_assert") {
+        return None;
+    }
+    Some(Predicate::atom(format!(
+        "assert_violation({})",
+        metadata.edge_id
+    )))
 }
 
 pub fn assertion_violation_predicate(metadata: &LlvmEdgeMetadata) -> Option<Predicate> {
@@ -252,7 +321,7 @@ pub fn assertion_violation_predicate(metadata: &LlvmEdgeMetadata) -> Option<Pred
         return None;
     }
 
-    let site = Predicate::atom(format!("assert_violation({})", metadata.edge_id));
+    let site = assertion_site_predicate(metadata)?;
     let arg = metadata
         .operands
         .first()
@@ -281,6 +350,8 @@ fn boolean_argument_predicate(argument: &str) -> Predicate {
 }
 
 fn effect_label(metadata: &LlvmEdgeMetadata) -> String {
+    // APPROX_HEAVY: Encodes LLVM effects as lightweight string atoms; many
+    // operations are summarized syntactically rather than semantically.
     match metadata.opcode {
         InstructionOpcode::Add => binary_effect(metadata, "add"),
         InstructionOpcode::Sub => binary_effect(metadata, "sub"),
@@ -336,6 +407,8 @@ fn effect_label(metadata: &LlvmEdgeMetadata) -> String {
             format!("ret({value}) @{}", metadata.edge_id)
         }
         InstructionOpcode::Br => format!("take_branch({})", metadata.edge_id),
+        // APPROX_HEAVY: Unsupported/other opcodes collapse into an opaque
+        // uninterpreted effect token.
         _ => format!(
             "effect({:?}, {})",
             metadata.opcode, metadata.instruction_text
@@ -575,6 +648,31 @@ mod tests {
             Predicate::and([
                 Predicate::atom("assert_violation(e6)"),
                 Predicate::not(Predicate::atom("%cond")),
+            ]),
+        );
+    }
+
+    #[test]
+    fn target_assert_edge_uses_site_marker_in_site_reachability_mode() {
+        let edge = branch_edge(EdgeId(7), EdgeKind::Local);
+        let mut registry = LlvmEdgeRegistry::new();
+        registry.insert(may_assert_metadata(edge.id, "1"));
+        let oracle = LlvmTransitionOracle::with_target_assertion_mode(
+            &registry,
+            Some(edge.id),
+            AssertionTargetMode::SiteReachability,
+        );
+
+        let theta = oracle
+            .post_under_approx(&edge, &Predicate::atom("Omega_n1_phi1"))
+            .unwrap();
+
+        assert_eq!(
+            theta,
+            Predicate::and([
+                Predicate::atom("Omega_n1_phi1"),
+                Predicate::True,
+                Predicate::atom("assert_violation(e7)"),
             ]),
         );
     }

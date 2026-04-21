@@ -38,6 +38,8 @@ Current state:
 - Created summaries are now persisted and reused on subsequent call edges.
 - `SummaryTable::add` now de-duplicates identical summaries.
 - MayCall projection now drops edge-local atoms at call boundaries.
+- MayCall instantiation now applies call-instance renaming, formal/actual and
+  retval/lhs bindings, and global/memory post-havoc at call boundaries.
 - When projected call postconditions are vacuous, the active fallback uses:
 
 ```text
@@ -66,24 +68,30 @@ Needed:
 
 Current state:
 
-- `src/main.rs` builds a single-target query from the first embedded
-  `may_assert(...)`.
-- The postcondition is now the target assertion's violation predicate:
+- `src/main.rs` now builds assertion jobs for every embedded `may_assert(...)`
+  site.
+- For each site, the CLI runs:
 
 ```text
-assert_violation(site) && !assert_arg
+site reachability:      assert_violation(site)
+violation reachability: assert_violation(site) && !assert_arg
 ```
 
-- Only the selected target site is treated as an assertion violation during
-  transition; other `may_assert(...)` calls remain ordinary call effects.
+- The transition layer now supports per-target assertion modes:
+  `SiteReachability` and `Violation`.
+- The CLI now reports per-site verdicts:
+  `ASSERTION UNREACHABLE`, `ASSERTION TRUE WHEN REACHED`,
+  `ASSERTION VIOLATION REACHABLE`, or `UNKNOWN`.
 - The smoke test now covers direct bug and direct safe cases.
 
 Needed:
 
-- Select the target assertion explicitly instead of taking the first one.
-- Decide how multiple assertion sites should be surfaced at the CLI/query level.
-- Translate command-line target choices into one resolved edge id.
-- Keep summaries target-specific.
+- Implement `--assert` in the active driver so users can select a specific
+  assertion/site from the CLI.
+- Decide and document the stable output contract for modules with many
+  assertion sites.
+- Keep summaries target-specific while preserving soundness across differing
+  assertion target modes.
 
 ## 4. Strengthen The Predicate And Transition Oracles
 
@@ -226,5 +234,5 @@ make -C tests smoke
 Current unit-test baseline:
 
 ```text
-34 passed
+39 passed
 ```

@@ -41,7 +41,8 @@ What is active today:
 - LLVM metadata-backed transition approximation;
 - interprocedural call handling with summary reuse + MayCall recursion +
   summary creation for `Must`/`NotMay`;
-- one target assertion per query.
+- per-site assertion verification jobs (`site` + `violation`) for each embedded
+  `may_assert(...)`.
 
 What is not active yet:
 

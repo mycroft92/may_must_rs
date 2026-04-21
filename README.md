@@ -65,16 +65,25 @@ Every run writes DOT graphs to `graph_dot/<input-stem>/`.
 The binary adapts LLVM `FunctionGraph`s into paper-shaped procedures and then
 runs the interprocedural driver in `src/analysis/driver.rs`.
 
-For each function, the CLI currently chooses a single target assertion by
-taking the first embedded `may_assert(...)`. The query postcondition is that
-target site's violation predicate:
+For each embedded `may_assert(...)` site, the CLI now runs two checks:
 
 ```text
-assert_violation(edge) && !assert_arg
+1) site reachability:      assert_violation(site)
+2) violation reachability: assert_violation(site) && !assert_arg
 ```
 
-Only that selected site is encoded as an assertion-violation target during the
-transition step. Other `may_assert(...)` calls remain ordinary call effects.
+The transition layer supports this with two target modes:
+
+- `SiteReachability`: the targeted `may_assert` edge emits `assert_violation(site)`;
+- `Violation`: the targeted `may_assert` edge emits
+  `assert_violation(site) && !assert_arg`.
+
+The CLI reports a per-site verdict:
+
+- `ASSERTION UNREACHABLE`
+- `ASSERTION TRUE WHEN REACHED`
+- `ASSERTION VIOLATION REACHABLE`
+- `UNKNOWN`
 
 and returns one of:
 
@@ -142,6 +151,9 @@ FunctionGraph
 - call-query projection now drops edge-local SSA effect atoms at callee
   boundaries and uses a return-boundary fallback target predicate
   `retval_<callee> < 0` when projected postconditions are vacuous;
+- call-query instantiation now renames call-instance locals/retvals, adds
+  formal-to-actual and retval-to-lhs bindings, and havocs global/memory-shaped
+  post symbols at the caller boundary;
 - current Figure-1 heuristic: when a callee matches a non-negative-return shape
   (`icmp sgt` + negation step), the driver synthesizes a direct not-may summary
   `true => retval_<callee> < 0`;
@@ -154,7 +166,7 @@ Current unit-test baseline:
 
 ```text
 cargo test
-34 passed
+39 passed
 ```
 
 ## What Is Not Yet Implemented
@@ -167,7 +179,7 @@ cargo test
 - richer call-query projection semantics beyond the current boundary heuristic
   (edge-local atom stripping + `retval_<callee> < 0` fallback + shape-based
   not-may synthesis);
-- explicit target selection when a function has multiple embedded assertions;
+- explicit CLI target-selection (`--assert`) in the active driver;
 - command-line `--assert` queries in the paper driver;
 - rich LLVM coverage (`phi`, `switch`, `getelementptr`, casts, calls with
   summaries, globals, heap, arrays, structs);

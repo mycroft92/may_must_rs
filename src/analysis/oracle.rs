@@ -215,6 +215,8 @@ fn encode_atom(atom: &str) -> Bool {
     if let Some(encoded) = encode_semantic_atom(atom) {
         return encoded;
     }
+    // APPROX_HEAVY: Unknown atoms are treated as independent Boolean symbols
+    // rather than being reduced to structured scalar/memory constraints.
     Bool::new_const(atom_symbol(atom))
 }
 
@@ -248,6 +250,8 @@ fn symbol_with_prefix(prefix: &str, raw: &str) -> String {
 }
 
 fn encode_semantic_atom(atom: &str) -> Option<Bool> {
+    // APPROX_HEAVY: Edge suffixes are stripped before semantic encoding.
+    // This discards per-edge provenance embedded in atom names.
     let core = strip_edge_suffix(atom);
     let (lhs, rhs) = parse_assignment(core)?;
     if let Some((func, args)) = parse_call(rhs) {
@@ -266,6 +270,8 @@ fn encode_semantic_atom(atom: &str) -> Option<Bool> {
 }
 
 fn strip_edge_suffix(atom: &str) -> &str {
+    // APPROX_HEAVY: Syntactic edge-tag erasure (" @eK") to recover a
+    // boundary-like atom shape for the current lightweight SMT encoding.
     atom.rsplit_once(" @")
         .map(|(core, _)| core)
         .unwrap_or(atom)

@@ -14,12 +14,6 @@ At the start of a new session, read these files in order:
 5. `src/analysis/design.md`
 6. `src/analysis/analysis_flow.md`
 
-If the task touches the archived implementation, also read:
-
-1. `obsolete/src/analysis/analysis_flow.md`
-2. `obsolete/src/analysis/summary_store_design.md`
-3. `obsolete/src/analysis/memory_updates.md`
-
 Then inspect the relevant Rust modules before editing.
 
 For active paper-shaped work, start with:
@@ -34,16 +28,6 @@ src/analysis/transfer.rs
 src/analysis/summaries.rs
 src/analysis/driver.rs
 src/analysis/formula.rs
-```
-
-For archived-reference work only, start with:
-
-```text
-obsolete/src/analysis/analysis_flow.md
-obsolete/src/analysis/summary_store_design.md
-obsolete/src/analysis/memory_updates.md
-obsolete/src/analysis/
-src/smt/solver.rs
 ```
 
 ## Current Architecture
@@ -68,18 +52,10 @@ Keep the core paper modules (`cfg`, `formula`, `state`, `rules`, `summaries`,
 `driver`, `oracle`) free of LLVM and Z3 details. LLVM specifics should stay in
 `llvm_adapter.rs` and `transfer.rs`.
 
-The archived implementation now lives under:
-
-```text
-obsolete/src/analysis
-```
-
-Do not move archived concepts back into `src/analysis` unless there is a
-deliberate migration step.
 
 ## Current CLI
 
-`src/main.rs` now drives the paper-shaped tree directly:
+`src/main.rs` drives the paper-shaped tree directly:
 
 ```text
 LLVM bitcode
@@ -93,13 +69,18 @@ LLVM bitcode
 Current default query policy:
 
 ```text
-one target assertion per query
-current CLI policy = first embedded may_assert(...)
-post = assert_violation(site) && !assert_arg
+for each embedded may_assert(site):
+  job 1 (site):      post = assert_violation(site)
+  job 2 (violation): post = assert_violation(site) && !assert_arg
+  verdict = unreachable | true when reached | violation reachable | unknown
 ```
 
-Only the selected target site is turned into `assert_violation(site)`;
-non-target `may_assert(...)` calls stay as ordinary call effects.
+During transition, the targeted site is interpreted in mode:
+
+```text
+SiteReachability -> assert_violation(site)
+Violation        -> assert_violation(site) && !assert_arg
+```
 
 `--assert` is not implemented in the active driver.
 
@@ -236,7 +217,6 @@ AGENTS.md
   Agent/session instructions and stable engineering guardrails.
 ```
 
-Archived notes stay under `obsolete/src/analysis`.
 
 When adding a new active analysis concept:
 
@@ -282,8 +262,10 @@ CARGO_FLAGS=--offline make -C tests smoke
 ## Guardrails
 
 - Prefer `UNKNOWN` over unsound success claims.
+- Annotate every deliberate approximation-heavy site with an
+  `APPROX_HEAVY:` code comment so it is auditable and removable.
+- Do not read `obsolete` folder at all 
 - Keep generated `.ll`, `.bc`, and DOT files out of source control.
 - Keep C test inputs in `tests/`; generated artifacts belong in `tests/out/`.
 - Keep the active implementation close to the paper and fill only the gaps the
   current milestone needs.
-- Treat `obsolete/src/analysis` as reference material, not active code.

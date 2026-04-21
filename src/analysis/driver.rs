@@ -383,9 +383,13 @@ impl PaperDriver {
         P: PredicateOracle,
         I: InterproceduralOracleProvider,
     {
+        // APPROX_HEAVY: Bounded-call-depth cutoff to preserve soundness by
+        // returning UNKNOWN instead of claiming NOT REACHED.
         if call_stack.len() >= config.max_call_depth {
             return Ok(unknown_result_for_query(provider, query));
         }
+        // APPROX_HEAVY: Recursion-cycle cutoff; current engine does not run a
+        // fixpoint across recursive SCCs, so it returns UNKNOWN.
         if call_stack.contains(&query.procedure) {
             return Ok(unknown_result_for_query(provider, query));
         }
@@ -535,6 +539,9 @@ impl PaperDriver {
                         continue;
                     }
 
+                    // APPROX_HEAVY: If no applicable summary is obtained after
+                    // projection/recursion, unresolved internal call is marked
+                    // and the query may terminate as UNKNOWN.
                     unresolved_internal_call = true;
                     continue;
                 }

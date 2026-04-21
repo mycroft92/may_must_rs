@@ -19,17 +19,22 @@ cargo run --bin main -- <bitcode.bc>
 ```
 
 - `--assert` is not implemented in the active driver.
-- The active query builder currently uses the first embedded `may_assert(...)`
-  as the single target assertion and encodes its violation as:
+- The active query builder now creates assertion jobs for every embedded
+  `may_assert(...)` site:
 
 ```text
-assert_violation(site) && !assert_arg
+site reachability:      assert_violation(site)
+violation reachability: assert_violation(site) && !assert_arg
 ```
 
-- Only that selected target site is treated as a violation target; other
-  `may_assert(...)` calls stay as ordinary call effects.
+- Per-site verdicts are now:
+  `ASSERTION UNREACHABLE`, `ASSERTION TRUE WHEN REACHED`,
+  `ASSERTION VIOLATION REACHABLE`, or `UNKNOWN`.
 - MayCall boundary projection now strips edge-local atoms (`... @eK`) so call
   summaries are not polluted with caller-edge SSA effects.
+- MayCall instantiation now renames call-instance locals/retvals, adds
+  formal/actual and retval/lhs bindings, and havocs global/memory-shaped post
+  symbols at call boundaries.
 - When a projected call postcondition is vacuous, the active fallback now uses
   a return-boundary predicate of the shape:
 
@@ -53,7 +58,7 @@ true => (NotMay) retval_<callee> < 0
 
 ```sh
 cargo test
-# 34 passed
+# 39 passed
 
 make -C tests smoke
 # passes
@@ -126,9 +131,9 @@ Use them for reference only when porting ideas into the active tree.
    - Keep unresolved internal calls mapped to `UNKNOWN`, never unsound
      `NOT REACHED`.
 
-2. Keep target selection honest while doing interprocedural work.
-   - Current stopgap: first embedded `may_assert(...)`.
-   - Next real step: resolve one explicit target assertion from the CLI/query.
+2. Implement explicit CLI target selection.
+   - Current behavior runs all embedded `may_assert(...)` sites.
+   - Next real step: implement `--assert` to select one resolved assertion/site.
 
 3. Strengthen the active oracle path.
    - Keep improving `SmtPredicateOracle` and `SmtLlvmTransitionOracle`.
@@ -159,8 +164,20 @@ retval_<callee> < 0
    - Decide what memory object should live in the active state/query language.
    - Extend the initial integer-array encoding into transition/query/summaries
      with stable memory-version naming.
+   - Adopt conditional frame vs havoc at call boundaries:
+     pure/no-write callees may use `mem_out = mem_in`; otherwise havoc
+     modified memory and constrain only by summary-supported effects.
+   - Read how Boogie models `modifies`/havoc frame conditions and capture
+     concrete adaptation notes for `src/analysis` before implementing.
    - Port only the useful ideas from `obsolete/src/analysis/memory_updates.md`.
    - Keep the active tree paper-readable while doing it.
+
+7. Enable user-provided summary overrides.
+   - Add a mechanism to inject user specification summaries (Must/NotMay-style)
+     per procedure/call boundary.
+   - Define precedence and safety policy between inferred summaries and
+     user-provided overrides.
+   - Ensure overrides are auditable in CLI output/debug summary dumps.
 
 6. Expand LLVM coverage when needed by the active driver.
    - calls with summaries
