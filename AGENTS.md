@@ -1,13 +1,16 @@
+
 # AGENTS.md
 
 This file is the first stop for future coding-agent sessions in this
-repository. Read it before changing code.
+repository. Read it before changing code. We are implementing the following paper on LLVM IR programs:
+
+https://dl.acm.org/doi/10.1145/1707801.1706307
 
 ## Session Startup
 
-At the start of a new session, read these files in order:
+At the start of a new session, read these files in order (create an initial version if not present):
 
-1. `README.md`
+1. `README.md` (or `Readme.md` if that is the current file in the branch)
 2. `TODO.md`
 3. `TASKVIEW.md`
 4. `AGENTS.md`
@@ -15,6 +18,9 @@ At the start of a new session, read these files in order:
 6. `src/analysis/analysis_flow.md`
 
 Then inspect the relevant Rust modules before editing.
+
+If the session goal is to reconstruct or audit the implemented milestone from
+scratch, also read `Reproducer.md`.
 
 For active paper-shaped work, start with:
 
@@ -29,203 +35,102 @@ src/analysis/summaries.rs
 src/analysis/driver.rs
 src/analysis/formula.rs
 ```
+## Idea
+We are try to prove or counter with evidence that: given an assertion and a program, either the assertion is unreachable (vacuous true) or is reachable and always `true` under reachable conditions. We perform both forward and backward analyses of the LLVM IR program.
 
-## Current Architecture
+
+## Architecture
 
 The active implementation is the paper-shaped tree in `src/analysis`.
 
 The intended module boundaries are:
 
 ```text
-named SMASH rules      -> src/analysis/rules.rs
-Pi_n / Omega_n / N_e   -> src/analysis/state.rs
-P / n / e / Gamma_e    -> src/analysis/cfg.rs
-predicate vocabulary   -> src/analysis/formula.rs
-set/transition queries -> src/analysis/oracle.rs
-LLVM bridge            -> src/analysis/llvm_adapter.rs
-edge transfer model    -> src/analysis/transfer.rs
-procedure summaries    -> src/analysis/summaries.rs
-summary orchestration  -> src/analysis/driver.rs
+raw LLVM program graph                  -> src/llvm_utils/program_graph.rs
+assertion frontend lowering             -> src/assertions/translation.rs
+named SMASH rules                       -> src/analysis/rules.rs
+Pi_n / Omega_n / N_e and path summaries -> src/analysis/state.rs
+P / n / e / Gamma_e                     -> src/analysis/cfg.rs
+predicate vocabulary                    -> src/analysis/formula.rs
+set/sat/evidence queries                -> src/analysis/oracle.rs
+LLVM decoding and lowering              -> src/analysis/llvm_adapter.rs
+normalized step relations               -> src/analysis/transfer.rs
+procedure summaries                     -> src/analysis/summaries.rs
+summary orchestration                   -> src/analysis/driver.rs
 ```
 
 Keep the core paper modules (`cfg`, `formula`, `state`, `rules`, `summaries`,
 `driver`, `oracle`) free of LLVM and Z3 details. LLVM specifics should stay in
-`llvm_adapter.rs` and `transfer.rs`.
+`llvm_utils` and `llvm_adapter.rs`. `transfer.rs` should consume a normalized
+effect/instruction layer produced by `llvm_adapter.rs`, not raw
+`llvm_wrap::Instruction` handles.
 
+`llvm_adapter.rs` should lower one procedure into the paper `cfg` plus
+pre-normalized `node_effects` and `edge_effects` for `transfer.rs`.
 
-## Current CLI
+Track path predicates in `state.rs`, not in `cfg.rs`. `cfg.rs` should only
+store edge-local relations/guards (`Gamma_e`). The accumulated path summary for
+the current analysis frontier belongs in `state.rs`.
 
-`src/main.rs` drives the paper-shaped tree directly:
+Lower ordinary branch conditions into `cfg.rs` edge relations, not into the
+normalized transfer-effect stream. Lower `phi` nodes as predecessor-specific
+normalized assignments on incoming edges. Reserve `Assume`-style transfer
+effects for extra trusted refinements such as user-supplied contracts.
 
-```text
-LLVM bitcode
-  -> llvm_utils::program_graph::generate_program_graph
-  -> analysis::llvm_adapter::adapt_function_graph
-  -> analysis::oracle::SmtPredicateOracle
-  -> analysis::transfer::SmtLlvmTransitionOracle
-  -> analysis::driver::PaperDriver::run_interprocedural
-```
+`oracle.rs` is the only place that should answer satisfiability, implication,
+or evidence/model queries against the SMT solver. Other modules may build
+formulas but should not own solver policy.
 
-Current default query policy:
+Before loop invariants exist, use a `max_step` engine as the temporary loop
+policy:
 
-```text
-for each embedded may_assert(site):
-  job 1 (site):      post = assert_violation(site)
-  job 2 (violation): post = assert_violation(site) && !assert_arg
-  verdict = unreachable | true when reached | violation reachable | unknown
-```
+- `state.rs` should be able to carry the visit-count or bounded-progress facts
+  needed by that engine.
+- `driver.rs` should enforce the revisit bound and decide when exploration
+  stops because the temporary loop budget is exhausted.
+- `transfer.rs` should stay local to one normalized step; it should not own the
+  global loop bound policy.
 
-During transition, the targeted site is interpreted in mode:
+When we replace bounded loop handling with loop invariants:
 
-```text
-SiteReachability -> assert_violation(site)
-Violation        -> assert_violation(site) && !assert_arg
-```
+- `llvm_adapter.rs` should identify the relevant loop structure in the lowered
+  CFG, such as headers, latches, backedges, or SCC-based loop regions.
+- `transfer.rs` should encode one-iteration semantic steps, not invent
+  invariants.
+- `state.rs` should store candidate/header facts and the accumulated path
+  summaries those candidates summarize.
+- `oracle.rs` should check initiation, inductiveness, and evidence queries for
+  invariant candidates.
+- `summaries.rs` should be the home of loop invariant extraction/refinement and
+  reusable loop summaries.
+- `driver.rs` should orchestrate when invariant generation/checking runs and
+  when a loop summary is accepted into the analysis.
 
-`--assert` is not implemented in the active driver.
+The program graph generation is written in `llvm_utils` directory.
+If an LLVM/function graph has multiple exits, lower it to a single paper exit
+by creating one synthetic exit node and adding trivial (`true`) edges from each
+real exit to that synthetic exit.
 
-## Flow Rules
+Do not generate summaries for `may_assert` call edges. If possible do not even generate the call edges for it, instead we generate the assertion `true =>(not-May) PathCondition /\  !(assert_expression)`.
 
-The active flow is interprocedural with local intraprocedural worklists:
-
-```text
-run_interprocedural(query)
-  1. try top-level summary applicability
-  2. initialize local Pi_n and Omega_n from the query
-  3. enqueue (edge, source region, destination region) obligations
-  4. on internal call edge:
-       try summary-use rules
-       else project callee query (MayCall), recurse, and create Must/NotMay summary
-       then retry summary-use rules
-  5. on non-call or unresolved external edge:
-       apply MUST-POST / NOTMAY-PRE
-  6. requeue obligations affected by Omega growth or partition refinement
-  7. stop at REACHABLE, UNKNOWN (limit/unresolved internal call), or exhaustion
-```
-
-Current initialization:
-
-```text
-Omega_entry = query.pre
-Pi_exit     = { query.post, !query.post }
-other Pi_n  = { true }
-```
-
-Current requeue policy:
-
-```text
-Omega growth at node n -> enqueue outgoing obligations from n
-Pi split at node n     -> enqueue incoming and outgoing obligations touching n
-```
-
-## Rule Placement
-
-Rule names in `src/analysis/rules.rs` should match the paper directly:
-
-```text
-MUST-POST                  -> must_post_edge
-NOTMAY-PRE                 -> not_may_pre_edge
-MUST-POST-USE-SUMMARY      -> must_post_use_summary
-NOTMAY-PRE-USE-SUMMARY     -> not_may_pre_use_summary
-```
-
-In the active tree:
-
-```text
-Gamma_e  -> PaperEdge::gamma
-Omega_n  -> PaperAnalysisState::omega(node)
-Pi_n     -> PaperAnalysisState::partition(node)
-theta    -> RuleConclusion::AddOmega
-beta     -> RuleConclusion::RefineAndAddMayEdge
-```
-
-`rules.rs` may:
-
-- inspect `PaperEdge`, `ProcedureSummary`, and `ReachabilityQuery`;
-- call `PredicateOracle` and `TransitionOracle`;
-- return structured rule applications and conclusions.
-
-`rules.rs` must not:
-
-- inspect raw LLVM instruction wrappers directly;
-- own Z3 solver operations;
-- run the CFG worklist;
-- store summaries;
-- implement LLVM transfer semantics.
-
-## Summary Policy
-
-Persist only:
-
-```text
-Must   : there exists a witness path
-NotMay : no supported path reaches the queried target
-```
-
-Do not add persistent May summaries.
-
-The active `SummaryTable` is part of the paper tree, and summary use is wired
-into call-edge execution inside the interprocedural driver.
-Summary creation and reuse are active for `Must` and `NotMay`.
-Keep summary types aligned with the paper while extending coverage.
-
-## Transfer Policy
-
-The active transfer boundary is:
-
-```text
-TransitionOracle
-  backed by
-SmtLlvmTransitionOracle (CLI default)
-LlvmTransitionOracle    (syntactic/fallback)
-```
-
-Keep the design split:
-
-```text
-LLVM IR / FunctionGraph      -> llvm_adapter.rs
-EdgeId -> LlvmEdgeMetadata   -> llvm_adapter.rs
-metadata -> guard/effect     -> transfer.rs
-paper rules consume Post/Pre -> rules.rs
-```
-
-Do not collapse this boundary by making `rules.rs` parse LLVM instructions.
-
-## Documentation Guidelines
-
-Keep documentation current as the architecture changes.
-
-Use these destinations:
-
-```text
-README.md
-  User-facing project status, how to run, current capabilities, and limits.
-
-TODO.md
-  Backlog and implementation checklist. Mark what exists versus what remains.
-
-TASKVIEW.md
-  Resume document for the next session. Keep it concrete and ordered.
-
-src/analysis/design.md
-  Paper-to-code map for Pi, Omega, Gamma_e, summaries, and rule names.
-
-src/analysis/analysis_flow.md
-  Flow-oriented paper mapping, module correspondence, and SMT layering notes.
-
-AGENTS.md
-  Agent/session instructions and stable engineering guardrails.
-```
+## Development idea
+- We first develop this for straightline programs, then for programs with single procedures, then finally when function calls are present. 
+- To deal with loops, first implement a `max_step` engine where we wont revisit an instruction/edge for more than that number. Only after that is stable should we replace it with loop summary generation / loop invariant extraction in `summaries.rs`, checked through `oracle.rs`, and orchestrated by `driver.rs`.
+- Clearly notate in TASKVIEW which phase of the development we are in.
+- Add examples from the paper as targets for each of these goals. 
+- Do not add fallback summary generations ever. Instead let the analysis discover them automatically as the development progresses.
 
 
 When adding a new active analysis concept:
 
 1. Put the implementation in the narrowest correct module.
 2. Add focused unit tests.
-3. Update `TODO.md` if it changes the backlog.
-4. Update `TASKVIEW.md` if it changes the next-session plan.
-5. Update `src/analysis/design.md` if it changes the paper-to-code mapping.
-6. Update `README.md` when user-facing behavior or run instructions change.
+3. Add a short module-level doc comment that states the module intention and the paper notation or definition it implements.
+4. Update `TODO.md` if it changes the backlog.
+5. Update `TASKVIEW.md` if it changes the next-session plan.
+6. Update `src/analysis/design.md` if it changes the paper-to-code mapping.
+7. Update `README.md` or `Readme.md` when user-facing behavior or run instructions change.
+8. If the task is complete and the user did not say otherwise, commit and push the branch after verification.
 
 Do not overclaim. Clearly distinguish:
 
@@ -253,6 +158,9 @@ smoke assumptions:
 make -C tests smoke
 ```
 
+If the current branch does not yet contain the smoke harness, state that
+clearly and fall back to the available Rust verification commands.
+
 Use offline cargo only when needed:
 
 ```sh
@@ -268,4 +176,5 @@ CARGO_FLAGS=--offline make -C tests smoke
 - Keep generated `.ll`, `.bc`, and DOT files out of source control.
 - Keep C test inputs in `tests/`; generated artifacts belong in `tests/out/`.
 - Keep the active implementation close to the paper and fill only the gaps the
-  current milestone needs.
+  current milestone needs. 
+
