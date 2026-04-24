@@ -22,7 +22,7 @@ use crate::analysis::driver::{
     InterproceduralConfig, InterproceduralOracleProvider, IntraproceduralConfig,
     IntraproceduralResult, PaperDriver,
 };
-use crate::analysis::formula::Predicate;
+use crate::analysis::formula::{substitute_predicate_symbols, Predicate};
 use crate::analysis::llvm_adapter::{adapt_function_graph, AdaptedProcedure, LlvmEdgeRegistry};
 use crate::analysis::oracle::SmtPredicateOracle;
 use crate::analysis::summaries::ReachabilityQuery;
@@ -55,6 +55,7 @@ struct AssertionPathPredicates {
     site: EdgeId,
     site_post: Predicate,
     violation_post: Predicate,
+    path_to_site: Predicate,
 }
 
 fn handle(module: Module, input_file: &str, assertion: Option<String>, max_obligations: usize) {
@@ -123,7 +124,11 @@ fn run_analysis(graphs: &[FunctionGraph], assertion: Option<String>, max_obligat
         let Some(registry) = registries.get(&procedure_name) else {
             continue;
         };
-        let path_predicates = assertion_path_predicates(registry);
+        let params = parameters
+            .get(&procedure_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let path_predicates = assertion_path_predicates(registry, params);
         if path_predicates.is_empty() {
             debug!(
                 "Skipping top-level query for {}: no embedded may_assert target",
@@ -137,6 +142,7 @@ fn run_analysis(graphs: &[FunctionGraph], assertion: Option<String>, max_obligat
                 "Assertion Site <{}:{}>",
                 procedure_name, site_predicates.site
             );
+            println!("Path Predicate: {}", site_predicates.path_to_site);
 
             let site_query = ReachabilityQuery::new(
                 procedure_name.clone(),
@@ -267,19 +273,197 @@ fn query_status(result: &IntraproceduralResult) -> QueryStatus {
     }
 }
 
-fn assertion_path_predicates(registry: &LlvmEdgeRegistry) -> Vec<AssertionPathPredicates> {
+fn assertion_path_predicates(
+    registry: &LlvmEdgeRegistry,
+    parameters: &[String],
+) -> Vec<AssertionPathPredicates> {
+    let (value_defs, memory_defs) = build_symbolic_defs(registry);
     registry
         .iter()
         .filter_map(|metadata| {
             let site_post = assertion_site_predicate(metadata)?;
             let violation_post = assertion_violation_predicate(metadata)?;
+            let path_to_site =
+                derive_path_to_may_assert(registry, metadata, &value_defs, &memory_defs);
+            let path_to_site = rename_formals_for_display(path_to_site, parameters);
             Some(AssertionPathPredicates {
                 site: metadata.edge_id,
                 site_post,
                 violation_post,
+                path_to_site,
             })
         })
         .collect()
+}
+
+fn derive_path_to_may_assert(
+    registry: &LlvmEdgeRegistry,
+    may_assert_site: &crate::analysis::llvm_adapter::LlvmEdgeMetadata,
+    value_defs: &BTreeMap<String, String>,
+    memory_defs: &BTreeMap<String, String>,
+) -> Predicate {
+    let incoming_guards = registry
+        .iter()
+        .filter(|metadata| metadata.to == may_assert_site.from)
+        .filter_map(|metadata| {
+            let condition = metadata.branch_condition.as_ref()?;
+            let expanded = expand_symbolic_token(condition, value_defs, memory_defs);
+            let guard = match metadata.successor_index {
+                Some(1) => format!("!({expanded})"),
+                _ => expanded,
+            };
+            Some(Predicate::atom(guard))
+        })
+        .collect::<Vec<_>>();
+    if !incoming_guards.is_empty() {
+        return Predicate::or(incoming_guards);
+    }
+    may_assert_site
+        .operands
+        .first()
+        .map(|operand| Predicate::atom(expand_symbolic_token(operand, value_defs, memory_defs)))
+        .unwrap_or(Predicate::True)
+}
+
+fn rename_formals_for_display(predicate: Predicate, parameters: &[String]) -> Predicate {
+    let replacements = parameters
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), format!("i{}", index + 1)))
+        .collect::<BTreeMap<_, _>>();
+    substitute_predicate_symbols(predicate, &replacements)
+}
+
+fn build_symbolic_defs(
+    registry: &LlvmEdgeRegistry,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut ordered = registry.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|metadata| metadata.edge_id);
+
+    let mut value_defs = BTreeMap::<String, String>::new();
+    let mut memory_defs = BTreeMap::<String, String>::new();
+
+    for metadata in ordered {
+        match metadata.opcode {
+            InstructionOpcode::Store => {
+                if let (Some(value), Some(ptr)) =
+                    (metadata.operands.first(), metadata.operands.get(1))
+                {
+                    let value = expand_symbolic_token(value, &value_defs, &memory_defs);
+                    memory_defs.insert(ptr.clone(), value);
+                }
+            }
+            InstructionOpcode::Load => {
+                if let (Some(lhs), Some(ptr)) = (&metadata.assignment, metadata.operands.first()) {
+                    let value = memory_defs
+                        .get(ptr)
+                        .cloned()
+                        .unwrap_or_else(|| format!("load({ptr})"));
+                    value_defs.insert(lhs.clone(), value);
+                }
+            }
+            InstructionOpcode::Call => {
+                let Some(lhs) = &metadata.assignment else {
+                    continue;
+                };
+                let Some(callee) = &metadata.called_function else {
+                    continue;
+                };
+                if callee == "may_assert" {
+                    continue;
+                }
+                let args = metadata
+                    .operands
+                    .iter()
+                    .filter(|operand| !is_callee_symbol_operand(operand, callee))
+                    .map(|operand| expand_symbolic_token(operand, &value_defs, &memory_defs))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                value_defs.insert(lhs.clone(), format!("{callee}({args})"));
+            }
+            InstructionOpcode::ICmp => {
+                let Some(lhs) = &metadata.assignment else {
+                    continue;
+                };
+                let Some(predicate) = parse_icmp_predicate(&metadata.instruction_text) else {
+                    continue;
+                };
+                let Some(left) = metadata.operands.first() else {
+                    continue;
+                };
+                let Some(right) = metadata.operands.get(1) else {
+                    continue;
+                };
+                let left = expand_symbolic_token(left, &value_defs, &memory_defs);
+                let right = expand_symbolic_token(right, &value_defs, &memory_defs);
+                let expression = format_icmp_expression(predicate, left, right);
+                value_defs.insert(lhs.clone(), expression);
+            }
+            InstructionOpcode::Add | InstructionOpcode::Sub | InstructionOpcode::Mul => {
+                let Some(lhs) = &metadata.assignment else {
+                    continue;
+                };
+                let Some(left) = metadata.operands.first() else {
+                    continue;
+                };
+                let Some(right) = metadata.operands.get(1) else {
+                    continue;
+                };
+                let left = expand_symbolic_token(left, &value_defs, &memory_defs);
+                let right = expand_symbolic_token(right, &value_defs, &memory_defs);
+                let operator = match metadata.opcode {
+                    InstructionOpcode::Add => "+",
+                    InstructionOpcode::Sub => "-",
+                    InstructionOpcode::Mul => "*",
+                    _ => unreachable!("covered above"),
+                };
+                value_defs.insert(lhs.clone(), format!("({left} {operator} {right})"));
+            }
+            _ => {}
+        }
+    }
+
+    (value_defs, memory_defs)
+}
+
+fn expand_symbolic_token(
+    token: &str,
+    value_defs: &BTreeMap<String, String>,
+    memory_defs: &BTreeMap<String, String>,
+) -> String {
+    if let Some(value) = value_defs.get(token) {
+        return value.clone();
+    }
+    if let Some(value) = memory_defs.get(token) {
+        return value.clone();
+    }
+    token.to_string()
+}
+
+fn parse_icmp_predicate(instruction_text: &str) -> Option<&'static str> {
+    if instruction_text.contains("icmp slt") {
+        Some("<")
+    } else if instruction_text.contains("icmp sgt") {
+        Some(">")
+    } else if instruction_text.contains("icmp sle") {
+        Some("<=")
+    } else if instruction_text.contains("icmp sge") {
+        Some(">=")
+    } else if instruction_text.contains("icmp eq") {
+        Some("==")
+    } else if instruction_text.contains("icmp ne") {
+        Some("!=")
+    } else {
+        None
+    }
+}
+
+fn is_callee_symbol_operand(operand: &str, callee: &str) -> bool {
+    operand.trim_start_matches(['%', '@']) == callee
+}
+
+fn format_icmp_expression(predicate: &str, left: String, right: String) -> String {
+    format!("{left} {predicate} {right}")
 }
 
 fn should_dump_graphs() -> bool {
@@ -488,7 +672,7 @@ mod tests {
             successor_index: None,
         });
 
-        let jobs = assertion_path_predicates(&registry);
+        let jobs = assertion_path_predicates(&registry, &["%cond".to_string()]);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].site, EdgeId(7));
         assert_eq!(jobs[0].site_post, Predicate::atom("assert_violation(e7)"));
@@ -499,5 +683,6 @@ mod tests {
                 Predicate::not(Predicate::atom("%cond")),
             ])
         );
+        assert_eq!(jobs[0].path_to_site, Predicate::atom("i1"));
     }
 }
