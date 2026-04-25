@@ -4,10 +4,10 @@
 //! values into solver constraints. It is intentionally small: no paper-level
 //! oracle policy lives here yet.
 
-use crate::analysis::formula::{Formula, FormulaError, Rational, Sort, Term};
+use crate::analysis::formula::{Formula, FormulaError, Memory, Rational, Sort, Term};
 use std::collections::BTreeMap;
-use z3::ast::{Bool, Int, Real};
-use z3::{SatResult, Solver};
+use z3::ast::{Array, Bool, Int, Real};
+use z3::{SatResult, Solver, Sort as Z3Sort};
 
 #[derive(Debug, Default)]
 pub struct SmtScope {
@@ -15,6 +15,7 @@ pub struct SmtScope {
     bool_vars: BTreeMap<String, Bool>,
     int_vars: BTreeMap<String, Int>,
     real_vars: BTreeMap<String, Real>,
+    memory_vars: BTreeMap<String, Array>,
 }
 
 impl SmtScope {
@@ -101,6 +102,18 @@ impl SmtScope {
             },
             Term::Int(value) => Ok(EncodedTerm::Int(Int::from_i64(*value))),
             Term::Real(value) => Ok(EncodedTerm::Real(self.real_constant(value))),
+            Term::Select(memory, index) => {
+                let memory = self.lower_memory(memory)?;
+                let index = match self.lower_term(index)? {
+                    EncodedTerm::Int(index) => index,
+                    EncodedTerm::Real(_) => {
+                        return Err(FormulaError::ExpectedIntegerSort { found: Sort::Real });
+                    }
+                };
+                Ok(EncodedTerm::Int(memory.select(&index).as_int().expect(
+                    "int memory array select should lower to an int term",
+                )))
+            }
             Term::Add(lhs, rhs) => combine_terms(
                 self.lower_term(lhs)?,
                 self.lower_term(rhs)?,
@@ -139,6 +152,28 @@ impl SmtScope {
         }
     }
 
+    fn lower_memory(&mut self, memory: &Memory) -> Result<Array, FormulaError> {
+        match memory {
+            Memory::Var(name) => Ok(self.memory_var(name)),
+            Memory::Store(memory, index, value) => {
+                let memory = self.lower_memory(memory)?;
+                let index = match self.lower_term(index)? {
+                    EncodedTerm::Int(index) => index,
+                    EncodedTerm::Real(_) => {
+                        return Err(FormulaError::ExpectedIntegerSort { found: Sort::Real });
+                    }
+                };
+                let value = match self.lower_term(value)? {
+                    EncodedTerm::Int(value) => value,
+                    EncodedTerm::Real(_) => {
+                        return Err(FormulaError::ExpectedIntegerSort { found: Sort::Real });
+                    }
+                };
+                Ok(memory.store(&index, &value))
+            }
+        }
+    }
+
     fn bool_var(&mut self, name: &str) -> Bool {
         self.bool_vars
             .entry(name.to_string())
@@ -157,6 +192,13 @@ impl SmtScope {
         self.real_vars
             .entry(name.to_string())
             .or_insert_with(|| Real::new_const(name))
+            .clone()
+    }
+
+    fn memory_var(&mut self, name: &str) -> Array {
+        self.memory_vars
+            .entry(name.to_string())
+            .or_insert_with(|| Array::new_const(name, &Z3Sort::int(), &Z3Sort::int()))
             .clone()
     }
 
@@ -242,13 +284,27 @@ fn compare_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::formula::{Formula, Term};
+    use crate::analysis::formula::{Formula, Memory, Term};
 
     #[test]
     fn basic_scope_usage_works() {
         let mut smt = SmtScope::new();
         smt.assert_formula(&Formula::eq(Term::var("x", Sort::Int), Term::int(2)))
             .unwrap();
+        assert_eq!(smt.check(), SatResult::Sat);
+    }
+
+    #[test]
+    fn memory_selects_and_stores_lower_to_z3_arrays() {
+        let mut smt = SmtScope::new();
+        smt.assert_formula(&Formula::eq(
+            Term::select(
+                Memory::store(Memory::var("mem0"), Term::int(0), Term::int(7)),
+                Term::int(0),
+            ),
+            Term::int(7),
+        ))
+        .unwrap();
         assert_eq!(smt.check(), SatResult::Sat);
     }
 }

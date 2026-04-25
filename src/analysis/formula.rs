@@ -108,10 +108,50 @@ impl fmt::Display for Rational {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Memory {
+    Var(String),
+    Store(Box<Memory>, Box<Term>, Box<Term>),
+}
+
+impl Memory {
+    pub fn var(name: impl Into<String>) -> Self {
+        Self::Var(name.into())
+    }
+
+    pub fn store(memory: Memory, index: Term, value: Term) -> Self {
+        Self::Store(Box::new(memory), Box::new(index), Box::new(value))
+    }
+
+    pub fn validate(&self) -> Result<(), FormulaError> {
+        match self {
+            Memory::Var(_) => Ok(()),
+            Memory::Store(memory, index, value) => {
+                memory.validate()?;
+                expect_integer_sort(index.sort()?)?;
+                expect_integer_sort(value.sort()?)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl fmt::Display for Memory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Memory::Var(name) => write!(f, "{name}"),
+            Memory::Store(memory, index, value) => {
+                write!(f, "(store {memory} {index} {value})")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Term {
     Var(Var),
     Int(i64),
     Real(Rational),
+    Select(Box<Memory>, Box<Term>),
     Add(Box<Term>, Box<Term>),
     Sub(Box<Term>, Box<Term>),
     Mul(Box<Term>, Box<Term>),
@@ -130,6 +170,10 @@ impl Term {
 
     pub fn real(num: i64, den: i64) -> Self {
         Self::Real(Rational::new(num, den))
+    }
+
+    pub fn select(memory: Memory, index: Term) -> Self {
+        Self::Select(Box::new(memory), Box::new(index))
     }
 
     pub fn add(lhs: Term, rhs: Term) -> Self {
@@ -163,6 +207,11 @@ impl Term {
             }
             Term::Int(_) => Ok(Sort::Int),
             Term::Real(_) => Ok(Sort::Real),
+            Term::Select(memory, index) => {
+                memory.validate()?;
+                expect_integer_sort(index.sort()?)?;
+                Ok(Sort::Int)
+            }
             Term::Add(lhs, rhs)
             | Term::Sub(lhs, rhs)
             | Term::Mul(lhs, rhs)
@@ -185,6 +234,7 @@ impl fmt::Display for Term {
             Term::Var(var) => write!(f, "{var}"),
             Term::Int(value) => write!(f, "{value}"),
             Term::Real(value) => write!(f, "{value}"),
+            Term::Select(memory, index) => write!(f, "(select {memory} {index})"),
             Term::Add(lhs, rhs) => write!(f, "({lhs} + {rhs})"),
             Term::Sub(lhs, rhs) => write!(f, "({lhs} - {rhs})"),
             Term::Mul(lhs, rhs) => write!(f, "({lhs} * {rhs})"),
@@ -361,8 +411,18 @@ pub enum FormulaError {
     ExpectedBooleanSort { found: Sort },
     #[error("expected a numeric sort but found {found}")]
     ExpectedNumericSort { found: Sort },
+    #[error("expected an integer sort but found {found}")]
+    ExpectedIntegerSort { found: Sort },
     #[error("mixed sorts are not allowed: {left} vs {right}")]
     MixedSorts { left: Sort, right: Sort },
+}
+
+fn expect_integer_sort(sort: Sort) -> Result<(), FormulaError> {
+    if sort == Sort::Int {
+        Ok(())
+    } else {
+        Err(FormulaError::ExpectedIntegerSort { found: sort })
+    }
 }
 
 fn unify_numeric_sorts(lhs: Sort, rhs: Sort) -> Result<Sort, FormulaError> {

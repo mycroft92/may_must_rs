@@ -16,6 +16,7 @@ Implemented:
 - paper oracle feasibility/implication queries
 - synthetic single-exit normalization for multi-exit procedures
 - temporary loop support through per-edge `max_step` bounds
+- integer-array memory handling plus conservative call-memory havoc
 - `tests/flow` fixture corpus and `make -C tests smoke`
 
 Not wired:
@@ -29,5 +30,5 @@ Not wired:
 
 1. Replace the temporary bounded checker in `driver.rs` with rule-driven scheduling.
 2. Connect lowered effects to candidate `β` / `θ` computations for `NOTMAY-PRE` and `MUST-POST`.
-3. Thread summary tables through actual call handling.
+3. Replace the current conservative call-memory handling with summary-driven call reasoning.
 4. Replace the temporary `max_step` policy with loop summaries / invariants.

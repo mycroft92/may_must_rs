@@ -8,13 +8,42 @@ use crate::analysis::formula::{Formula, Sort, Term, Var};
 use crate::analysis::state::NodeState;
 use thiserror::Error;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallMemoryEffect {
+    PreservesMemory,
+    HavocMemory,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransferEffect {
-    Assign { target: Var, value: AssignValue },
+    Assign {
+        target: Var,
+        value: AssignValue,
+    },
+    Alloca {
+        target: String,
+        region: String,
+    },
+    GetElementPtr {
+        target: String,
+        base: String,
+        offset: Term,
+    },
+    Load {
+        target: Var,
+        source: String,
+    },
+    Store {
+        target: String,
+        value: Term,
+    },
     Assume(Formula),
     Obligation(Formula),
     Nop,
-    Call { callee: String },
+    Call {
+        callee: String,
+        memory_effect: CallMemoryEffect,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,15 +74,42 @@ pub enum TransferError {
     ExpectedNumericTarget { found: Sort },
     #[error("expected a Boolean target but found {found}")]
     ExpectedBooleanTarget { found: Sort },
+    #[error("expected an integer memory value but found {found}")]
+    ExpectedIntegerMemoryValue { found: Sort },
     #[error("assignment sorts do not match: {target} vs {value}")]
     MismatchedAssignmentSort { target: Sort, value: Sort },
-    #[error("calls are not supported in phase 1 transfer semantics: {callee}")]
-    UnsupportedCall { callee: String },
 }
 
 pub fn apply_effect(state: &mut NodeState, effect: &TransferEffect) -> Result<(), TransferError> {
     match effect {
         TransferEffect::Assign { target, value } => apply_assignment(state, target, value),
+        TransferEffect::Alloca { target, region } => {
+            state.bind_alloca_pointer(target.clone(), region.clone());
+            Ok(())
+        }
+        TransferEffect::GetElementPtr {
+            target,
+            base,
+            offset,
+        } => {
+            ensure_integer_term(offset)?;
+            state.bind_pointer_offset(target.clone(), base, offset.clone());
+            Ok(())
+        }
+        TransferEffect::Load { target, source } => {
+            if target.sort() != Sort::Int {
+                return Err(TransferError::ExpectedIntegerMemoryValue {
+                    found: target.sort(),
+                });
+            }
+            state.load_from_pointer(target, source);
+            Ok(())
+        }
+        TransferEffect::Store { target, value } => {
+            ensure_integer_term(value)?;
+            state.store_to_pointer(target, value.clone());
+            Ok(())
+        }
         TransferEffect::Assume(formula) => {
             state.path_summary_mut().refine(formula.clone());
             Ok(())
@@ -63,9 +119,15 @@ pub fn apply_effect(state: &mut NodeState, effect: &TransferEffect) -> Result<()
             Ok(())
         }
         TransferEffect::Nop => Ok(()),
-        TransferEffect::Call { callee } => Err(TransferError::UnsupportedCall {
-            callee: callee.clone(),
-        }),
+        TransferEffect::Call {
+            callee: _,
+            memory_effect,
+        } => {
+            if *memory_effect == CallMemoryEffect::HavocMemory {
+                state.havoc_memory();
+            }
+            Ok(())
+        }
     }
 }
 
@@ -107,6 +169,14 @@ fn apply_assignment(
     }
 }
 
+fn ensure_integer_term(term: &Term) -> Result<(), TransferError> {
+    match term.sort() {
+        Ok(Sort::Int) => Ok(()),
+        Ok(found) => Err(TransferError::ExpectedIntegerMemoryValue { found }),
+        Err(_) => Err(TransferError::ExpectedIntegerMemoryValue { found: Sort::Bool }),
+    }
+}
+
 pub fn apply_effects(
     state: &mut NodeState,
     effects: &[TransferEffect],
@@ -120,7 +190,7 @@ pub fn apply_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::formula::{Predicate, Sort};
+    use crate::analysis::formula::{Memory, Predicate, Sort};
 
     #[test]
     fn arithmetic_assignment_produces_an_equality_fact() {
@@ -235,20 +305,63 @@ mod tests {
     }
 
     #[test]
-    fn calls_are_rejected_as_unsupported() {
+    fn memory_loads_and_stores_use_integer_arrays() {
         let mut state = NodeState::entry();
-        let error = apply_effect(
+        apply_effect(
             &mut state,
-            &TransferEffect::Call {
-                callee: "helper".to_string(),
+            &TransferEffect::Alloca {
+                target: "%ptr".to_string(),
+                region: "stack.ptr".to_string(),
             },
         )
-        .unwrap_err();
+        .unwrap();
+        apply_effect(
+            &mut state,
+            &TransferEffect::Store {
+                target: "%ptr".to_string(),
+                value: Term::int(9),
+            },
+        )
+        .unwrap();
+        apply_effect(
+            &mut state,
+            &TransferEffect::Load {
+                target: Var::int("%x"),
+                source: "%ptr".to_string(),
+            },
+        )
+        .unwrap();
         assert_eq!(
-            error,
-            TransferError::UnsupportedCall {
-                callee: "helper".to_string(),
-            }
+            state.facts().collapse(),
+            Formula::eq(
+                Term::Var(Var::int("%x")),
+                Term::select(
+                    Memory::store(Memory::var("stack.ptr$mem0"), Term::int(0), Term::int(9),),
+                    Term::int(0),
+                ),
+            )
         );
+    }
+
+    #[test]
+    fn impure_calls_havoc_memory() {
+        let mut state = NodeState::entry();
+        apply_effect(
+            &mut state,
+            &TransferEffect::Alloca {
+                target: "%ptr".to_string(),
+                region: "stack.ptr".to_string(),
+            },
+        )
+        .unwrap();
+        apply_effect(
+            &mut state,
+            &TransferEffect::Call {
+                callee: "touch".to_string(),
+                memory_effect: CallMemoryEffect::HavocMemory,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.memory_summary(), "[stack.ptr=stack.ptr$mem1]");
     }
 }

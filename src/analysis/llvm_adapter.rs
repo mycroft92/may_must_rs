@@ -7,10 +7,10 @@
 
 use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::{Formula, Sort, Term, Var};
-use crate::analysis::transfer::{AssignValue, TransferEffect};
+use crate::analysis::transfer::{AssignValue, CallMemoryEffect, TransferEffect};
 use crate::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TypeKind};
 use crate::llvm_utils::program_graph::{AssertSite, FunctionGraph};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -31,14 +31,10 @@ impl AdaptedProcedure {
 pub enum AdapterError {
     #[error("function graph has no visible start node")]
     MissingStart,
-    #[error("unsupported memory-heavy instruction: {instruction}")]
-    UnsupportedMemoryInstruction { instruction: String },
     #[error("unsupported floating-point instruction: {instruction}")]
     UnsupportedFloatingPointInstruction { instruction: String },
     #[error("unsupported instruction in current lowering: {instruction}")]
     UnsupportedInstruction { instruction: String },
-    #[error("call results are not supported yet: {instruction}")]
-    UnsupportedCallResult { instruction: String },
     #[error("missing assignment target for instruction: {instruction}")]
     MissingAssignmentTarget { instruction: String },
     #[error("unable to infer a supported sort for value: {value}")]
@@ -50,9 +46,17 @@ pub enum AdapterError {
 }
 
 pub fn adapt_function_graph(graph: &FunctionGraph) -> Result<AdaptedProcedure, AdapterError> {
+    adapt_function_graph_with_purity(graph, &BTreeSet::new())
+}
+
+pub fn adapt_function_graph_with_purity(
+    graph: &FunctionGraph,
+    memory_pure_functions: &BTreeSet<String>,
+) -> Result<AdaptedProcedure, AdapterError> {
     let start = graph.start.ok_or(AdapterError::MissingStart)?;
     let mut cfg = Cfg::new(start.print());
     let mut instruction_nodes = HashMap::<Instruction, CfgNodeId>::new();
+    let allocation_regions = allocation_regions(graph);
     instruction_nodes.insert(start, cfg.entry());
 
     for instruction in &graph.vertices {
@@ -71,7 +75,7 @@ pub fn adapt_function_graph(graph: &FunctionGraph) -> Result<AdaptedProcedure, A
 
     let mut node_effects = BTreeMap::<CfgNodeId, Vec<TransferEffect>>::new();
     for instruction in &graph.vertices {
-        let effects = lower_node_effects(*instruction)?;
+        let effects = lower_node_effects(*instruction, memory_pure_functions, &allocation_regions)?;
         if !effects.is_empty() {
             node_effects.insert(instruction_nodes[instruction], effects);
         }
@@ -107,7 +111,32 @@ pub fn adapt_function_graph(graph: &FunctionGraph) -> Result<AdaptedProcedure, A
     })
 }
 
-fn lower_node_effects(instruction: Instruction) -> Result<Vec<TransferEffect>, AdapterError> {
+pub fn infer_memory_pure_functions(graphs: &[FunctionGraph]) -> BTreeSet<String> {
+    let mut memory_pure = graphs
+        .iter()
+        .map(|graph| graph.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    loop {
+        let previous = memory_pure.clone();
+        memory_pure.retain(|name| {
+            let graph = graphs
+                .iter()
+                .find(|graph| graph.name == *name)
+                .expect("graph should exist while computing memory purity");
+            preserves_memory(graph, &previous)
+        });
+        if memory_pure == previous {
+            return memory_pure;
+        }
+    }
+}
+
+fn lower_node_effects(
+    instruction: Instruction,
+    memory_pure_functions: &BTreeSet<String>,
+    allocation_regions: &HashMap<Instruction, String>,
+) -> Result<Vec<TransferEffect>, AdapterError> {
     let effect = match instruction.get_opcode() {
         InstructionOpcode::Add
         | InstructionOpcode::Sub
@@ -186,6 +215,44 @@ fn lower_node_effects(instruction: Instruction) -> Result<Vec<TransferEffect>, A
                 value: AssignValue::Predicate(value),
             })
         }
+        InstructionOpcode::Alloca => Some(TransferEffect::Alloca {
+            target: pointer_name(instruction)?,
+            region: allocation_regions
+                .get(&instruction)
+                .cloned()
+                .ok_or_else(|| AdapterError::UnsupportedInstruction {
+                    instruction: instruction.print(),
+                })?,
+        }),
+        InstructionOpcode::Load => Some(TransferEffect::Load {
+            target: assigned_var(instruction)?,
+            source: pointer_name(instruction.get_operand(0).ok_or_else(|| {
+                AdapterError::UnsupportedInstruction {
+                    instruction: instruction.print(),
+                }
+            })?)?,
+        }),
+        InstructionOpcode::Store => Some(TransferEffect::Store {
+            target: pointer_name(instruction.get_operand(1).ok_or_else(|| {
+                AdapterError::UnsupportedInstruction {
+                    instruction: instruction.print(),
+                }
+            })?)?,
+            value: lower_integer_value(instruction.get_operand(0).ok_or_else(|| {
+                AdapterError::UnsupportedInstruction {
+                    instruction: instruction.print(),
+                }
+            })?)?,
+        }),
+        InstructionOpcode::GetElementPtr => Some(TransferEffect::GetElementPtr {
+            target: pointer_name(instruction)?,
+            base: pointer_name(instruction.get_operand(0).ok_or_else(|| {
+                AdapterError::UnsupportedInstruction {
+                    instruction: instruction.print(),
+                }
+            })?)?,
+            offset: lower_gep_offset(instruction)?,
+        }),
         InstructionOpcode::PHI | InstructionOpcode::Br | InstructionOpcode::Ret => None,
         InstructionOpcode::Call => {
             let callee = instruction.get_called_function().ok_or_else(|| {
@@ -196,27 +263,15 @@ fn lower_node_effects(instruction: Instruction) -> Result<Vec<TransferEffect>, A
             if callee == "may_assert" {
                 None
             } else {
-                match instruction
-                    .get_type()
-                    .map(|ty| ty.kind())
-                    .unwrap_or(TypeKind::Other)
-                {
-                    TypeKind::Void => Some(TransferEffect::Call { callee }),
-                    _ => {
-                        return Err(AdapterError::UnsupportedCallResult {
-                            instruction: instruction.print(),
-                        });
-                    }
-                }
+                Some(TransferEffect::Call {
+                    callee: callee.clone(),
+                    memory_effect: if memory_pure_functions.contains(&callee) {
+                        CallMemoryEffect::PreservesMemory
+                    } else {
+                        CallMemoryEffect::HavocMemory
+                    },
+                })
             }
-        }
-        InstructionOpcode::Alloca
-        | InstructionOpcode::Load
-        | InstructionOpcode::Store
-        | InstructionOpcode::GetElementPtr => {
-            return Err(AdapterError::UnsupportedMemoryInstruction {
-                instruction: instruction.print(),
-            });
         }
         InstructionOpcode::FNeg
         | InstructionOpcode::FAdd
@@ -237,6 +292,83 @@ fn lower_node_effects(instruction: Instruction) -> Result<Vec<TransferEffect>, A
     };
 
     Ok(effect.into_iter().collect())
+}
+
+fn allocation_regions(graph: &FunctionGraph) -> HashMap<Instruction, String> {
+    let mut regions = HashMap::new();
+    let mut next_region = 0usize;
+    for instruction in &graph.vertices {
+        if instruction.get_opcode() == InstructionOpcode::Alloca {
+            regions.insert(*instruction, format!("{}$stack{}", graph.name, next_region));
+            next_region += 1;
+        }
+    }
+    regions
+}
+
+fn preserves_memory(graph: &FunctionGraph, memory_pure_functions: &BTreeSet<String>) -> bool {
+    let local_pointers = infer_local_pointer_names(graph);
+    for instruction in &graph.vertices {
+        match instruction.get_opcode() {
+            InstructionOpcode::Store => {
+                let Some(pointer) = instruction.get_operand(1) else {
+                    return false;
+                };
+                if !is_local_pointer_value(pointer, &local_pointers) {
+                    return false;
+                }
+            }
+            InstructionOpcode::Call => {
+                let Some(callee) = instruction.get_called_function() else {
+                    return false;
+                };
+                if !memory_pure_functions.contains(&callee) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn infer_local_pointer_names(graph: &FunctionGraph) -> BTreeSet<String> {
+    let mut locals = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for instruction in &graph.vertices {
+            match instruction.get_opcode() {
+                InstructionOpcode::Alloca => {
+                    changed |= locals.insert(instruction.display_name());
+                }
+                InstructionOpcode::GetElementPtr => {
+                    if let Some(base) = instruction.get_operand(0) {
+                        if is_local_pointer_value(base, &locals) {
+                            changed |= locals.insert(instruction.display_name());
+                        }
+                    }
+                }
+                InstructionOpcode::PHI => {
+                    if is_pointer_value(*instruction)
+                        && instruction
+                            .get_phi_incomings()
+                            .iter()
+                            .all(|(_, incoming)| is_local_pointer_value(*incoming, &locals))
+                    {
+                        changed |= locals.insert(instruction.display_name());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            return locals;
+        }
+    }
+}
+
+fn is_local_pointer_value(value: Instruction, locals: &BTreeSet<String>) -> bool {
+    is_pointer_value(value) && locals.contains(&value.display_name())
 }
 
 fn lower_edge_relation(source: Instruction, target: Instruction) -> Result<Formula, AdapterError> {
@@ -358,6 +490,18 @@ fn assigned_var(instruction: Instruction) -> Result<Var, AdapterError> {
     }
 }
 
+fn lower_integer_value(value: Instruction) -> Result<Term, AdapterError> {
+    match sort_for_value(value)? {
+        Sort::Int => lower_numeric_value(value),
+        Sort::Real => Err(AdapterError::UnsupportedFloatingPointInstruction {
+            instruction: value.print(),
+        }),
+        Sort::Bool => Err(AdapterError::UnsupportedInstruction {
+            instruction: value.print(),
+        }),
+    }
+}
+
 fn lower_numeric_value(value: Instruction) -> Result<Term, AdapterError> {
     match sort_for_value(value)? {
         Sort::Int => {
@@ -374,6 +518,35 @@ fn lower_numeric_value(value: Instruction) -> Result<Term, AdapterError> {
             value: value.print(),
         }),
     }
+}
+
+fn lower_gep_offset(instruction: Instruction) -> Result<Term, AdapterError> {
+    // APPROX_HEAVY: the temporary memory model treats each region as an integer
+    // array and lowers GEP by summing raw indices, ignoring LLVM element sizes
+    // and aggregate layout.
+    let mut offset = Term::int(0);
+    for operand in instruction.get_operands().into_iter().skip(1) {
+        let index = lower_integer_value(operand)?;
+        offset = Term::add(offset, index);
+    }
+    Ok(offset)
+}
+
+fn pointer_name(value: Instruction) -> Result<String, AdapterError> {
+    if is_pointer_value(value) {
+        Ok(value.display_name())
+    } else {
+        Err(AdapterError::UnsupportedInstruction {
+            instruction: value.print(),
+        })
+    }
+}
+
+fn is_pointer_value(value: Instruction) -> bool {
+    value
+        .get_type()
+        .map(|ty| ty.kind() == TypeKind::Pointer)
+        .unwrap_or(false)
 }
 
 fn lower_bool_value(value: Instruction) -> Result<Formula, AdapterError> {
@@ -409,7 +582,7 @@ fn sort_for_value(value: Instruction) -> Result<Sort, AdapterError> {
                 instruction: value.print(),
             })
         }
-        TypeKind::Void => Err(AdapterError::UnsupportedValue {
+        TypeKind::Void | TypeKind::Pointer => Err(AdapterError::UnsupportedValue {
             value: value.print(),
         }),
         _ => Err(AdapterError::UnsupportedValue {
@@ -423,7 +596,7 @@ mod tests {
     use super::*;
     use crate::analysis::cfg::CfgNodeKind;
     use crate::analysis::formula::{Formula, Term};
-    use crate::analysis::transfer::TransferEffect;
+    use crate::analysis::transfer::{CallMemoryEffect, TransferEffect};
     use crate::llvm_utils::llvm_wrap::{initialize_target, Context};
     use crate::llvm_utils::program_graph::generate_program_graph;
 
@@ -432,7 +605,8 @@ mod tests {
         let context = Context::new();
         let module = context.parse_ir_str(ir, "test").unwrap();
         let graphs = generate_program_graph(&module).unwrap();
-        adapt_function_graph(&graphs[0]).unwrap()
+        let pure = infer_memory_pure_functions(&graphs);
+        adapt_function_graph_with_purity(&graphs[0], &pure).unwrap()
     }
 
     fn adapt_first_err(ir: &str) -> AdapterError {
@@ -440,7 +614,7 @@ mod tests {
         let context = Context::new();
         let module = context.parse_ir_str(ir, "test").unwrap();
         let graphs = generate_program_graph(&module).unwrap();
-        adapt_function_graph(&graphs[0]).unwrap_err()
+        adapt_function_graph_with_purity(&graphs[0], &BTreeSet::new()).unwrap_err()
     }
 
     #[test]
@@ -545,6 +719,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(effects.contains(&TransferEffect::Call {
             callee: "helper".to_string(),
+            memory_effect: CallMemoryEffect::HavocMemory,
         }));
     }
 
@@ -571,8 +746,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_memory_instructions_are_rejected() {
-        let error = adapt_first_err(
+    fn memory_instructions_lower_to_explicit_effects() {
+        let adapted = adapt_first(
             r#"
                 define i32 @main() {
                 entry:
@@ -583,9 +758,94 @@ mod tests {
                 }
             "#,
         );
-        assert!(matches!(
-            error,
-            AdapterError::UnsupportedMemoryInstruction { .. }
-        ));
+        let effects = adapted
+            .node_effects
+            .values()
+            .flat_map(|effects| effects.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(effects.contains(&TransferEffect::Alloca {
+            target: "%ptr".to_string(),
+            region: "main$stack0".to_string(),
+        }));
+        assert!(effects.contains(&TransferEffect::Store {
+            target: "%ptr".to_string(),
+            value: Term::int(1),
+        }));
+        assert!(effects.contains(&TransferEffect::Load {
+            target: Var::int("%value"),
+            source: "%ptr".to_string(),
+        }));
+    }
+
+    #[test]
+    fn local_stack_memory_keeps_a_helper_memory_pure() {
+        initialize_target();
+        let context = Context::new();
+        let module = context
+            .parse_ir_str(
+                r#"
+                    define void @helper() {
+                    entry:
+                        %ptr = alloca i32
+                        store i32 1, ptr %ptr
+                        %v = load i32, ptr %ptr
+                        ret void
+                    }
+
+                    define void @main() {
+                    entry:
+                        call void @helper()
+                        ret void
+                    }
+                "#,
+                "test",
+            )
+            .unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        let pure = infer_memory_pure_functions(&graphs);
+        assert!(pure.contains("helper"));
+        assert!(pure.contains("main"));
+    }
+
+    #[test]
+    fn stores_through_parameters_make_a_helper_impure() {
+        initialize_target();
+        let context = Context::new();
+        let module = context
+            .parse_ir_str(
+                r#"
+                    define void @touch(ptr %p) {
+                    entry:
+                        store i32 1, ptr %p
+                        ret void
+                    }
+                "#,
+                "test",
+            )
+            .unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        let pure = infer_memory_pure_functions(&graphs);
+        assert!(!pure.contains("touch"));
+    }
+
+    #[test]
+    fn pointer_phis_are_still_rejected() {
+        let error = adapt_first_err(
+            r#"
+                define ptr @main(i1 %cond, ptr %left, ptr %right) {
+                entry:
+                    br i1 %cond, label %lhs, label %rhs
+                lhs:
+                    br label %merge
+                rhs:
+                    br label %merge
+                merge:
+                    %p = phi ptr [ %left, %lhs ], [ %right, %rhs ]
+                    ret ptr %p
+                }
+            "#,
+        );
+        assert!(matches!(error, AdapterError::UnsupportedValue { .. }));
     }
 }

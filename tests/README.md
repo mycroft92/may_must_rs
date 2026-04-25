@@ -17,9 +17,11 @@ Those flags matter:
 Current status:
 
 - supported-shape fixtures are intended to stay within the adapter subset
-  (integer arithmetic, `icmp`, `br`, `phi`, plain `call`, `ret`);
+  (integer arithmetic, `icmp`, `br`, integer `alloca` / `load` / `store` /
+  `gep`, plain `call`, `ret`);
 - unsupported fixtures are present on purpose so future smoke/debug runs can
-  show explicit rejection for memory-heavy and floating-point IR.
+  show explicit rejection for floating-point IR and other shapes still outside
+  the active subset.
 
 Use:
 

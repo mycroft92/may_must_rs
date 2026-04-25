@@ -7,5 +7,5 @@
 - extend the oracle with evidence/model queries once the driver needs witnesses
 - extend CLI checking beyond the current `--simple-check` subset
 - replace temporary `max_step` loop bounding with loop summaries / invariants
-- extend LLVM adapter coverage beyond the current scalar/integer subset
+- extend LLVM adapter coverage beyond the current scalar/integer/integer-memory subset
 - connect actual call lowering to the implemented summary-rule interfaces

@@ -36,6 +36,10 @@ FunctionGraph
 - summary facts live in `summaries.rs`
 - `transfer.rs` interprets only normalized effects:
   - `Assign`
+  - `Alloca`
+  - `GetElementPtr`
+  - `Load`
+  - `Store`
   - `Assume`
   - `Obligation`
   - `Call`
@@ -43,6 +47,7 @@ FunctionGraph
   obligation independently against the current path formula
 - repeated loop traversals are cut off by the temporary per-edge `max_step`
   budget in `driver.rs`
+- impure calls havoc the currently tracked integer-array memory regions
 - evidence/model queries still do not exist yet in the active flow
 
 ## Current Rule API
@@ -83,7 +88,9 @@ driver:
 
 - it supports one procedure at a time
 - it bounds loop exploration by per-edge `max_step`
-- it rejects calls
+- it supports local integer-array memory
+- it treats calls conservatively: unconstrained returns plus memory havoc unless
+  the callee is inferred memory-pure
 - it uses `transfer.rs` plus SMT feasibility checks to explore concrete branch
   paths
 

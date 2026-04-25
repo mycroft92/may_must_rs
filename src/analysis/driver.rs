@@ -17,14 +17,16 @@
 
 use crate::analysis::cfg::{CfgEdge, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::Formula;
-use crate::analysis::llvm_adapter::{adapt_function_graph, AdaptedProcedure, AdapterError};
+use crate::analysis::llvm_adapter::{
+    adapt_function_graph, adapt_function_graph_with_purity, AdaptedProcedure, AdapterError,
+};
 use crate::analysis::oracle::{Feasibility, Oracle, OracleError};
 use crate::analysis::rules::QueryJudgement;
 use crate::analysis::state::NodeState;
 use crate::analysis::transfer::{apply_effects, TransferEffect, TransferError};
 use crate::llvm_utils::program_graph::FunctionGraph;
 use log::{debug, log_enabled, Level};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use thiserror::Error;
 
@@ -150,6 +152,15 @@ pub fn analyze_function_graph_simple_with_options(
     options: SimpleDriverOptions,
 ) -> Result<SimpleProcedureReport, DriverError> {
     let adapted = adapt_function_graph(graph)?;
+    analyze_adapted_procedure_simple_with_options(&graph.name, &adapted, options)
+}
+
+pub fn analyze_function_graph_simple_with_purity(
+    graph: &FunctionGraph,
+    memory_pure_functions: &BTreeSet<String>,
+    options: SimpleDriverOptions,
+) -> Result<SimpleProcedureReport, DriverError> {
+    let adapted = adapt_function_graph_with_purity(graph, memory_pure_functions)?;
     analyze_adapted_procedure_simple_with_options(&graph.name, &adapted, options)
 }
 
@@ -442,10 +453,11 @@ impl<'a> SimpleExplorer<'a> {
         }
         debug!(
             target: TRACE_TARGET,
-            "path {path_id} {location}: generated={}; path_summary={}; facts={}; obligations={}; feasibility={:?}",
+            "path {path_id} {location}: generated={}; path_summary={}; facts={}; memory={}; obligations={}; feasibility={:?}",
             format_generated(generated),
             state.path_summary().as_formula(),
             state.facts().collapse(),
+            state.memory_summary(),
             state.obligations().collapse(),
             feasibility
         );
@@ -467,13 +479,14 @@ impl<'a> SimpleExplorer<'a> {
         }
         debug!(
             target: TRACE_TARGET,
-            "path {path_id} loop edge {} ({} -> {}) iteration {}: generated={}; formula={}; obligations={}; feasibility={:?}",
+            "path {path_id} loop edge {} ({} -> {}) iteration {}: generated={}; formula={}; memory={}; obligations={}; feasibility={:?}",
             edge.id.0,
             source_label,
             target_label,
             visit_count,
             format_generated(generated),
             state.feasibility_formula(),
+            state.memory_summary(),
             state.obligations().collapse(),
             feasibility
         );
@@ -508,12 +521,13 @@ impl<'a> SimpleExplorer<'a> {
         }
         debug!(
             target: TRACE_TARGET,
-            "path {path_id} max_step cutoff on edge {} ({} -> {}): max_step={}; formula={}; obligations={}",
+            "path {path_id} max_step cutoff on edge {} ({} -> {}): max_step={}; formula={}; memory={}; obligations={}",
             edge.id.0,
             self.node_label(edge.source)?,
             self.node_label(edge.target)?,
             self.options.max_step,
             state.feasibility_formula(),
+            state.memory_summary(),
             state.obligations().collapse()
         );
         Ok(())
@@ -525,8 +539,9 @@ impl<'a> SimpleExplorer<'a> {
         }
         debug!(
             target: TRACE_TARGET,
-            "path {path_id} complete: formula={}; obligations={}",
+            "path {path_id} complete: formula={}; memory={}; obligations={}",
             state.feasibility_formula(),
+            state.memory_summary(),
             state.obligations().collapse()
         );
     }
@@ -550,7 +565,12 @@ fn effect_predicates(effects: &[TransferEffect]) -> Vec<Formula> {
             TransferEffect::Assume(formula) | TransferEffect::Obligation(formula) => {
                 predicates.push(formula.clone());
             }
-            TransferEffect::Nop | TransferEffect::Call { .. } => {}
+            TransferEffect::Alloca { .. }
+            | TransferEffect::GetElementPtr { .. }
+            | TransferEffect::Load { .. }
+            | TransferEffect::Store { .. }
+            | TransferEffect::Nop
+            | TransferEffect::Call { .. } => {}
         }
     }
     predicates
@@ -603,6 +623,20 @@ mod tests {
 
     fn analyze_first(ir: &str) -> SimpleProcedureReport {
         analyze_first_with_options(ir, SimpleDriverOptions::default())
+    }
+
+    fn analyze_named_with_options(
+        ir: &str,
+        name: &str,
+        options: SimpleDriverOptions,
+    ) -> SimpleProcedureReport {
+        initialize_target();
+        let context = Context::new();
+        let module = context.parse_ir_str(ir, "driver_test").unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        let pure = crate::analysis::llvm_adapter::infer_memory_pure_functions(&graphs);
+        let graph = graphs.iter().find(|graph| graph.name == name).unwrap();
+        analyze_function_graph_simple_with_purity(graph, &pure, options).unwrap()
     }
 
     #[test]
@@ -679,6 +713,89 @@ mod tests {
         );
         assert_eq!(report.judgement, QueryJudgement::Yes);
         assert_eq!(report.feasible_obligations, 1);
+    }
+
+    #[test]
+    fn memory_load_store_assertion_is_reported_safe() {
+        let report = analyze_first(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @main() {
+                entry:
+                    %ptr = alloca i32
+                    store i32 7, ptr %ptr
+                    %value = load i32, ptr %ptr
+                    %ok = icmp eq i32 %value, 7
+                    call void @may_assert(i1 %ok)
+                    ret i32 %value
+                }
+            "#,
+        );
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert_eq!(report.feasible_obligations, 0);
+    }
+
+    #[test]
+    fn impure_call_havoc_can_make_memory_assertion_fail() {
+        let report = analyze_named_with_options(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @touch(ptr %p) {
+                entry:
+                    store i32 1, ptr %p
+                    ret void
+                }
+
+                define void @main() {
+                entry:
+                    %ptr = alloca i32
+                    store i32 7, ptr %ptr
+                    call void @touch(ptr %ptr)
+                    %value = load i32, ptr %ptr
+                    %ok = icmp eq i32 %value, 7
+                    call void @may_assert(i1 %ok)
+                    ret void
+                }
+            "#,
+            "main",
+            SimpleDriverOptions::default(),
+        );
+        assert_eq!(report.judgement, QueryJudgement::Yes);
+        assert_eq!(report.feasible_obligations, 1);
+    }
+
+    #[test]
+    fn memory_pure_call_does_not_havoc_caller_memory() {
+        let report = analyze_named_with_options(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @helper() {
+                entry:
+                    %ptr = alloca i32
+                    store i32 1, ptr %ptr
+                    %tmp = load i32, ptr %ptr
+                    ret void
+                }
+
+                define void @main() {
+                entry:
+                    %ptr = alloca i32
+                    store i32 7, ptr %ptr
+                    call void @helper()
+                    %value = load i32, ptr %ptr
+                    %ok = icmp eq i32 %value, 7
+                    call void @may_assert(i1 %ok)
+                    ret void
+                }
+            "#,
+            "main",
+            SimpleDriverOptions::default(),
+        );
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert_eq!(report.feasible_obligations, 0);
     }
 
     #[test]

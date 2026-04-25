@@ -5,7 +5,7 @@
 //! It does not perform solver reasoning or transfer semantics by itself.
 
 use crate::analysis::cfg::{CfgEdgeId, CfgNodeId};
-use crate::analysis::formula::Formula;
+use crate::analysis::formula::{Formula, Memory, Term, Var};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,10 +86,36 @@ impl Obligations {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PointerValue {
+    region: String,
+    offset: Term,
+}
+
+impl PointerValue {
+    pub fn new(region: impl Into<String>, offset: Term) -> Self {
+        Self {
+            region: region.into(),
+            offset,
+        }
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub fn offset(&self) -> &Term {
+        &self.offset
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeState {
     path_summary: PathSummary,
     facts: TrackedFacts,
     obligations: Obligations,
+    memory_regions: BTreeMap<String, Memory>,
+    pointers: BTreeMap<String, PointerValue>,
+    memory_epoch: usize,
 }
 
 impl NodeState {
@@ -98,6 +124,9 @@ impl NodeState {
             path_summary: PathSummary::reachable(),
             facts: TrackedFacts::default(),
             obligations: Obligations::default(),
+            memory_regions: BTreeMap::new(),
+            pointers: BTreeMap::new(),
+            memory_epoch: 0,
         }
     }
 
@@ -106,6 +135,9 @@ impl NodeState {
             path_summary: PathSummary::unreachable(),
             facts: TrackedFacts::default(),
             obligations: Obligations::default(),
+            memory_regions: BTreeMap::new(),
+            pointers: BTreeMap::new(),
+            memory_epoch: 0,
         }
     }
 
@@ -137,12 +169,109 @@ impl NodeState {
         self.obligations.clear();
     }
 
+    pub fn bind_alloca_pointer(&mut self, target: impl Into<String>, region: impl Into<String>) {
+        let target = target.into();
+        let region = region.into();
+        self.ensure_region(&region);
+        self.pointers
+            .insert(target, PointerValue::new(region, Term::int(0)));
+    }
+
+    pub fn bind_pointer_offset(
+        &mut self,
+        target: impl Into<String>,
+        base: &str,
+        offset: Term,
+    ) -> PointerValue {
+        let target = target.into();
+        let base_pointer = self.resolve_pointer(base);
+        let offset = if base_pointer.offset() == &Term::int(0) {
+            offset
+        } else {
+            Term::add(base_pointer.offset().clone(), offset)
+        };
+        let resolved = PointerValue::new(base_pointer.region().to_string(), offset);
+        self.pointers.insert(target, resolved.clone());
+        resolved
+    }
+
+    pub fn load_from_pointer(&mut self, target: &Var, source: &str) {
+        let pointer = self.resolve_pointer(source);
+        let memory = self.current_memory(pointer.region()).clone();
+        self.facts_mut().push(Formula::eq(
+            Term::Var(target.clone()),
+            Term::select(memory, pointer.offset().clone()),
+        ));
+    }
+
+    pub fn store_to_pointer(&mut self, target: &str, value: Term) {
+        let pointer = self.resolve_pointer(target);
+        let next_memory = Memory::store(
+            self.current_memory(pointer.region()).clone(),
+            pointer.offset().clone(),
+            value,
+        );
+        self.memory_regions
+            .insert(pointer.region().to_string(), next_memory);
+    }
+
+    pub fn havoc_memory(&mut self) {
+        self.memory_epoch += 1;
+        let regions = self.memory_regions.keys().cloned().collect::<Vec<_>>();
+        for region in regions {
+            self.memory_regions
+                .insert(region.clone(), Memory::var(self.memory_symbol(&region)));
+        }
+    }
+
+    pub fn memory_summary(&self) -> String {
+        if self.memory_regions.is_empty() {
+            "[]".to_string()
+        } else {
+            let parts = self
+                .memory_regions
+                .iter()
+                .map(|(region, memory)| format!("{region}={memory}"))
+                .collect::<Vec<_>>();
+            format!("[{}]", parts.join(", "))
+        }
+    }
+
     pub fn feasibility_formula(&self) -> Formula {
         Formula::and_all([self.path_summary.as_formula(), self.facts.collapse()])
     }
 
     pub fn obligation_query_formula(&self) -> Formula {
         Formula::and_all([self.feasibility_formula(), self.obligations.collapse()])
+    }
+
+    fn resolve_pointer(&mut self, name: &str) -> PointerValue {
+        if let Some(pointer) = self.pointers.get(name) {
+            return pointer.clone();
+        }
+        let region = format!("{name}$region");
+        self.ensure_region(&region);
+        let pointer = PointerValue::new(region, Term::int(0));
+        self.pointers.insert(name.to_string(), pointer.clone());
+        pointer
+    }
+
+    fn ensure_region(&mut self, region: &str) {
+        if self.memory_regions.contains_key(region) {
+            return;
+        }
+        self.memory_regions
+            .insert(region.to_string(), Memory::var(self.memory_symbol(region)));
+    }
+
+    fn current_memory(&self, region: &str) -> &Memory {
+        self.memory_regions
+            .get(region)
+            .expect("memory region should exist before use")
+    }
+
+    fn memory_symbol(&self, region: &str) -> String {
+        format!("{region}$mem{}", self.memory_epoch)
     }
 }
 
@@ -197,7 +326,7 @@ impl AnalysisState {
 mod tests {
     use super::*;
     use crate::analysis::cfg::{CfgEdgeId, CfgNodeId};
-    use crate::analysis::formula::{Term, Var};
+    use crate::analysis::formula::{Memory, Term, Var};
 
     #[test]
     fn path_summary_refinement_conjoins_guards() {
@@ -278,6 +407,38 @@ mod tests {
                 Formula::eq(Term::Var(Var::int("x")), Term::int(3)),
                 Formula::not(Formula::bool_var("assert_ok")),
             ])
+        );
+    }
+
+    #[test]
+    fn memory_regions_are_updated_and_havoced() {
+        let mut state = NodeState::entry();
+        state.bind_alloca_pointer("%ptr", "stack.ptr");
+        state.store_to_pointer("%ptr", Term::int(7));
+        state.load_from_pointer(&Var::int("%x"), "%ptr");
+
+        assert_eq!(
+            state.facts().collapse(),
+            Formula::eq(
+                Term::Var(Var::int("%x")),
+                Term::select(
+                    Memory::store(Memory::var("stack.ptr$mem0"), Term::int(0), Term::int(7),),
+                    Term::int(0),
+                ),
+            )
+        );
+
+        state.havoc_memory();
+        assert_eq!(state.memory_summary(), "[stack.ptr=stack.ptr$mem1]");
+    }
+
+    #[test]
+    fn unknown_pointer_sources_are_treated_as_external_regions() {
+        let mut state = NodeState::entry();
+        state.store_to_pointer("%arg", Term::int(3));
+        assert_eq!(
+            state.memory_summary(),
+            "[%arg$region=(store %arg$region$mem0 0 3)]"
         );
     }
 

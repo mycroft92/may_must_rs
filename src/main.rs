@@ -82,6 +82,8 @@ fn handle(
     match generate_program_graph(&module) {
         Ok(graphs) => {
             let mut summaries = Vec::<ProcedureSummary>::new();
+            let memory_pure_functions =
+                analysis::llvm_adapter::infer_memory_pure_functions(&graphs);
             if dump_dot {
                 let out_dir = graph_output_dir(input_file);
                 dump_graphs(&graphs, &out_dir);
@@ -95,8 +97,9 @@ fn handle(
                     graph.asserts.len()
                 );
                 if simple_check {
-                    match analysis::driver::analyze_function_graph_simple_with_options(
+                    match analysis::driver::analyze_function_graph_simple_with_purity(
                         graph,
+                        &memory_pure_functions,
                         options.clone(),
                     ) {
                         Ok(report) => summaries.push(ProcedureSummary::Checked(report)),

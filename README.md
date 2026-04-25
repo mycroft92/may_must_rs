@@ -11,6 +11,8 @@ Implemented and CLI-active:
 - DOT graph dumping
 - fixture compilation under `tests/flow/`
 - `--simple-check` for the current bounded single-procedure checker
+- integer-array memory modeling for `alloca` / `load` / `store` / `gep`
+- conservative call handling with memory-preserving vs memory-havocing callees
 
 Implemented but not wired:
 
@@ -106,13 +108,18 @@ Those per-procedure summaries include:
 With `--trace-predicates`, the checker emits debug logs on the dedicated
 `analysis_trace` target for generated formulas after each ordinary node/edge
 step. Repeated loop traversals are summarized once per loop edge visit instead
-of dumping every repeated internal step.
+of dumping every repeated internal step. Those debug lines also show the
+current per-region memory arrays after each step.
 
 That checker is intentionally limited:
 
 - loops use a temporary per-edge `max_step` cutoff and return `Unknown` when a
   path is cut off by that budget
-- calls are still unsupported
+- call results are conservative and summary-free: scalar returns stay
+  unconstrained, and memory is havoced unless the callee is inferred to be
+  memory-pure
+- memory is modeled only as integer arrays; floating-point memory and pointer
+  phis are still outside the active subset
 - some C loop fixtures still lower to memory-heavy or intrinsic forms that are
   outside the current transfer subset, so bounded-loop behavior is covered most
   directly by the `analysis::driver` unit tests today
@@ -138,13 +145,16 @@ src/smt/solver.rs               -> raw Z3 lowering
 Key boundaries:
 
 - `cfg.rs` stores only edge-local guards/relations.
-- accumulated path predicates belong in `state.rs`.
+- accumulated path predicates and current per-region memory arrays belong in
+  `state.rs`.
 - `oracle.rs` is the only paper module that answers solver-backed feasibility
   and implication queries.
 - `rules.rs` keeps the rule names and premises close to the paper instead of
   hiding them behind a generic engine.
 - `transfer.rs` interprets normalized effects produced by `llvm_adapter.rs`.
 - `llvm_adapter.rs` lowers one procedure into `cfg + node_effects + edge_effects`.
+- local memory is modeled as integer arrays, and impure calls havoc those
+  arrays conservatively.
 - `may_assert` becomes an obligation, not a summarized call edge.
 - multi-exit procedures are normalized to one synthetic exit with trivial
   `true` edges from the real exits.

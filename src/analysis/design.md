@@ -11,6 +11,7 @@ The active codebase has been reconstructed to the pre-driver milestone:
   - C fixture compilation under `tests/flow/`
   - `--simple-check` for the current bounded single-procedure checker
   - temporary `max_step` loop bounding in `analysis::driver`
+  - integer-array memory modeling and conservative call-memory havoc
 - implemented but not wired:
   - assertion-to-formula translation
   - paper formula language
@@ -58,12 +59,16 @@ raw solver layer               -> src/smt/solver.rs
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
   most `max_step` times on one explored path; budget exhaustion yields
   `Unknown`.
+- `state.rs` also carries current pointer bindings and per-region memory arrays
+  for the active executable slice.
 - `transfer.rs` consumes normalized effects from `llvm_adapter.rs`; it does not
   inspect raw LLVM instructions.
 - `llvm_adapter.rs` lowers one procedure into:
   - `Cfg`
   - `node_effects`
   - `edge_effects`
+- the current memory model is intentionally narrow: integer arrays only,
+  pointer phis unsupported, and impure calls havoc all tracked regions.
 - `may_assert` is lowered as an obligation, not as a call summary.
 - multi-exit procedures are normalized by creating one synthetic exit node and
   adding trivial `true` edges from each real exit to that node.
@@ -113,6 +118,8 @@ representation choices are deliberately minimal:
   not derive them themselves
 - the current `driver.rs` explores bounded paths directly instead of scheduling
   the paper rules
+- the current memory model is path-execution-oriented rather than a full paper
+  memory abstraction
 
 The main conservative check is the abstract path search used by `VERIFIED` and
 `CREATE_NOTMAYSUMMARY`:
