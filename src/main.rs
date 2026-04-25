@@ -17,6 +17,11 @@ use llvm_utils::llvm_wrap::{initialize_target, Context, Module};
 use llvm_utils::program_graph::{dump_graphs, generate_program_graph};
 use std::path::Path;
 
+enum ProcedureSummary {
+    Checked(analysis::driver::SimpleProcedureReport),
+    Unsupported { procedure: String, reason: String },
+}
+
 fn main() {
     Builder::from_env(Env::default().default_filter_or("info")).init();
     initialize_target();
@@ -42,6 +47,7 @@ fn main() {
 fn handle(module: Module, input_file: &str, dump_dot: bool, simple_check: bool) {
     match generate_program_graph(&module) {
         Ok(graphs) => {
+            let mut summaries = Vec::<ProcedureSummary>::new();
             if dump_dot {
                 let out_dir = graph_output_dir(input_file);
                 dump_graphs(&graphs, &out_dir);
@@ -56,19 +62,30 @@ fn handle(module: Module, input_file: &str, dump_dot: bool, simple_check: bool) 
                 );
                 if simple_check {
                     match analysis::driver::analyze_function_graph_simple(graph) {
-                        Ok(report) => println!(
-                            "  simple-check: {:?} (paths={}, pruned={}, obligations={}, feasible={})",
-                            report.judgement,
-                            report.explored_paths,
-                            report.pruned_paths,
-                            report.checked_obligations,
-                            report.feasible_obligations
-                        ),
-                        Err(error) => println!("  simple-check: unsupported ({error})"),
+                        Ok(report) => summaries.push(ProcedureSummary::Checked(report)),
+                        Err(error) => summaries.push(ProcedureSummary::Unsupported {
+                            procedure: graph.name.clone(),
+                            reason: error.to_string(),
+                        }),
                     }
                 }
             }
-            if !simple_check {
+            if simple_check {
+                println!();
+                println!("Simple-check summaries:");
+                for summary in summaries {
+                    match summary {
+                        ProcedureSummary::Checked(report) => {
+                            println!("{report}");
+                        }
+                        ProcedureSummary::Unsupported { procedure, reason } => {
+                            println!("procedure {procedure}");
+                            println!("  unsupported: {reason}");
+                        }
+                    }
+                    println!();
+                }
+            } else {
                 println!(
                     "Paper CFG/transfer lowering is implemented; use --simple-check for the current acyclic branch checker."
                 );
@@ -87,4 +104,26 @@ fn graph_output_dir(input_file: &str) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("graph");
     format!("graph_dot/{stem}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_summary_uses_driver_display() {
+        let rendered = format!(
+            "{}",
+            analysis::driver::SimpleProcedureReport {
+                procedure: "subject".to_string(),
+                judgement: analysis::rules::QueryJudgement::No,
+                explored_paths: 1,
+                pruned_paths: 0,
+                checked_obligations: 1,
+                feasible_obligations: 0,
+            }
+        );
+        assert!(rendered.contains("procedure subject"));
+        assert!(rendered.contains("judgement: No"));
+    }
 }

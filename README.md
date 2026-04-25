@@ -79,7 +79,17 @@ The binary currently stops at LLVM graph generation. It:
 - prints a small per-function summary
 
 With `--simple-check`, the CLI also runs the current acyclic single-procedure
-checker over each function and prints `Yes` / `No` / `Unknown` style results.
+checker over each function and prints one clean summary block per procedure
+after the run.
+
+Those per-procedure summaries include:
+
+- final judgement
+- explored path count
+- pruned path count
+- checked obligation count
+- feasible obligation count
+
 That checker is intentionally limited:
 
 - loops are rejected as unsupported

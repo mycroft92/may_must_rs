@@ -23,6 +23,7 @@ use crate::analysis::state::NodeState;
 use crate::analysis::transfer::{apply_effects, TransferError};
 use crate::llvm_utils::program_graph::FunctionGraph;
 use std::collections::BTreeSet;
+use std::fmt;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +34,17 @@ pub struct SimpleProcedureReport {
     pub pruned_paths: usize,
     pub checked_obligations: usize,
     pub feasible_obligations: usize,
+}
+
+impl fmt::Display for SimpleProcedureReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "procedure {}", self.procedure)?;
+        writeln!(f, "  judgement: {:?}", self.judgement)?;
+        writeln!(f, "  explored paths: {}", self.explored_paths)?;
+        writeln!(f, "  pruned paths: {}", self.pruned_paths)?;
+        writeln!(f, "  obligations checked: {}", self.checked_obligations)?;
+        write!(f, "  feasible obligations: {}", self.feasible_obligations)
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -307,5 +319,22 @@ mod tests {
         );
         assert_eq!(report.judgement, QueryJudgement::Yes);
         assert_eq!(report.feasible_obligations, 1);
+    }
+
+    #[test]
+    fn report_display_is_stable_and_readable() {
+        let report = SimpleProcedureReport {
+            procedure: "subject".to_string(),
+            judgement: QueryJudgement::No,
+            explored_paths: 2,
+            pruned_paths: 1,
+            checked_obligations: 3,
+            feasible_obligations: 0,
+        };
+
+        assert_eq!(
+            report.to_string(),
+            "procedure subject\n  judgement: No\n  explored paths: 2\n  pruned paths: 1\n  obligations checked: 3\n  feasible obligations: 0"
+        );
     }
 }
