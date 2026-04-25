@@ -1,37 +1,59 @@
 //! Minimal intraprocedural driver for the current milestone.
 //!
 //! This driver is intentionally narrow. It handles one lowered procedure at a
-//! time, explores acyclic branch paths, applies normalized transfer effects,
-//! and uses the SMT oracle to decide whether embedded `may_assert` obligations
-//! are feasible.
+//! time, explores branch paths under a temporary `max_step` loop budget,
+//! applies normalized transfer effects, and uses the SMT oracle to decide
+//! whether embedded `may_assert` obligations are feasible.
 //!
 //! It is not yet the full paper scheduler:
 //!
-//! - no loop handling beyond rejecting cyclic paths
+//! - loop handling is temporary and bounded by `max_step`
 //! - no interprocedural summaries
 //! - no automatic `β` / `θ` generation for the named rule layer
 //!
 //! The purpose is to wire the existing lowering/oracle/transfer pieces into one
-//! honest end-to-end slice for straightline and branchy single-procedure code.
+//! honest end-to-end slice for straightline, branchy, and bounded-loop
+//! single-procedure code.
 
-use crate::analysis::cfg::CfgNodeId;
+use crate::analysis::cfg::{CfgEdge, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::Formula;
 use crate::analysis::llvm_adapter::{adapt_function_graph, AdaptedProcedure, AdapterError};
 use crate::analysis::oracle::{Feasibility, Oracle, OracleError};
 use crate::analysis::rules::QueryJudgement;
 use crate::analysis::state::NodeState;
-use crate::analysis::transfer::{apply_effects, TransferError};
+use crate::analysis::transfer::{apply_effects, TransferEffect, TransferError};
 use crate::llvm_utils::program_graph::FunctionGraph;
-use std::collections::BTreeSet;
+use log::{debug, log_enabled, Level};
+use std::collections::BTreeMap;
 use std::fmt;
 use thiserror::Error;
+
+pub const TRACE_TARGET: &str = "analysis_trace";
+pub const DEFAULT_MAX_STEP: usize = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimpleDriverOptions {
+    pub max_step: usize,
+    pub trace_predicates: bool,
+}
+
+impl Default for SimpleDriverOptions {
+    fn default() -> Self {
+        Self {
+            max_step: DEFAULT_MAX_STEP,
+            trace_predicates: false,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleProcedureReport {
     pub procedure: String,
     pub judgement: QueryJudgement,
+    pub max_step: usize,
     pub explored_paths: usize,
     pub pruned_paths: usize,
+    pub bounded_paths: usize,
     pub checked_obligations: usize,
     pub feasible_obligations: usize,
 }
@@ -40,10 +62,64 @@ impl fmt::Display for SimpleProcedureReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "procedure {}", self.procedure)?;
         writeln!(f, "  judgement: {:?}", self.judgement)?;
+        writeln!(f, "  max step: {}", self.max_step)?;
         writeln!(f, "  explored paths: {}", self.explored_paths)?;
         writeln!(f, "  pruned paths: {}", self.pruned_paths)?;
+        writeln!(f, "  bounded paths: {}", self.bounded_paths)?;
         writeln!(f, "  obligations checked: {}", self.checked_obligations)?;
         write!(f, "  feasible obligations: {}", self.feasible_obligations)
+    }
+}
+
+impl SimpleProcedureReport {
+    pub fn summary_only(
+        procedure: impl Into<String>,
+        judgement: QueryJudgement,
+        max_step: usize,
+        explored_paths: usize,
+        pruned_paths: usize,
+        bounded_paths: usize,
+        checked_obligations: usize,
+        feasible_obligations: usize,
+    ) -> Self {
+        Self {
+            procedure: procedure.into(),
+            judgement,
+            max_step,
+            explored_paths,
+            pruned_paths,
+            bounded_paths,
+            checked_obligations,
+            feasible_obligations,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PathContext {
+    active_nodes: BTreeMap<CfgNodeId, usize>,
+    edge_visits: BTreeMap<CfgEdgeId, usize>,
+}
+
+impl PathContext {
+    fn enter_node(&self, node: CfgNodeId) -> Self {
+        let mut next = self.clone();
+        *next.active_nodes.entry(node).or_default() += 1;
+        next
+    }
+
+    fn active_node_count(&self, node: CfgNodeId) -> usize {
+        self.active_nodes.get(&node).copied().unwrap_or(0)
+    }
+
+    fn increment_edge_visit(&self, edge: CfgEdgeId) -> Self {
+        let mut next = self.clone();
+        *next.edge_visits.entry(edge).or_default() += 1;
+        next
+    }
+
+    fn edge_visit_count(&self, edge: CfgEdgeId) -> usize {
+        self.edge_visits.get(&edge).copied().unwrap_or(0)
     }
 }
 
@@ -55,8 +131,8 @@ pub enum DriverError {
     Oracle(#[from] OracleError),
     #[error(transparent)]
     Transfer(#[from] TransferError),
-    #[error("driver requires an acyclic procedure but found a cycle through {node:?}")]
-    LoopUnsupported { node: CfgNodeId },
+    #[error("max_step must be at least 1 but found {max_step}")]
+    InvalidMaxStep { max_step: usize },
     #[error("unknown CFG node {node:?}")]
     UnknownNode { node: CfgNodeId },
     #[error("missing CFG edge {edge}")]
@@ -66,16 +142,40 @@ pub enum DriverError {
 pub fn analyze_function_graph_simple(
     graph: &FunctionGraph,
 ) -> Result<SimpleProcedureReport, DriverError> {
+    analyze_function_graph_simple_with_options(graph, SimpleDriverOptions::default())
+}
+
+pub fn analyze_function_graph_simple_with_options(
+    graph: &FunctionGraph,
+    options: SimpleDriverOptions,
+) -> Result<SimpleProcedureReport, DriverError> {
     let adapted = adapt_function_graph(graph)?;
-    analyze_adapted_procedure_simple(&graph.name, &adapted)
+    analyze_adapted_procedure_simple_with_options(&graph.name, &adapted, options)
 }
 
 pub fn analyze_adapted_procedure_simple(
     procedure: &str,
     adapted: &AdaptedProcedure,
 ) -> Result<SimpleProcedureReport, DriverError> {
+    analyze_adapted_procedure_simple_with_options(
+        procedure,
+        adapted,
+        SimpleDriverOptions::default(),
+    )
+}
+
+pub fn analyze_adapted_procedure_simple_with_options(
+    procedure: &str,
+    adapted: &AdaptedProcedure,
+    options: SimpleDriverOptions,
+) -> Result<SimpleProcedureReport, DriverError> {
+    if options.max_step == 0 {
+        return Err(DriverError::InvalidMaxStep {
+            max_step: options.max_step,
+        });
+    }
     let oracle = Oracle::new();
-    let mut explorer = SimpleExplorer::new(procedure, adapted, &oracle);
+    let mut explorer = SimpleExplorer::new(procedure, adapted, &oracle, options);
     explorer.explore_entry()?;
     Ok(explorer.finish())
 }
@@ -84,24 +184,35 @@ struct SimpleExplorer<'a> {
     procedure: &'a str,
     adapted: &'a AdaptedProcedure,
     oracle: &'a Oracle,
+    options: SimpleDriverOptions,
     explored_paths: usize,
     pruned_paths: usize,
+    bounded_paths: usize,
     checked_obligations: usize,
     feasible_obligations: usize,
     unknown_seen: bool,
+    next_path_id: usize,
 }
 
 impl<'a> SimpleExplorer<'a> {
-    fn new(procedure: &'a str, adapted: &'a AdaptedProcedure, oracle: &'a Oracle) -> Self {
+    fn new(
+        procedure: &'a str,
+        adapted: &'a AdaptedProcedure,
+        oracle: &'a Oracle,
+        options: SimpleDriverOptions,
+    ) -> Self {
         Self {
             procedure,
             adapted,
             oracle,
+            options,
             explored_paths: 0,
             pruned_paths: 0,
+            bounded_paths: 0,
             checked_obligations: 0,
             feasible_obligations: 0,
             unknown_seen: false,
+            next_path_id: 1,
         }
     }
 
@@ -116,8 +227,10 @@ impl<'a> SimpleExplorer<'a> {
         SimpleProcedureReport {
             procedure: self.procedure.to_string(),
             judgement,
+            max_step: self.options.max_step,
             explored_paths: self.explored_paths,
             pruned_paths: self.pruned_paths,
+            bounded_paths: self.bounded_paths,
             checked_obligations: self.checked_obligations,
             feasible_obligations: self.feasible_obligations,
         }
@@ -125,41 +238,56 @@ impl<'a> SimpleExplorer<'a> {
 
     fn explore_entry(&mut self) -> Result<(), DriverError> {
         let entry = self.adapted.cfg.entry();
-        let mut active = BTreeSet::new();
-        self.explore_node(entry, NodeState::entry(), &mut active)
+        let path_id = self.allocate_path_id();
+        self.explore_node(entry, NodeState::entry(), PathContext::default(), path_id)
     }
 
     fn explore_node(
         &mut self,
         node: CfgNodeId,
         mut state: NodeState,
-        active: &mut BTreeSet<CfgNodeId>,
+        context: PathContext,
+        path_id: usize,
     ) -> Result<(), DriverError> {
-        if !active.insert(node) {
-            return Err(DriverError::LoopUnsupported { node });
-        }
+        let context = context.enter_node(node);
+        let node_label = self.node_label(node)?;
+        let repeated_node = context.active_node_count(node) > 1;
 
         if let Some(effects) = self.adapted.node_effects.get(&node) {
             apply_effects(&mut state, effects)?;
         }
 
-        match self.oracle.state_feasibility(&state)? {
+        let node_generated = self
+            .adapted
+            .node_effects
+            .get(&node)
+            .map(|effects| effect_predicates(effects))
+            .unwrap_or_default();
+        let node_feasibility = self.oracle.state_feasibility(&state)?;
+        if !repeated_node {
+            self.debug_state_step(
+                path_id,
+                &format!("node {node_label}"),
+                &node_generated,
+                &state,
+                node_feasibility,
+            );
+        }
+
+        match node_feasibility {
             Feasibility::Feasible => {}
             Feasibility::Infeasible => {
                 self.pruned_paths += 1;
-                active.remove(&node);
                 return Ok(());
             }
             Feasibility::Unknown => {
                 self.unknown_seen = true;
-                active.remove(&node);
                 return Ok(());
             }
         }
 
-        self.check_obligations(&mut state)?;
+        self.check_obligations(node, &mut state, path_id)?;
         if self.feasible_obligations > 0 {
-            active.remove(&node);
             return Ok(());
         }
 
@@ -170,11 +298,12 @@ impl<'a> SimpleExplorer<'a> {
             .map_err(|_| DriverError::UnknownNode { node })?;
         if outgoing.is_empty() {
             self.explored_paths += 1;
-            active.remove(&node);
+            self.debug_path_completion(path_id, &state);
             return Ok(());
         }
 
-        for edge_id in outgoing {
+        let edge_count = outgoing.len();
+        for (edge_index, edge_id) in outgoing.into_iter().enumerate() {
             if self.feasible_obligations > 0 {
                 break;
             }
@@ -183,15 +312,60 @@ impl<'a> SimpleExplorer<'a> {
                 .cfg
                 .edge(edge_id)
                 .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+            let branch_path_id = if edge_count > 1 && edge_index > 0 {
+                self.allocate_path_id()
+            } else {
+                path_id
+            };
+
+            if context.edge_visit_count(edge_id) >= self.options.max_step {
+                // APPROX_HEAVY: bounded loop handling cuts off any path whose
+                // next step would exceed the temporary edge-visit budget.
+                self.bounded_paths += 1;
+                self.unknown_seen = true;
+                self.debug_bound_cutoff(branch_path_id, edge, &state)?;
+                continue;
+            }
+
             let mut next_state = state.clone();
             next_state.path_summary_mut().refine(edge.relation.clone());
             if let Some(effects) = self.adapted.edge_effects.get(&edge_id) {
                 apply_effects(&mut next_state, effects)?;
             }
 
-            match self.oracle.state_feasibility(&next_state)? {
+            let next_context = context.increment_edge_visit(edge_id);
+            let visit_count = next_context.edge_visit_count(edge_id);
+            let edge_feasibility = self.oracle.state_feasibility(&next_state)?;
+            let target_label = self.node_label(edge.target)?;
+            let generated = edge_predicates(
+                edge.relation.clone(),
+                self.adapted.edge_effects.get(&edge_id),
+            );
+
+            if context.active_node_count(edge.target) > 0 || visit_count > 1 {
+                self.debug_loop_iteration(
+                    branch_path_id,
+                    edge,
+                    &node_label,
+                    &target_label,
+                    visit_count,
+                    &generated,
+                    &next_state,
+                    edge_feasibility,
+                );
+            } else {
+                self.debug_state_step(
+                    branch_path_id,
+                    &format!("edge {} -> {}", node_label, target_label),
+                    &generated,
+                    &next_state,
+                    edge_feasibility,
+                );
+            }
+
+            match edge_feasibility {
                 Feasibility::Feasible => {
-                    self.explore_node(edge.target, next_state, active)?;
+                    self.explore_node(edge.target, next_state, next_context, branch_path_id)?;
                 }
                 Feasibility::Infeasible => {
                     self.pruned_paths += 1;
@@ -202,23 +376,28 @@ impl<'a> SimpleExplorer<'a> {
             }
         }
 
-        active.remove(&node);
         Ok(())
     }
 
-    fn check_obligations(&mut self, state: &mut NodeState) -> Result<(), DriverError> {
+    fn check_obligations(
+        &mut self,
+        node: CfgNodeId,
+        state: &mut NodeState,
+        path_id: usize,
+    ) -> Result<(), DriverError> {
         let obligations = state.obligations().formulas().to_vec();
         if obligations.is_empty() {
             return Ok(());
         }
 
         let path_formula = state.feasibility_formula();
+        let node_label = self.node_label(node)?;
         for obligation in obligations {
             self.checked_obligations += 1;
-            match self
-                .oracle
-                .feasibility(&Formula::and(path_formula.clone(), obligation))?
-            {
+            let query = Formula::and(path_formula.clone(), obligation.clone());
+            let result = self.oracle.feasibility(&query)?;
+            self.debug_obligation_step(path_id, &node_label, &obligation, &query, result);
+            match result {
                 Feasibility::Feasible => {
                     self.feasible_obligations += 1;
                 }
@@ -231,6 +410,181 @@ impl<'a> SimpleExplorer<'a> {
         state.clear_obligations();
         Ok(())
     }
+
+    fn allocate_path_id(&mut self) -> usize {
+        let path_id = self.next_path_id;
+        self.next_path_id += 1;
+        path_id
+    }
+
+    fn node_label(&self, node: CfgNodeId) -> Result<String, DriverError> {
+        self.adapted
+            .cfg
+            .node(node)
+            .map(|node| normalize_label(&node.label))
+            .ok_or(DriverError::UnknownNode { node })
+    }
+
+    fn trace_enabled(&self) -> bool {
+        self.options.trace_predicates && log_enabled!(target: TRACE_TARGET, Level::Debug)
+    }
+
+    fn debug_state_step(
+        &self,
+        path_id: usize,
+        location: &str,
+        generated: &[Formula],
+        state: &NodeState,
+        feasibility: Feasibility,
+    ) {
+        if !self.trace_enabled() {
+            return;
+        }
+        debug!(
+            target: TRACE_TARGET,
+            "path {path_id} {location}: generated={}; path_summary={}; facts={}; obligations={}; feasibility={:?}",
+            format_generated(generated),
+            state.path_summary().as_formula(),
+            state.facts().collapse(),
+            state.obligations().collapse(),
+            feasibility
+        );
+    }
+
+    fn debug_loop_iteration(
+        &self,
+        path_id: usize,
+        edge: &CfgEdge,
+        source_label: &str,
+        target_label: &str,
+        visit_count: usize,
+        generated: &[Formula],
+        state: &NodeState,
+        feasibility: Feasibility,
+    ) {
+        if !self.trace_enabled() {
+            return;
+        }
+        debug!(
+            target: TRACE_TARGET,
+            "path {path_id} loop edge {} ({} -> {}) iteration {}: generated={}; formula={}; obligations={}; feasibility={:?}",
+            edge.id.0,
+            source_label,
+            target_label,
+            visit_count,
+            format_generated(generated),
+            state.feasibility_formula(),
+            state.obligations().collapse(),
+            feasibility
+        );
+    }
+
+    fn debug_obligation_step(
+        &self,
+        path_id: usize,
+        node_label: &str,
+        obligation: &Formula,
+        query: &Formula,
+        result: Feasibility,
+    ) {
+        if !self.trace_enabled() {
+            return;
+        }
+        debug!(
+            target: TRACE_TARGET,
+            "path {path_id} obligation at {node_label}: obligation={obligation}; check={query}; result={:?}",
+            result
+        );
+    }
+
+    fn debug_bound_cutoff(
+        &self,
+        path_id: usize,
+        edge: &CfgEdge,
+        state: &NodeState,
+    ) -> Result<(), DriverError> {
+        if !self.trace_enabled() {
+            return Ok(());
+        }
+        debug!(
+            target: TRACE_TARGET,
+            "path {path_id} max_step cutoff on edge {} ({} -> {}): max_step={}; formula={}; obligations={}",
+            edge.id.0,
+            self.node_label(edge.source)?,
+            self.node_label(edge.target)?,
+            self.options.max_step,
+            state.feasibility_formula(),
+            state.obligations().collapse()
+        );
+        Ok(())
+    }
+
+    fn debug_path_completion(&self, path_id: usize, state: &NodeState) {
+        if !self.trace_enabled() {
+            return;
+        }
+        debug!(
+            target: TRACE_TARGET,
+            "path {path_id} complete: formula={}; obligations={}",
+            state.feasibility_formula(),
+            state.obligations().collapse()
+        );
+    }
+}
+
+fn effect_predicates(effects: &[TransferEffect]) -> Vec<Formula> {
+    let mut predicates = Vec::new();
+    for effect in effects {
+        match effect {
+            TransferEffect::Assign { target, value } => match value {
+                crate::analysis::transfer::AssignValue::Term(term) => {
+                    predicates.push(Formula::eq(
+                        crate::analysis::formula::Term::Var(target.clone()),
+                        term.clone(),
+                    ));
+                }
+                crate::analysis::transfer::AssignValue::Predicate(formula) => {
+                    predicates.push(Formula::iff(Formula::Var(target.clone()), formula.clone()));
+                }
+            },
+            TransferEffect::Assume(formula) | TransferEffect::Obligation(formula) => {
+                predicates.push(formula.clone());
+            }
+            TransferEffect::Nop | TransferEffect::Call { .. } => {}
+        }
+    }
+    predicates
+}
+
+fn edge_predicates(relation: Formula, edge_effects: Option<&Vec<TransferEffect>>) -> Vec<Formula> {
+    let mut predicates = Vec::new();
+    if relation != Formula::True {
+        predicates.push(relation);
+    }
+    if let Some(effects) = edge_effects {
+        predicates.extend(effect_predicates(effects));
+    }
+    predicates
+}
+
+fn format_generated(formulas: &[Formula]) -> String {
+    if formulas.is_empty() {
+        "<none>".to_string()
+    } else {
+        join_formulas(formulas)
+    }
+}
+
+fn join_formulas(formulas: &[Formula]) -> String {
+    formulas
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn normalize_label(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -239,12 +593,16 @@ mod tests {
     use crate::llvm_utils::llvm_wrap::{initialize_target, Context};
     use crate::llvm_utils::program_graph::generate_program_graph;
 
-    fn analyze_first(ir: &str) -> SimpleProcedureReport {
+    fn analyze_first_with_options(ir: &str, options: SimpleDriverOptions) -> SimpleProcedureReport {
         initialize_target();
         let context = Context::new();
         let module = context.parse_ir_str(ir, "driver_test").unwrap();
         let graphs = generate_program_graph(&module).unwrap();
-        analyze_function_graph_simple(&graphs[0]).unwrap()
+        analyze_function_graph_simple_with_options(&graphs[0], options).unwrap()
+    }
+
+    fn analyze_first(ir: &str) -> SimpleProcedureReport {
+        analyze_first_with_options(ir, SimpleDriverOptions::default())
     }
 
     #[test]
@@ -265,6 +623,7 @@ mod tests {
         assert_eq!(report.judgement, QueryJudgement::No);
         assert_eq!(report.feasible_obligations, 0);
         assert_eq!(report.checked_obligations, 1);
+        assert_eq!(report.bounded_paths, 0);
     }
 
     #[test]
@@ -293,6 +652,7 @@ mod tests {
         assert_eq!(report.feasible_obligations, 0);
         assert_eq!(report.checked_obligations, 2);
         assert_eq!(report.explored_paths, 2);
+        assert_eq!(report.bounded_paths, 0);
     }
 
     #[test]
@@ -322,19 +682,102 @@ mod tests {
     }
 
     #[test]
+    fn loop_budget_exhaustion_is_reported_unknown() {
+        let report = analyze_first_with_options(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i1 %keep_looping) {
+                entry:
+                    br label %loop
+                loop:
+                    call void @may_assert(i1 true)
+                    br i1 %keep_looping, label %loop, label %exit
+                exit:
+                    ret void
+                }
+            "#,
+            SimpleDriverOptions {
+                max_step: 2,
+                trace_predicates: false,
+            },
+        );
+        assert_eq!(report.judgement, QueryJudgement::Unknown);
+        assert_eq!(report.bounded_paths, 1);
+        assert_eq!(report.feasible_obligations, 0);
+    }
+
+    #[test]
+    fn loop_body_violation_is_still_found_before_cutoff() {
+        let report = analyze_first_with_options(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i1 %keep_looping, i1 %bad) {
+                entry:
+                    br label %loop
+                loop:
+                    call void @may_assert(i1 %bad)
+                    br i1 %keep_looping, label %loop, label %exit
+                exit:
+                    ret void
+                }
+            "#,
+            SimpleDriverOptions {
+                max_step: 2,
+                trace_predicates: false,
+            },
+        );
+        assert_eq!(report.judgement, QueryJudgement::Yes);
+        assert_eq!(report.feasible_obligations, 1);
+    }
+
+    #[test]
+    fn zero_max_step_is_rejected() {
+        initialize_target();
+        let context = Context::new();
+        let module = context
+            .parse_ir_str(
+                r#"
+                declare void @may_assert(i1)
+
+                define void @main() {
+                entry:
+                    ret void
+                }
+            "#,
+                "driver_test",
+            )
+            .unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        let error = analyze_function_graph_simple_with_options(
+            &graphs[0],
+            SimpleDriverOptions {
+                max_step: 0,
+                trace_predicates: false,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, DriverError::InvalidMaxStep { max_step: 0 });
+    }
+
+    #[test]
     fn report_display_is_stable_and_readable() {
-        let report = SimpleProcedureReport {
-            procedure: "subject".to_string(),
-            judgement: QueryJudgement::No,
-            explored_paths: 2,
-            pruned_paths: 1,
-            checked_obligations: 3,
-            feasible_obligations: 0,
-        };
+        let report = SimpleProcedureReport::summary_only(
+            "subject",
+            QueryJudgement::Unknown,
+            3,
+            2,
+            1,
+            1,
+            3,
+            0,
+        );
 
         assert_eq!(
             report.to_string(),
-            "procedure subject\n  judgement: No\n  explored paths: 2\n  pruned paths: 1\n  obligations checked: 3\n  feasible obligations: 0"
+            "procedure subject\n  judgement: Unknown\n  max step: 3\n  explored paths: 2\n  pruned paths: 1\n  bounded paths: 1\n  obligations checked: 3\n  feasible obligations: 0"
         );
     }
 }

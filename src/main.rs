@@ -2,7 +2,7 @@
 //!
 //! The active CLI surface stops at LLVM graph construction and DOT dumping.
 //! The paper-shaped CFG/effect lowering exists in the crate and is unit-tested,
-//! and a minimal acyclic single-procedure checker can now be run explicitly.
+//! and a minimal bounded single-procedure checker can now be run explicitly.
 
 mod analysis;
 mod assertions;
@@ -15,6 +15,7 @@ use clap::{arg, command, value_parser};
 use env_logger::{Builder, Env};
 use llvm_utils::llvm_wrap::{initialize_target, Context, Module};
 use llvm_utils::program_graph::{dump_graphs, generate_program_graph};
+use log::LevelFilter;
 use std::path::Path;
 
 enum ProcedureSummary {
@@ -23,28 +24,61 @@ enum ProcedureSummary {
 }
 
 fn main() {
-    Builder::from_env(Env::default().default_filter_or("info")).init();
-    initialize_target();
-
     let matches = command!()
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
-        .arg(arg!(--"simple-check" "Run the current acyclic single-procedure checker"))
+        .arg(arg!(--"simple-check" "Run the current bounded single-procedure checker"))
+        .arg(arg!(--"trace-predicates" "Emit predicate traces for the simple checker as debug logs"))
+        .arg(
+            arg!(--"max-step" <MAX_STEP> "Temporary per-edge loop visit bound for the simple checker")
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("3"),
+        )
         .get_matches();
 
     let input = matches.get_one::<String>("INPUT").unwrap();
     let dump_dot = !matches.get_flag("no-dot");
-    let simple_check = matches.get_flag("simple-check");
+    let trace_predicates = matches.get_flag("trace-predicates");
+    let max_step = *matches.get_one::<usize>("max-step").unwrap();
+    let simple_check = matches.get_flag("simple-check") || trace_predicates;
+    init_logging(trace_predicates);
+    initialize_target();
 
     let context = Context::new();
     let Some(module) = context.parse_bc_file(input) else {
         eprintln!("Unable to parse bitcode file: {input}");
         std::process::exit(1);
     };
-    handle(module, input, dump_dot, simple_check);
+    handle(
+        module,
+        input,
+        dump_dot,
+        simple_check,
+        analysis::driver::SimpleDriverOptions {
+            max_step,
+            trace_predicates,
+        },
+    );
 }
 
-fn handle(module: Module, input_file: &str, dump_dot: bool, simple_check: bool) {
+fn init_logging(trace_predicates: bool) {
+    let mut builder = Builder::from_env(Env::default().default_filter_or("info"));
+    if trace_predicates {
+        builder.filter_module(analysis::driver::TRACE_TARGET, LevelFilter::Debug);
+        builder.filter_module("llvm_reader::llvm_utils::program_graph", LevelFilter::Info);
+        builder.filter_module("main::llvm_utils::program_graph", LevelFilter::Info);
+    }
+    builder.init();
+}
+
+fn handle(
+    module: Module,
+    input_file: &str,
+    dump_dot: bool,
+    simple_check: bool,
+    options: analysis::driver::SimpleDriverOptions,
+) {
     match generate_program_graph(&module) {
         Ok(graphs) => {
             let mut summaries = Vec::<ProcedureSummary>::new();
@@ -61,7 +95,10 @@ fn handle(module: Module, input_file: &str, dump_dot: bool, simple_check: bool) 
                     graph.asserts.len()
                 );
                 if simple_check {
-                    match analysis::driver::analyze_function_graph_simple(graph) {
+                    match analysis::driver::analyze_function_graph_simple_with_options(
+                        graph,
+                        options.clone(),
+                    ) {
                         Ok(report) => summaries.push(ProcedureSummary::Checked(report)),
                         Err(error) => summaries.push(ProcedureSummary::Unsupported {
                             procedure: graph.name.clone(),
@@ -75,9 +112,7 @@ fn handle(module: Module, input_file: &str, dump_dot: bool, simple_check: bool) 
                 println!("Simple-check summaries:");
                 for summary in summaries {
                     match summary {
-                        ProcedureSummary::Checked(report) => {
-                            println!("{report}");
-                        }
+                        ProcedureSummary::Checked(report) => println!("{report}"),
                         ProcedureSummary::Unsupported { procedure, reason } => {
                             println!("procedure {procedure}");
                             println!("  unsupported: {reason}");
@@ -87,7 +122,7 @@ fn handle(module: Module, input_file: &str, dump_dot: bool, simple_check: bool) 
                 }
             } else {
                 println!(
-                    "Paper CFG/transfer lowering is implemented; use --simple-check for the current acyclic branch checker."
+                    "Paper CFG/transfer lowering is implemented; use --simple-check for the current bounded branch checker."
                 );
             }
         }
@@ -114,16 +149,19 @@ mod tests {
     fn checked_summary_uses_driver_display() {
         let rendered = format!(
             "{}",
-            analysis::driver::SimpleProcedureReport {
-                procedure: "subject".to_string(),
-                judgement: analysis::rules::QueryJudgement::No,
-                explored_paths: 1,
-                pruned_paths: 0,
-                checked_obligations: 1,
-                feasible_obligations: 0,
-            }
+            analysis::driver::SimpleProcedureReport::summary_only(
+                "subject",
+                analysis::rules::QueryJudgement::No,
+                analysis::driver::DEFAULT_MAX_STEP,
+                1,
+                0,
+                0,
+                1,
+                0,
+            )
         );
         assert!(rendered.contains("procedure subject"));
         assert!(rendered.contains("judgement: No"));
+        assert!(rendered.contains("max step: 3"));
     }
 }

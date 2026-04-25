@@ -9,7 +9,8 @@ The active codebase has been reconstructed to the pre-driver milestone:
   - instruction-level `FunctionGraph` construction
   - DOT dumping for those graphs
   - C fixture compilation under `tests/flow/`
-  - `--simple-check` for the current acyclic single-procedure checker
+  - `--simple-check` for the current bounded single-procedure checker
+  - temporary `max_step` loop bounding in `analysis::driver`
 - implemented but not wired:
   - assertion-to-formula translation
   - paper formula language
@@ -23,7 +24,6 @@ The active codebase has been reconstructed to the pre-driver milestone:
 - planned:
   - full driver orchestration over the implemented rules
   - `Pre` / `Post` candidate generation from lowered effects
-  - `max_step`
   - loop summaries/invariants
 
 ## Module Mapping
@@ -38,7 +38,7 @@ paper state (Pi_n, Omega_n)    -> src/analysis/state.rs
 oracle SAT/implication         -> src/analysis/oracle.rs
 named paper rules             -> src/analysis/rules.rs
 summary facts                 -> src/analysis/summaries.rs
-temporary acyclic driver      -> src/analysis/driver.rs
+temporary bounded driver      -> src/analysis/driver.rs
 normalized local effects       -> src/analysis/transfer.rs
 LLVM adapter lowering          -> src/analysis/llvm_adapter.rs
 raw solver layer               -> src/smt/solver.rs
@@ -53,8 +53,11 @@ raw solver layer               -> src/smt/solver.rs
   to the paper.
 - `summaries.rs` stores summary facts, but summary scheduling still belongs in
   the future driver.
-- `driver.rs` is currently a temporary acyclic path explorer that wires the
+- `driver.rs` is currently a temporary bounded path explorer that wires the
   existing lowering, transfer, and oracle pieces into one end-to-end check.
+- the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
+  most `max_step` times on one explored path; budget exhaustion yields
+  `Unknown`.
 - `transfer.rs` consumes normalized effects from `llvm_adapter.rs`; it does not
   inspect raw LLVM instructions.
 - `llvm_adapter.rs` lowers one procedure into:
@@ -108,7 +111,7 @@ representation choices are deliberately minimal:
 - `N_e` stores exact blocked region pairs rather than a symbolic relation
 - `β`, `θ`, and local-variable projection are explicit rule inputs; the rules do
   not derive them themselves
-- the current `driver.rs` explores acyclic paths directly instead of scheduling
+- the current `driver.rs` explores bounded paths directly instead of scheduling
   the paper rules
 
 The main conservative check is the abstract path search used by `VERIFIED` and

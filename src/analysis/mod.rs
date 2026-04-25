@@ -6,8 +6,8 @@
 //!
 //! - implemented but not wired: `formula`, `state`, `cfg`, `transfer`,
 //!   `llvm_adapter`, `oracle`, `rules`, `summaries`;
-//! - implemented for the current acyclic subset: `driver`;
-//! - planned: full forward/backward rule scheduling and loop handling.
+//! - implemented for the current bounded subset: `driver`;
+//! - planned: full forward/backward rule scheduling and loop invariants.
 //!
 //! The intention is to keep this tree LLVM-independent except for
 //! `llvm_adapter`, which lowers one `FunctionGraph` into the paper-shaped CFG

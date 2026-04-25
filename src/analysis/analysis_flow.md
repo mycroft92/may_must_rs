@@ -39,8 +39,10 @@ FunctionGraph
   - `Assume`
   - `Obligation`
   - `Call`
-- `driver.rs` currently explores one acyclic path at a time and checks each
+- `driver.rs` currently explores one bounded path at a time and checks each
   obligation independently against the current path formula
+- repeated loop traversals are cut off by the temporary per-edge `max_step`
+  budget in `driver.rs`
 - evidence/model queries still do not exist yet in the active flow
 
 ## Current Rule API
@@ -80,17 +82,17 @@ Two rule-level checks deserve explicit mention:
 driver:
 
 - it supports one procedure at a time
-- it requires the CFG to be acyclic
+- it bounds loop exploration by per-edge `max_step`
 - it rejects calls
 - it uses `transfer.rs` plus SMT feasibility checks to explore concrete branch
   paths
 
-That is enough to run simple straightline and branchy assertion tests, but it
-is still a temporary bridge to the future rule-driven scheduler.
+That is enough to run simple straightline, branchy, and bounded-loop assertion
+tests, but it is still a temporary bridge to the future rule-driven scheduler.
 
 ## Next Wiring Steps
 
 1. Add `driver.rs` to orchestrate the implemented figure modules.
 2. Connect lowered effects to rule-premise generation (`β`, `θ`, and call summaries).
 3. Add CLI query integration for assertions.
-4. Add temporary `max_step` handling before loop summaries.
+4. Replace temporary `max_step` handling with loop summaries / invariants.

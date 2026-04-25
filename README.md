@@ -10,7 +10,7 @@ Implemented and CLI-active:
 - instruction-level `FunctionGraph` construction
 - DOT graph dumping
 - fixture compilation under `tests/flow/`
-- `--simple-check` for the current acyclic single-procedure checker
+- `--simple-check` for the current bounded single-procedure checker
 
 Implemented but not wired:
 
@@ -23,12 +23,11 @@ Implemented but not wired:
 - paper summary tables for `¬may ⇒ P` and `must ⇒ P`
 - normalized transfer effects
 - LLVM adapter lowering into `Cfg + node_effects + edge_effects`
-- minimal intraprocedural acyclic driver in `analysis::driver`
+- minimal intraprocedural bounded driver in `analysis::driver`
 
 Planned:
 
 - full driver orchestration over the named paper rules
-- `max_step`
 - summaries and loop invariants
 
 ## How To Run
@@ -51,10 +50,22 @@ Run the CLI on one bitcode file:
 cargo run --bin main -- tests/out/straight_line_assert.bc
 ```
 
-Run the current acyclic checker:
+Run the current bounded checker:
 
 ```sh
 cargo run --bin main -- --simple-check --no-dot tests/out/multi_exit.bc
+```
+
+Run the checker with the temporary loop bound set explicitly:
+
+```sh
+cargo run --bin main -- --simple-check --max-step 2 --no-dot tests/out/multi_exit.bc
+```
+
+Run the checker with per-step predicate tracing as debug logs:
+
+```sh
+cargo run --bin main -- --trace-predicates --max-step 2 --no-dot tests/out/multi_exit.bc
 ```
 
 Run unit tests:
@@ -78,22 +89,33 @@ The binary currently stops at LLVM graph generation. It:
 - optionally dumps DOT output under `graph_dot/<input-stem>/`
 - prints a small per-function summary
 
-With `--simple-check`, the CLI also runs the current acyclic single-procedure
+With `--simple-check`, the CLI also runs the current bounded single-procedure
 checker over each function and prints one clean summary block per procedure
 after the run.
 
 Those per-procedure summaries include:
 
 - final judgement
+- active `max_step`
 - explored path count
 - pruned path count
+- bounded path count
 - checked obligation count
 - feasible obligation count
 
+With `--trace-predicates`, the checker emits debug logs on the dedicated
+`analysis_trace` target for generated formulas after each ordinary node/edge
+step. Repeated loop traversals are summarized once per loop edge visit instead
+of dumping every repeated internal step.
+
 That checker is intentionally limited:
 
-- loops are rejected as unsupported
+- loops use a temporary per-edge `max_step` cutoff and return `Unknown` when a
+  path is cut off by that budget
 - calls are still unsupported
+- some C loop fixtures still lower to memory-heavy or intrinsic forms that are
+  outside the current transfer subset, so bounded-loop behavior is covered most
+  directly by the `analysis::driver` unit tests today
 - it explores paths directly instead of scheduling the full paper rule engine
 
 ## Active Architecture
@@ -107,7 +129,7 @@ src/analysis/cfg.rs             -> P / n / e / Gamma_e
 src/analysis/oracle.rs          -> SMT feasibility / implication boundary
 src/analysis/rules.rs           -> named rules from Figures 5-10
 src/analysis/summaries.rs       -> `¬may ⇒ P` / `must ⇒ P` tables
-src/analysis/driver.rs          -> current acyclic end-to-end checker
+src/analysis/driver.rs          -> current bounded end-to-end checker
 src/analysis/transfer.rs        -> normalized local effects
 src/analysis/llvm_adapter.rs    -> FunctionGraph -> cfg + node/edge effects
 src/smt/solver.rs               -> raw Z3 lowering
@@ -142,11 +164,11 @@ The rules are paper-shaped but still unwired:
 - they do not yet consume real call edges from the LLVM adapter
 
 Those pieces are the next job for the full paper driver, beyond the current
-acyclic checker in `analysis::driver`.
+bounded checker in `analysis::driver`.
 
 ## Next Milestone
 
-1. Replace the current acyclic checker with rule-driven orchestration over lowered procedures.
+1. Replace the current bounded checker with rule-driven orchestration over lowered procedures.
 2. Wire the current `rules.rs` over `Cfg + state + oracle + summaries`.
 3. Add CLI assertion selection/query integration.
-4. Add temporary `max_step` handling before loop summaries.
+4. Replace temporary `max_step` handling with loop summaries/invariants.
