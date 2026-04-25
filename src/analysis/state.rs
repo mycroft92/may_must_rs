@@ -30,6 +30,10 @@ impl PathSummary {
         &self.predicate
     }
 
+    pub fn as_formula(&self) -> Formula {
+        self.predicate.clone()
+    }
+
     pub fn refine(&mut self, guard: Formula) {
         self.predicate = Formula::and(self.predicate.clone(), guard);
     }
@@ -123,6 +127,14 @@ impl NodeState {
 
     pub fn obligations_mut(&mut self) -> &mut Obligations {
         &mut self.obligations
+    }
+
+    pub fn feasibility_formula(&self) -> Formula {
+        Formula::and_all([self.path_summary.as_formula(), self.facts.collapse()])
+    }
+
+    pub fn obligation_query_formula(&self) -> Formula {
+        Formula::and_all([self.feasibility_formula(), self.obligations.collapse()])
     }
 }
 
@@ -244,6 +256,21 @@ mod tests {
         assert_eq!(state.path_summary().predicate(), &Formula::bool_var("path"));
         assert_eq!(state.facts().formulas().len(), 1);
         assert_eq!(state.obligations().formulas().len(), 1);
+        assert_eq!(
+            state.feasibility_formula(),
+            Formula::and(
+                Formula::bool_var("path"),
+                Formula::eq(Term::Var(Var::int("x")), Term::int(3))
+            )
+        );
+        assert_eq!(
+            state.obligation_query_formula(),
+            Formula::and_all([
+                Formula::bool_var("path"),
+                Formula::eq(Term::Var(Var::int("x")), Term::int(3)),
+                Formula::not(Formula::bool_var("assert_ok")),
+            ])
+        );
     }
 
     #[test]

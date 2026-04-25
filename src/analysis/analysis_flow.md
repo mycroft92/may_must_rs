@@ -19,6 +19,7 @@ FunctionGraph
      -> edge_effects
   -> transfer::apply_effects
   -> state::AnalysisState
+  -> oracle::Oracle feasibility / implication queries
 ```
 
 ## Important Ownership Rules
@@ -26,17 +27,17 @@ FunctionGraph
 - branch conditions become `CfgEdge::relation`
 - phi nodes become predecessor-specific edge assignments
 - accumulated path summaries are refined and merged in `state.rs`
+- satisfiability and implication queries live only in `oracle.rs`
 - `transfer.rs` interprets only normalized effects:
   - `Assign`
   - `Assume`
   - `Obligation`
   - `Call`
-- satisfiability and evidence queries do not exist yet in the active flow;
-  `oracle.rs` remains future work
+- evidence/model queries still do not exist yet in the active flow
 
 ## Next Wiring Steps
 
-1. Add an oracle boundary over `formula.rs` and `smt::solver`.
-2. Add forward propagation over `Cfg + effects + state`.
+1. Add the named paper rule layer.
+2. Wire backward `NOTMAY-PRE` and forward `MUST-POST`.
 3. Add CLI query integration for assertions.
 4. Add temporary `max_step` handling before loop summaries.

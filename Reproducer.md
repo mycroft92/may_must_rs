@@ -21,6 +21,7 @@ Build the repository up to this exact state:
 - LLVM intraprocedural program graph generation is correct and tested
 - parsed assertions can be translated into a paper-shaped formula language
 - formulas can be lowered to Z3 through the local SMT wrapper
+- a paper oracle can check feasibility and implication over formulas/path summaries
 - a paper-shaped state layer exists for path summaries, obligations, facts, and
   temporary bounded-progress counters
 - a paper-shaped LLVM-independent CFG exists
@@ -37,10 +38,10 @@ Build the repository up to this exact state:
 - the architecture/docs clearly separate:
   - raw LLVM graph generation
   - parser/frontend lowering
-  - paper-core formula, state, and CFG modules
+  - paper-core formula, state, CFG, and oracle modules
   - normalized transfer semantics
   - LLVM-specific adapter lowering
-  - still-planned oracle/driver/summary work
+  - still-planned rule/driver/summary work
 
 Stop there.
 
@@ -48,9 +49,8 @@ Stop there.
 
 Do not implement any of the following:
 
-- forward may fixpoint/driver wiring
-- backward/must analysis
-- `oracle.rs`
+- forward driver wiring
+- backward driver wiring beyond the minimal oracle boundary
 - `rules.rs`
 - `summaries.rs`
 - loop invariant extraction
@@ -184,11 +184,9 @@ Create or update:
 - `src/analysis/design.md`
 - `src/analysis/analysis_flow.md`
 - `src/analysis/state.rs`
-- `src/analysis/preimage.rs`
 
 Requirements:
 
-- `preimage.rs` may remain a stub
 - module comments must say what each module is intended to hold
 - module comments must mention the paper mapping
 - docs must distinguish:
@@ -438,7 +436,6 @@ At minimum, by the end you should have created or updated:
 - `src/analysis/cfg.rs`
 - `src/analysis/transfer.rs`
 - `src/analysis/llvm_adapter.rs`
-- `src/analysis/preimage.rs`
 - `src/assertions/translation.rs`
 - `src/analysis/design.md`
 - `src/analysis/analysis_flow.md`

@@ -125,8 +125,9 @@ plan above:
 
 - CLI-active code stops at LLVM graph generation and DOT dumping.
 - `src/analysis/formula.rs`, `state.rs`, `cfg.rs`, `transfer.rs`, and
-  `llvm_adapter.rs` are implemented but not wired into a forward/backward
-  driver yet.
+  `llvm_adapter.rs` are implemented but not wired into a rule/driver layer yet.
+- `src/analysis/oracle.rs` now owns solver-backed feasibility and implication
+  queries over paper formulas and state summaries.
 - `transfer.rs` currently uses one normalized
   `TransferEffect::Assign { target, value }` effect plus `Assume`,
   `Obligation`, `Call`, and `Nop`.

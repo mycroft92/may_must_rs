@@ -2,9 +2,9 @@
 
 ## Current Backlog
 
-- add an oracle boundary over `analysis::formula` and `smt::solver`
-- wire a forward may pass over `Cfg + node_effects + edge_effects + AnalysisState`
-- add a backward/preimage path after the forward pass has settled
+- wire backward `NOTMAY-PRE` over `Cfg + state + oracle`
+- wire forward `MUST-POST` over `Cfg + state + oracle`
+- extend the oracle with evidence/model queries once the driver needs witnesses
 - add CLI assertion selection instead of graph-generation-only execution
 - add temporary `max_step` loop bounding
 - extend LLVM adapter coverage beyond the current scalar/integer subset

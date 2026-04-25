@@ -2,7 +2,7 @@
 
 ## Phase
 
-Current phase: pre-driver intraprocedural lowering.
+Current phase: pre-driver intraprocedural lowering plus solver-backed oracle.
 
 Implemented:
 
@@ -10,19 +10,20 @@ Implemented:
 - assertion translation into the paper formula language
 - paper CFG/state/transfer modules
 - LLVM adapter lowering through `transfer.rs`
+- paper oracle feasibility/implication queries
 - synthetic single-exit normalization for multi-exit procedures
 - `tests/flow` fixture corpus and `make -C tests smoke`
 
 Not wired:
 
-- oracle queries
-- forward propagation
-- backward propagation
+- named paper rules
+- backward `NOTMAY-PRE`
+- forward `MUST-POST`
 - loop handling
 
 ## Next Session Plan
 
-1. Introduce the oracle abstraction without leaking solver policy into `cfg/state/transfer`.
-2. Add forward propagation over the lowered CFG/effects.
-3. Decide the smallest honest CLI integration point for assertion checking.
-4. Only then add `max_step` for loops.
+1. Add the named rule layer so the implementation speaks the paper directly.
+2. Wire backward `NOTMAY-PRE` using the current oracle queries.
+3. Wire forward `MUST-POST` over the lowered CFG/effects.
+4. Decide the smallest honest CLI integration point for assertion checking, then add `max_step`.
