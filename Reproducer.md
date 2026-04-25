@@ -22,6 +22,8 @@ Build the repository up to this exact state:
 - parsed assertions can be translated into a paper-shaped formula language
 - formulas can be lowered to Z3 through the local SMT wrapper
 - a paper oracle can check feasibility and implication over formulas/path summaries
+- named paper rules from Figures 5-10 are implemented as explicit APIs
+- paper summary tables exist for `¬may ⇒ P` and `must ⇒ P`
 - a paper-shaped state layer exists for path summaries, obligations, facts, and
   temporary bounded-progress counters
 - a paper-shaped LLVM-independent CFG exists
@@ -39,6 +41,7 @@ Build the repository up to this exact state:
   - raw LLVM graph generation
   - parser/frontend lowering
   - paper-core formula, state, CFG, and oracle modules
+  - paper rule and summary modules
   - normalized transfer semantics
   - LLVM-specific adapter lowering
   - still-planned rule/driver/summary work
@@ -51,8 +54,6 @@ Do not implement any of the following:
 
 - forward driver wiring
 - backward driver wiring beyond the minimal oracle boundary
-- `rules.rs`
-- `summaries.rs`
 - loop invariant extraction
 - the `max_step` engine
 - memory modeling beyond explicitly rejecting unsupported instructions

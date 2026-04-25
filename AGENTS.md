@@ -128,6 +128,10 @@ plan above:
   `llvm_adapter.rs` are implemented but not wired into a rule/driver layer yet.
 - `src/analysis/oracle.rs` now owns solver-backed feasibility and implication
   queries over paper formulas and state summaries.
+- `src/analysis/rules.rs` now implements the named rules from Figures 5-10,
+  grouped by figure so duplicated rule names remain literal.
+- `src/analysis/summaries.rs` now stores `¬may ⇒ P` and `must ⇒ P` summary
+  facts, but no driver consumes them yet.
 - `transfer.rs` currently uses one normalized
   `TransferEffect::Assign { target, value }` effect plus `Assume`,
   `Obligation`, `Call`, and `Nop`.

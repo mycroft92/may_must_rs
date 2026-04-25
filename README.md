@@ -18,14 +18,14 @@ Implemented but not wired:
 - paper state carriers (`Pi_n`, `Omega_n`)
 - paper CFG (`P`, `n`, `e`, `Gamma_e`)
 - SMT oracle feasibility and implication queries over paper formulas/states
+- named paper rules from Figures 5-10
+- paper summary tables for `¬may ⇒ P` and `must ⇒ P`
 - normalized transfer effects
 - LLVM adapter lowering into `Cfg + node_effects + edge_effects`
 
 Planned:
 
-- named paper rules and driver orchestration
-- backward `NOTMAY-PRE`
-- forward `MUST-POST`
+- driver orchestration over the named paper rules
 - `max_step`
 - summaries and loop invariants
 
@@ -82,6 +82,8 @@ src/analysis/formula.rs         -> predicate vocabulary
 src/analysis/state.rs           -> Pi_n / Omega_n / tracked facts
 src/analysis/cfg.rs             -> P / n / e / Gamma_e
 src/analysis/oracle.rs          -> SMT feasibility / implication boundary
+src/analysis/rules.rs           -> named rules from Figures 5-10
+src/analysis/summaries.rs       -> `¬may ⇒ P` / `must ⇒ P` tables
 src/analysis/transfer.rs        -> normalized local effects
 src/analysis/llvm_adapter.rs    -> FunctionGraph -> cfg + node/edge effects
 src/smt/solver.rs               -> raw Z3 lowering
@@ -93,6 +95,8 @@ Key boundaries:
 - accumulated path predicates belong in `state.rs`.
 - `oracle.rs` is the only paper module that answers solver-backed feasibility
   and implication queries.
+- `rules.rs` keeps the rule names and premises close to the paper instead of
+  hiding them behind a generic engine.
 - `transfer.rs` interprets normalized effects produced by `llvm_adapter.rs`.
 - `llvm_adapter.rs` lowers one procedure into `cfg + node_effects + edge_effects`.
 - `may_assert` becomes an obligation, not a summarized call edge.
@@ -101,7 +105,7 @@ Key boundaries:
 
 ## Next Milestone
 
-1. Add the named paper rules and driver skeleton around the current core.
-2. Wire backward `NOTMAY-PRE` and forward `MUST-POST` over `Cfg + state + oracle`.
+1. Add a driver skeleton that executes the named rule modules over lowered procedures.
+2. Wire the current `rules.rs` over `Cfg + state + oracle + summaries`.
 3. Add CLI assertion selection/query integration.
 4. Add temporary `max_step` handling before loop summaries.

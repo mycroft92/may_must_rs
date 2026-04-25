@@ -20,6 +20,8 @@ FunctionGraph
   -> transfer::apply_effects
   -> state::AnalysisState
   -> oracle::Oracle feasibility / implication queries
+  -> rules::{figure5..figure10}
+  -> summaries::SummaryTables
 ```
 
 ## Important Ownership Rules
@@ -28,6 +30,8 @@ FunctionGraph
 - phi nodes become predecessor-specific edge assignments
 - accumulated path summaries are refined and merged in `state.rs`
 - satisfiability and implication queries live only in `oracle.rs`
+- named declarative rules live in `rules.rs`
+- summary facts live in `summaries.rs`
 - `transfer.rs` interprets only normalized effects:
   - `Assign`
   - `Assume`
@@ -37,7 +41,7 @@ FunctionGraph
 
 ## Next Wiring Steps
 
-1. Add the named paper rule layer.
-2. Wire backward `NOTMAY-PRE` and forward `MUST-POST`.
+1. Add `driver.rs` to orchestrate the implemented figure modules.
+2. Connect lowered effects to rule-premise generation (`β`, `θ`, and call summaries).
 3. Add CLI query integration for assertions.
 4. Add temporary `max_step` handling before loop summaries.
