@@ -2,7 +2,7 @@
 //!
 //! The active CLI surface stops at LLVM graph construction and DOT dumping.
 //! The paper-shaped CFG/effect lowering exists in the crate and is unit-tested,
-//! but it is not wired into a forward or backward analysis driver yet.
+//! and a minimal acyclic single-procedure checker can now be run explicitly.
 
 mod analysis;
 mod assertions;
@@ -24,20 +24,22 @@ fn main() {
     let matches = command!()
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
+        .arg(arg!(--"simple-check" "Run the current acyclic single-procedure checker"))
         .get_matches();
 
     let input = matches.get_one::<String>("INPUT").unwrap();
     let dump_dot = !matches.get_flag("no-dot");
+    let simple_check = matches.get_flag("simple-check");
 
     let context = Context::new();
     let Some(module) = context.parse_bc_file(input) else {
         eprintln!("Unable to parse bitcode file: {input}");
         std::process::exit(1);
     };
-    handle(module, input, dump_dot);
+    handle(module, input, dump_dot, simple_check);
 }
 
-fn handle(module: Module, input_file: &str, dump_dot: bool) {
+fn handle(module: Module, input_file: &str, dump_dot: bool, simple_check: bool) {
     match generate_program_graph(&module) {
         Ok(graphs) => {
             if dump_dot {
@@ -52,8 +54,25 @@ fn handle(module: Module, input_file: &str, dump_dot: bool) {
                     graph.vertices.len(),
                     graph.asserts.len()
                 );
+                if simple_check {
+                    match analysis::driver::analyze_function_graph_simple(graph) {
+                        Ok(report) => println!(
+                            "  simple-check: {:?} (paths={}, pruned={}, obligations={}, feasible={})",
+                            report.judgement,
+                            report.explored_paths,
+                            report.pruned_paths,
+                            report.checked_obligations,
+                            report.feasible_obligations
+                        ),
+                        Err(error) => println!("  simple-check: unsupported ({error})"),
+                    }
+                }
             }
-            println!("Paper CFG/transfer lowering is implemented but not wired into the CLI yet.");
+            if !simple_check {
+                println!(
+                    "Paper CFG/transfer lowering is implemented; use --simple-check for the current acyclic branch checker."
+                );
+            }
         }
         Err(error) => {
             eprintln!("{error}");

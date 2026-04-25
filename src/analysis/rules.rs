@@ -5,6 +5,17 @@
 //! different premises can coexist without being blurred into one ad hoc API.
 //! Premises involving `Pre`, `Post`, or `∃V^L` are passed in explicitly as
 //! `β`, `θ`, or a projection closure instead of being hidden inside the rules.
+//!
+//! The current module is intentionally declarative rather than executable.
+//! It stores and updates the paper carriers:
+//!
+//! - `Π_n` as a partition-like list of regions per node
+//! - `Ω_n` as one accumulated must-region per node
+//! - `N_e` as blocked abstract `(ϕ_1, ϕ_2)` pairs per edge
+//! - `⟨ϕ_1 ?⇒_P ϕ_2⟩` as [`ReachabilityQuery`]
+//!
+//! A future `driver.rs` is expected to choose candidate `β` / `θ` formulas and
+//! schedule these rules over lowered LLVM procedures.
 
 use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::Formula;
@@ -15,6 +26,7 @@ use thiserror::Error;
 
 pub type Region = Formula;
 
+/// The paper query `⟨ϕ_1 ?⇒_P ϕ_2⟩` for one procedure `P`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReachabilityQuery {
     pub procedure: ProcedureName,
@@ -23,6 +35,7 @@ pub struct ReachabilityQuery {
 }
 
 impl ReachabilityQuery {
+    /// Builds a query in the same shape as the paper notation.
     pub fn new(
         procedure: impl Into<ProcedureName>,
         precondition: Formula,
@@ -36,6 +49,11 @@ impl ReachabilityQuery {
     }
 }
 
+/// Final judgements for one reachability query.
+///
+/// `Yes` corresponds to a found bug / witness, `No` corresponds to a verified
+/// not-may result, and `Unknown` means the currently available rules do not
+/// settle the query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryJudgement {
     Yes,
@@ -43,12 +61,21 @@ pub enum QueryJudgement {
     Unknown,
 }
 
+/// One abstract blocked pair in `N_e`.
+///
+/// The pair means that abstract execution from `pre_region` at the source of
+/// `e` to `post_region` at the target of `e` has been ruled out.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NotMayPair {
     pub pre_region: Formula,
     pub post_region: Formula,
 }
 
+/// All paper carriers for one procedure/query instance.
+///
+/// This is the mutable frame over which the named rules operate. It does not
+/// choose which rule to apply; it only stores the state those rules read and
+/// update.
 #[derive(Clone, Debug)]
 pub struct ProcedureFrame {
     cfg: Cfg,
@@ -59,6 +86,8 @@ pub struct ProcedureFrame {
 }
 
 impl ProcedureFrame {
+    /// Creates an empty rule frame for one normalized procedure CFG and one
+    /// paper query.
     pub fn new(cfg: Cfg, query: ReachabilityQuery) -> Self {
         Self {
             cfg,
@@ -69,22 +98,27 @@ impl ProcedureFrame {
         }
     }
 
+    /// Returns the normalized paper CFG `P`.
     pub fn cfg(&self) -> &Cfg {
         &self.cfg
     }
 
+    /// Returns the query `⟨ϕ_1 ?⇒_P ϕ_2⟩`.
     pub fn query(&self) -> &ReachabilityQuery {
         &self.query
     }
 
+    /// Returns the current region list used as `Π_n`.
     pub fn partition(&self, node: CfgNodeId) -> Option<&[Formula]> {
         self.pi.get(&node).map(Vec::as_slice)
     }
 
+    /// Returns the current accumulated `Ω_n`.
     pub fn omega(&self, node: CfgNodeId) -> Option<&Formula> {
         self.omega.get(&node)
     }
 
+    /// Returns the blocked abstract pairs currently stored in `N_e`.
     pub fn ne(&self, edge: CfgEdgeId) -> Option<&[NotMayPair]> {
         self.ne.get(&edge).map(Vec::as_slice)
     }
@@ -227,6 +261,10 @@ pub enum RuleError {
 pub mod figure5 {
     use super::*;
 
+    /// Figure 5 `INIT-PI-NE`.
+    ///
+    /// Initializes every non-exit partition to `[true]`, initializes the exit
+    /// partition to `[ϕ_2, ¬ϕ_2]`, and clears all `N_e`.
     pub fn INIT_PI_NE(frame: &mut ProcedureFrame) -> Result<(), RuleError> {
         frame.pi.clear();
         frame.ne.clear();
@@ -253,6 +291,14 @@ pub mod figure5 {
         Ok(())
     }
 
+    /// Figure 5 `NOTMAY-PRE`.
+    ///
+    /// This is the backward partition-splitting rule. The caller supplies `θ`
+    /// as the paper-side `Pre` candidate. The rule:
+    ///
+    /// - checks that `ϕ_1 ∈ Π_n1` and `ϕ_2 ∈ Π_n2`
+    /// - replaces `ϕ_1` by `ϕ_1 ∧ θ` and `ϕ_1 ∧ ¬θ`
+    /// - adds `(ϕ_1 ∧ ¬θ, ϕ_2)` to `N_e`
     pub fn NOTMAY_PRE(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -290,6 +336,10 @@ pub mod figure5 {
         Ok(())
     }
 
+    /// Figure 5 `IMPL-LEFT`.
+    ///
+    /// If `(ϕ_1, ϕ_2) ∈ N_e` and `ϕ'_1 ⊆ ϕ_1`, then `(ϕ'_1, ϕ_2)` may also be
+    /// recorded in `N_e`.
     pub fn IMPL_LEFT(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -316,6 +366,10 @@ pub mod figure5 {
         )
     }
 
+    /// Figure 5 `IMPL-RIGHT`.
+    ///
+    /// If `(ϕ_1, ϕ_2) ∈ N_e` and `ϕ'_2 ⊆ ϕ_2`, then `(ϕ_1, ϕ'_2)` may also be
+    /// recorded in `N_e`.
     pub fn IMPL_RIGHT(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -342,6 +396,14 @@ pub mod figure5 {
         )
     }
 
+    /// Figure 5 `VERIFIED`.
+    ///
+    /// The current implementation checks whether any abstract path remains from
+    /// an entry partition region overlapping `ϕ_1` to an exit partition region
+    /// overlapping `ϕ_2`. If none remain, the query is verified as `No`.
+    ///
+    /// If at least one path still exists, the rule reports `Unknown` rather
+    /// than making a stronger claim.
     pub fn VERIFIED(frame: &ProcedureFrame, oracle: &Oracle) -> Result<QueryJudgement, RuleError> {
         if abstract_path_exists(frame, oracle)? {
             Ok(QueryJudgement::Unknown)
@@ -355,6 +417,9 @@ pub mod figure5 {
 pub mod figure6 {
     use super::*;
 
+    /// Figure 6 `INIT-OMEGA`.
+    ///
+    /// Initializes `Ω_entry = ϕ_1` and every other `Ω_n = false`.
     pub fn INIT_OMEGA(frame: &mut ProcedureFrame) -> Result<(), RuleError> {
         frame.omega.clear();
         let entry = frame.cfg.entry();
@@ -370,6 +435,10 @@ pub mod figure6 {
         Ok(())
     }
 
+    /// Figure 6 `MUST-POST`.
+    ///
+    /// The caller provides `θ` as a forward `Post` candidate. The rule adds
+    /// `θ` into `Ω_n2`.
     pub fn MUST_POST(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -383,6 +452,11 @@ pub mod figure6 {
         frame.add_to_omega(target, theta)
     }
 
+    /// Figure 6 `BUGFOUND`.
+    ///
+    /// Checks feasibility of `Ω_exit ∧ ϕ_2`. If feasible, a witness to the
+    /// query exists and the judgement is `Yes`. Otherwise the figure only
+    /// supports `Unknown`.
     pub fn BUGFOUND(frame: &ProcedureFrame, oracle: &Oracle) -> Result<QueryJudgement, RuleError> {
         let exit = frame.exit()?;
         match oracle.feasibility(&Formula::and(
@@ -399,6 +473,11 @@ pub mod figure6 {
 pub mod figure7 {
     use super::*;
 
+    /// Figure 7 combined `MUST-POST`.
+    ///
+    /// This is the refined must-side rule that uses both `Π_n` and `Ω_n`.
+    /// Membership, overlap, and disjointness premises are checked exactly as
+    /// solver queries through [`Oracle`].
     pub fn MUST_POST(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -436,6 +515,12 @@ pub mod figure7 {
         frame.add_to_omega(target, theta)
     }
 
+    /// Figure 7 combined `NOTMAY-PRE`.
+    ///
+    /// This is the refined not-may rule that uses both `Π_n` and `Ω_n`. The
+    /// caller supplies `β` directly. If the premises hold, the source region is
+    /// split into `ϕ_1 ∧ β` and `ϕ_1 ∧ ¬β`, and `(ϕ_1 ∧ ¬β, ϕ_2)` is inserted
+    /// into `N_e`.
     pub fn NOTMAY_PRE(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -496,10 +581,15 @@ pub mod figure7 {
 pub mod figure8 {
     use super::*;
 
+    /// Figure 8 `INIT-NOTMAYSUM`.
     pub fn INIT_NOTMAYSUM(summaries: &mut SummaryTables, procedure: impl Into<ProcedureName>) {
         summaries.init_notmay(procedure);
     }
 
+    /// Figure 8 `NOTMAY-PRE-USESUMMARY`.
+    ///
+    /// Reuses one not-may summary by checking the paper subset premises and
+    /// then applying the same split-and-block shape as the local backward rule.
     pub fn NOTMAY_PRE_USESUMMARY(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -555,6 +645,9 @@ pub mod figure8 {
         )
     }
 
+    /// Figure 8 `MAY-CALL`.
+    ///
+    /// Produces the callee subquery directly in paper form.
     pub fn MAY_CALL(
         callee: impl Into<ProcedureName>,
         phi_1: Formula,
@@ -563,6 +656,13 @@ pub mod figure8 {
         ReachabilityQuery::new(callee, phi_1, phi_2)
     }
 
+    /// Figure 8 `CREATE-NOTMAYSUMMARY`.
+    ///
+    /// The summary is created only when all entry-to-exit abstract paths are
+    /// already blocked. Entry and exit summary regions are formed by collecting
+    /// partition members that overlap the query pre/post and then disjoining
+    /// them. `project_locals` stands in for the paper's local-variable
+    /// projection `∃V^L`.
     pub fn CREATE_NOTMAYSUMMARY<P>(
         frame: &ProcedureFrame,
         summaries: &mut SummaryTables,
@@ -604,6 +704,10 @@ pub mod figure8 {
         Ok(())
     }
 
+    /// Figure 8 `MERGE-MAYSUMMARY`.
+    ///
+    /// Merges two not-may summaries with the same postcondition by disjoining
+    /// their preconditions.
     pub fn MERGE_MAYSUMMARY(
         summaries: &mut SummaryTables,
         procedure: &str,
@@ -631,10 +735,15 @@ pub mod figure8 {
 pub mod figure9 {
     use super::*;
 
+    /// Figure 9 `INIT-MUSTSUMMARY`.
     pub fn INIT_MUSTSUMMARY(summaries: &mut SummaryTables, procedure: impl Into<ProcedureName>) {
         summaries.init_must(procedure);
     }
 
+    /// Figure 9 `MUST-POST-USESUMMARY`.
+    ///
+    /// Reuses one must summary by checking the paper subset premises and then
+    /// adding `θ` into `Ω_n2`.
     pub fn MUST_POST_USESUMMARY(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -666,6 +775,9 @@ pub mod figure9 {
         frame.add_to_omega(target, theta)
     }
 
+    /// Figure 9 `MUST-CALL`.
+    ///
+    /// Produces the callee subquery directly from `Ω_n1` and `σ_Π`.
     pub fn MUST_CALL(
         callee: impl Into<ProcedureName>,
         omega_n1: Formula,
@@ -674,6 +786,10 @@ pub mod figure9 {
         ReachabilityQuery::new(callee, omega_n1, sigma_pi)
     }
 
+    /// Figure 9 `CREATE-MUSTSUMMARY`.
+    ///
+    /// Projects the current exit must-region and stores a summary when it still
+    /// overlaps the query postcondition.
     pub fn CREATE_MUSTSUMMARY<P>(
         frame: &ProcedureFrame,
         summaries: &mut SummaryTables,
@@ -701,6 +817,10 @@ pub mod figure9 {
         Ok(())
     }
 
+    /// Figure 9 `MERGE-MUSTSUMMARY`.
+    ///
+    /// Merges two must summaries with the same precondition by disjoining
+    /// their postconditions.
     pub fn MERGE_MUSTSUMMARY(
         summaries: &mut SummaryTables,
         procedure: &str,
@@ -728,6 +848,11 @@ pub mod figure9 {
 pub mod figure10 {
     use super::*;
 
+    /// Figure 10 `MUST-POST-USESUMMARY`.
+    ///
+    /// This is the combined must-side summary rule. It checks partition
+    /// membership, must-overlap/disjointness, summary subset premises, and
+    /// overlap of the target region with `θ`.
     pub fn MUST_POST_USESUMMARY(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -778,6 +903,11 @@ pub mod figure10 {
         frame.add_to_omega(target, theta)
     }
 
+    /// Figure 10 `NOTMAY-PRE-USESUMMARY`.
+    ///
+    /// This is the combined not-may summary rule. It checks summary premises
+    /// plus the must-side exclusion premise `¬θ ∩ Ω_n1 = {}`, then performs the
+    /// same partition split and `N_e` update shape as the local not-may rules.
     pub fn NOTMAY_PRE_USESUMMARY(
         frame: &mut ProcedureFrame,
         edge: CfgEdgeId,
@@ -839,6 +969,10 @@ pub mod figure10 {
         )
     }
 
+    /// Figure 10 `MAY-MUST-CALL`.
+    ///
+    /// Builds the mixed query for a call edge after confirming the caller-side
+    /// may/must premises.
     pub fn MAY_MUST_CALL(
         callee: impl Into<ProcedureName>,
         phi_1: &Formula,
@@ -858,6 +992,7 @@ pub mod figure10 {
     }
 }
 
+/// Checks a paper premise of the form `lhs ⊆ rhs`.
 fn require_subset(
     rule: &'static str,
     premise: &str,
@@ -878,6 +1013,7 @@ fn require_subset(
     }
 }
 
+/// Checks a paper premise of the form `lhs ∩ rhs ≠ {}`.
 fn require_overlap(
     rule: &'static str,
     premise: &str,
@@ -898,6 +1034,7 @@ fn require_overlap(
     }
 }
 
+/// Checks a paper premise of the form `lhs ∩ rhs = {}`.
 fn require_disjoint(
     rule: &'static str,
     premise: &str,
@@ -919,6 +1056,8 @@ fn require_disjoint(
 }
 
 fn may_overlap(oracle: &Oracle, lhs: &Formula, rhs: &Formula) -> Result<bool, RuleError> {
+    // APPROX_HEAVY: if SMT returns Unknown, this helper treats the regions as
+    // possibly overlapping so that path-blocking checks stay conservative.
     Ok(
         match oracle.feasibility(&Formula::and(lhs.clone(), rhs.clone()))? {
             Feasibility::Infeasible => false,
@@ -927,6 +1066,7 @@ fn may_overlap(oracle: &Oracle, lhs: &Formula, rhs: &Formula) -> Result<bool, Ru
     )
 }
 
+/// Returns all members of `Π_n` that may overlap a target region.
 fn overlapping_partition_regions(
     frame: &ProcedureFrame,
     node: CfgNodeId,
@@ -945,6 +1085,12 @@ fn overlapping_partition_regions(
     Ok(regions)
 }
 
+/// Conservative abstract-path search used by `VERIFIED` and
+/// `CREATE_NOTMAYSUMMARY`.
+///
+/// Nodes in the search graph are `(node, region-index)` pairs. An abstract edge
+/// is blocked only when the exact `(ϕ_1, ϕ_2)` pair has been stored in `N_e`.
+/// Any solver `Unknown` in overlap checks is treated as "path may exist".
 fn abstract_path_exists(frame: &ProcedureFrame, oracle: &Oracle) -> Result<bool, RuleError> {
     let entry = frame.cfg.entry();
     let exit = frame.exit()?;

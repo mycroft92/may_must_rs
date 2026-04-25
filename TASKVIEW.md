@@ -2,7 +2,7 @@
 
 ## Phase
 
-Current phase: pre-driver paper rules plus solver-backed oracle.
+Current phase: paper rules plus a temporary acyclic checker.
 
 Implemented:
 
@@ -11,6 +11,7 @@ Implemented:
 - paper CFG/state/transfer modules
 - paper summary tables
 - named paper rules from Figures 5-10
+- temporary acyclic intraprocedural driver
 - LLVM adapter lowering through `transfer.rs`
 - paper oracle feasibility/implication queries
 - synthetic single-exit normalization for multi-exit procedures
@@ -18,14 +19,14 @@ Implemented:
 
 Not wired:
 
-- rule driver/orchestration
+- rule-driven orchestration
 - effect-to-`Pre` / `Post` computation
-- CLI rule execution
+- full CLI rule execution
 - loop handling
 
 ## Next Session Plan
 
-1. Add `driver.rs` around the implemented Figure 5-10 rule modules.
+1. Replace the temporary acyclic checker in `driver.rs` with rule-driven scheduling.
 2. Connect lowered effects to candidate `β` / `θ` computations for `NOTMAY-PRE` and `MUST-POST`.
 3. Thread summary tables through actual call handling.
 4. Decide the smallest honest CLI integration point for assertion checking, then add `max_step`.

@@ -24,6 +24,7 @@ Build the repository up to this exact state:
 - a paper oracle can check feasibility and implication over formulas/path summaries
 - named paper rules from Figures 5-10 are implemented as explicit APIs
 - paper summary tables exist for `¬may ⇒ P` and `must ⇒ P`
+- a temporary acyclic driver can run simple single-procedure checks end-to-end
 - a paper-shaped state layer exists for path summaries, obligations, facts, and
   temporary bounded-progress counters
 - a paper-shaped LLVM-independent CFG exists
@@ -41,7 +42,8 @@ Build the repository up to this exact state:
   - raw LLVM graph generation
   - parser/frontend lowering
   - paper-core formula, state, CFG, and oracle modules
-  - paper rule and summary modules
+- paper rule and summary modules
+  - temporary driver wiring
   - normalized transfer semantics
   - LLVM-specific adapter lowering
   - still-planned rule/driver/summary work
@@ -53,7 +55,7 @@ Stop there.
 Do not implement any of the following:
 
 - forward driver wiring
-- backward driver wiring beyond the minimal oracle boundary
+- full backward/forward rule scheduling beyond the temporary acyclic checker
 - loop invariant extraction
 - the `max_step` engine
 - memory modeling beyond explicitly rejecting unsupported instructions

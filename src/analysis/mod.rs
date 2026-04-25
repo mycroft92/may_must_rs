@@ -6,13 +6,15 @@
 //!
 //! - implemented but not wired: `formula`, `state`, `cfg`, `transfer`,
 //!   `llvm_adapter`, `oracle`, `rules`, `summaries`;
-//! - planned: forward/backward drivers and loop handling.
+//! - implemented for the current acyclic subset: `driver`;
+//! - planned: full forward/backward rule scheduling and loop handling.
 //!
 //! The intention is to keep this tree LLVM-independent except for
 //! `llvm_adapter`, which lowers one `FunctionGraph` into the paper-shaped CFG
 //! plus normalized local effects.
 
 pub mod cfg;
+pub mod driver;
 pub mod formula;
 pub mod llvm_adapter;
 pub mod oracle;

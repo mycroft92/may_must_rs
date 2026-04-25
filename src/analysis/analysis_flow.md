@@ -7,6 +7,7 @@ LLVM bitcode
   -> llvm_wrap
   -> program_graph::generate_program_graph
   -> optional DOT dump
+  -> optional driver::analyze_function_graph_simple
 ```
 
 ## Implemented But Not Wired
@@ -20,6 +21,7 @@ FunctionGraph
   -> transfer::apply_effects
   -> state::AnalysisState
   -> oracle::Oracle feasibility / implication queries
+  -> driver::analyze_adapted_procedure_simple
   -> rules::{figure5..figure10}
   -> summaries::SummaryTables
 ```
@@ -37,7 +39,54 @@ FunctionGraph
   - `Assume`
   - `Obligation`
   - `Call`
+- `driver.rs` currently explores one acyclic path at a time and checks each
+  obligation independently against the current path formula
 - evidence/model queries still do not exist yet in the active flow
+
+## Current Rule API
+
+The implemented rule layer is declarative, not yet scheduled by a full driver.
+
+- `rules::ReachabilityQuery`
+  is the paper query `⟨ϕ1 ?⇒_P ϕ2⟩`
+- `rules::ProcedureFrame`
+  stores the working carriers for one procedure/query pair
+- `rules::figure5` through `rules::figure10`
+  expose the named rule entry points with paper-facing parameters
+- `summaries::SummaryTables`
+  stores reusable `¬may ⇒ P` and `must ⇒ P` facts
+
+Today the caller must still provide:
+
+- candidate `β` formulas for `NOTMAY_PRE`
+- candidate `θ` formulas for `MUST_POST`
+- local-variable projection closures for summary creation
+
+Those inputs will come from the future driver and the lowered transfer/effect
+layer. The rule module intentionally does not guess them.
+
+## Conservative Checks
+
+Two rule-level checks deserve explicit mention:
+
+- `VERIFIED` and `CREATE_NOTMAYSUMMARY` use an abstract path search over
+  partition regions instead of a concrete execution engine
+- solver `Unknown` is treated conservatively as "the premise may still hold" for
+  overlap/path checks, which prevents unsound proofs
+
+## Current Driver Slice
+
+`driver.rs` currently implements a smaller, executable slice than the paper
+driver:
+
+- it supports one procedure at a time
+- it requires the CFG to be acyclic
+- it rejects calls
+- it uses `transfer.rs` plus SMT feasibility checks to explore concrete branch
+  paths
+
+That is enough to run simple straightline and branchy assertion tests, but it
+is still a temporary bridge to the future rule-driven scheduler.
 
 ## Next Wiring Steps
 

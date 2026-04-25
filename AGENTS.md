@@ -124,6 +124,8 @@ Current reproduced branch milestone is earlier than the later driver/summaries
 plan above:
 
 - CLI-active code stops at LLVM graph generation and DOT dumping.
+- CLI can additionally run `--simple-check`, which executes the current
+  acyclic single-procedure checker.
 - `src/analysis/formula.rs`, `state.rs`, `cfg.rs`, `transfer.rs`, and
   `llvm_adapter.rs` are implemented but not wired into a rule/driver layer yet.
 - `src/analysis/oracle.rs` now owns solver-backed feasibility and implication
@@ -132,6 +134,8 @@ plan above:
   grouped by figure so duplicated rule names remain literal.
 - `src/analysis/summaries.rs` now stores `¬may ⇒ P` and `must ⇒ P` summary
   facts, but no driver consumes them yet.
+- `src/analysis/driver.rs` is currently a temporary acyclic path explorer for
+  simple single-procedure code; it is not the full paper scheduler.
 - `transfer.rs` currently uses one normalized
   `TransferEffect::Assign { target, value }` effect plus `Assume`,
   `Obligation`, `Call`, and `Nop`.

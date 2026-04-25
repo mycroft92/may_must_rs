@@ -76,6 +76,10 @@ impl Obligations {
         &self.obligations
     }
 
+    pub fn clear(&mut self) {
+        self.obligations.clear();
+    }
+
     pub fn collapse(&self) -> Formula {
         Formula::and_all(self.obligations.clone())
     }
@@ -127,6 +131,10 @@ impl NodeState {
 
     pub fn obligations_mut(&mut self) -> &mut Obligations {
         &mut self.obligations
+    }
+
+    pub fn clear_obligations(&mut self) {
+        self.obligations.clear();
     }
 
     pub fn feasibility_formula(&self) -> Formula {
