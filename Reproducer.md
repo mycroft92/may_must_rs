@@ -286,8 +286,8 @@ semantic effects.
 
 Required effect language:
 
-- `AssignTerm { target, value }`
-- `AssignBool { target, value }`
+- `Assign { target, value }`
+  where `value` is either a numeric `Term` or a Boolean `Formula`
 - `Assume(Formula)`
 - `Obligation(Formula)`
 - `Nop`

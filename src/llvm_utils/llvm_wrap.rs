@@ -18,9 +18,10 @@
 
 use llvm_sys::bit_reader::*;
 use llvm_sys::core::*;
+use llvm_sys::ir_reader::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
-use llvm_sys::{LLVMIntPredicate, LLVMOpcode};
+use llvm_sys::{LLVMIntPredicate, LLVMOpcode, LLVMTypeKind};
 use std::ffi::{CStr, CString};
 use std::ptr;
 
@@ -110,6 +111,7 @@ pub enum InstructionOpcode {
     Unknown,
 }
 
+#[allow(unreachable_patterns)]
 impl From<LLVMOpcode> for InstructionOpcode {
     fn from(opcode: LLVMOpcode) -> Self {
         match opcode {
@@ -242,6 +244,29 @@ impl Context {
             Some(Module(module))
         }
     }
+
+    pub fn parse_ir_str(&self, ir: &str, name: &str) -> Option<Module> {
+        unsafe {
+            let name = CString::new(name).unwrap();
+            let buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+                ir.as_ptr() as *const _,
+                ir.len(),
+                name.as_ptr(),
+            );
+            let mut module = ptr::null_mut();
+            let mut error = ptr::null_mut();
+            let status = LLVMParseIRInContext(self.0, buffer, &mut module, &mut error);
+            if status != 0 {
+                if !error.is_null() {
+                    let message = CStr::from_ptr(error).to_string_lossy();
+                    eprintln!("Error parsing IR: {message}");
+                    LLVMDisposeMessage(error);
+                }
+                return None;
+            }
+            Some(Module(module))
+        }
+    }
 }
 
 pub struct Module(LLVMModuleRef);
@@ -283,7 +308,36 @@ impl AsMut<llvm_sys::LLVMModule> for Module {
 #[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct Type(LLVMTypeRef);
 
-impl Type {}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypeKind {
+    Void,
+    Integer(u32),
+    Half,
+    Float,
+    Double,
+    Pointer,
+    Function,
+    Label,
+    Other,
+}
+
+impl Type {
+    pub fn kind(&self) -> TypeKind {
+        unsafe {
+            match LLVMGetTypeKind(self.0) {
+                LLVMTypeKind::LLVMVoidTypeKind => TypeKind::Void,
+                LLVMTypeKind::LLVMIntegerTypeKind => TypeKind::Integer(LLVMGetIntTypeWidth(self.0)),
+                LLVMTypeKind::LLVMHalfTypeKind => TypeKind::Half,
+                LLVMTypeKind::LLVMFloatTypeKind => TypeKind::Float,
+                LLVMTypeKind::LLVMDoubleTypeKind => TypeKind::Double,
+                LLVMTypeKind::LLVMPointerTypeKind => TypeKind::Pointer,
+                LLVMTypeKind::LLVMFunctionTypeKind => TypeKind::Function,
+                LLVMTypeKind::LLVMLabelTypeKind => TypeKind::Label,
+                _ => TypeKind::Other,
+            }
+        }
+    }
+}
 
 #[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct FunctionType(LLVMTypeRef);
@@ -406,6 +460,24 @@ impl BasicBlock {
             Some(Instruction(instr))
         }
     }
+
+    pub fn get_name(&self) -> Option<String> {
+        unsafe {
+            let value = LLVMBasicBlockAsValue(self.0);
+            let mut len = 0;
+            let name = LLVMGetValueName2(value, &mut len);
+            if name.is_null() || len == 0 {
+                return None;
+            }
+            Some(CStr::from_ptr(name).to_string_lossy().into_owned())
+        }
+    }
+
+    pub fn label_token(&self) -> String {
+        self.get_name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("bb_{:p}", self.0))
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
@@ -414,7 +486,7 @@ pub struct Instruction(LLVMValueRef);
 impl Instruction {
     pub fn get_assignment_var(&self) -> Option<String> {
         let instr = self.print();
-        if let Some((name, rest)) = instr.trim().split_once(' ') {
+        if let Some((name, _rest)) = instr.trim().split_once(' ') {
             if (name.len() > 0) && (name.chars().nth(0).unwrap() == '%') {
                 return Some(String::from(&name[1..]));
             }
@@ -488,6 +560,10 @@ impl Instruction {
         }
     }
 
+    pub fn get_type(&self) -> Option<Type> {
+        self.get_ret_type()
+    }
+
     pub fn is_return_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsAReturnInst(self.0);
@@ -508,9 +584,12 @@ impl Instruction {
         }
         unsafe {
             let val = LLVMGetCalledValue(self.0);
-            let name = LLVMGetValueName(val);
-            let name_str = CStr::from_ptr(name).to_string_lossy();
-            return Some(String::from(name_str));
+            let mut len = 0;
+            let name = LLVMGetValueName2(val, &mut len);
+            if name.is_null() || len == 0 {
+                return None;
+            }
+            Some(CStr::from_ptr(name).to_string_lossy().into_owned())
         }
     }
 
@@ -595,6 +674,33 @@ impl Instruction {
         }
     }
 
+    pub fn get_parent_basic_block(&self) -> Option<BasicBlock> {
+        unsafe {
+            let parent = LLVMGetInstructionParent(self.0);
+            if parent.is_null() {
+                None
+            } else {
+                Some(BasicBlock(parent))
+            }
+        }
+    }
+
+    pub fn get_successor_blocks(&self) -> Vec<BasicBlock> {
+        unsafe {
+            if !self.is_terminator_instruction() {
+                return vec![];
+            }
+            let mut ret = Vec::new();
+            for i in 0..LLVMGetNumSuccessors(self.0) {
+                let bb = LLVMGetSuccessor(self.0, i);
+                if !bb.is_null() {
+                    ret.push(BasicBlock(bb));
+                }
+            }
+            ret
+        }
+    }
+
     pub fn get_successors(&self) -> Vec<Instruction> {
         unsafe {
             if !self.is_terminator_instruction() {
@@ -607,6 +713,24 @@ impl Instruction {
                 ret.push(Instruction(first));
             }
             ret
+        }
+    }
+
+    pub fn get_phi_incomings(&self) -> Vec<(BasicBlock, Instruction)> {
+        if self.get_opcode() != InstructionOpcode::PHI {
+            return vec![];
+        }
+        unsafe {
+            let count = LLVMCountIncoming(self.0);
+            let mut res = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let block = LLVMGetIncomingBlock(self.0, index);
+                let value = LLVMGetIncomingValue(self.0, index);
+                if !block.is_null() && !value.is_null() {
+                    res.push((BasicBlock(block), Instruction(value)));
+                }
+            }
+            res
         }
     }
 }

@@ -120,6 +120,20 @@ Do not generate summaries for `may_assert` call edges. If possible do not even g
 - Add examples from the paper as targets for each of these goals. 
 - Do not add fallback summary generations ever. Instead let the analysis discover them automatically as the development progresses.
 
+Current reproduced branch milestone is earlier than the later driver/summaries
+plan above:
+
+- CLI-active code stops at LLVM graph generation and DOT dumping.
+- `src/analysis/formula.rs`, `state.rs`, `cfg.rs`, `transfer.rs`, and
+  `llvm_adapter.rs` are implemented but not wired into a forward/backward
+  driver yet.
+- `transfer.rs` currently uses one normalized
+  `TransferEffect::Assign { target, value }` effect plus `Assume`,
+  `Obligation`, `Call`, and `Nop`.
+- the curated fixture corpus lives under `tests/flow/`.
+- `make -C tests smoke` currently compiles that corpus and runs the graph CLI
+  over the resulting bitcode files.
+
 
 When adding a new active analysis concept:
 
@@ -177,4 +191,3 @@ CARGO_FLAGS=--offline make -C tests smoke
 - Keep C test inputs in `tests/`; generated artifacts belong in `tests/out/`.
 - Keep the active implementation close to the paper and fill only the gaps the
   current milestone needs. 
-

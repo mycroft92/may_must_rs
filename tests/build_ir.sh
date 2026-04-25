@@ -2,7 +2,7 @@
 set -eu
 
 out_dir="tests/out"
-cflags="${CFLAGS:--O0}"
+cflags="${CFLAGS:--O1 -fno-inline -I.}"
 
 if [ "${CLANG:-}" ]; then
     clang_bin="$CLANG"
@@ -26,7 +26,7 @@ mkdir -p "$out_dir"
 printf 'Using %s\n' "$("$clang_bin" --version | sed -n '1p')"
 
 if [ "$#" -eq 0 ]; then
-    set -- tests/*.c
+    set -- tests/flow/*.c
 fi
 
 for src in "$@"; do

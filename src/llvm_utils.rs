@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! LLVM-facing utilities.
 //!
 //! `llvm_wrap` is the unsafe boundary around LLVM's C API. `program_graph`

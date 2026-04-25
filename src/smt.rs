@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! SMT helpers.
 //!
 //! The public split is intentional: solver mechanics live in `Z3Interface`,

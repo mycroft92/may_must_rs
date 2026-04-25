@@ -186,7 +186,7 @@ fn transpose<'src>(s: Assert<'src>) -> Assertion {
     }
 }
 
-fn converter<'src>(s: &'src str) -> Token<'_> {
+fn converter<'src>(s: &'src str) -> Token<'src> {
     use Token::*;
     match s {
         "+" => TPlus,

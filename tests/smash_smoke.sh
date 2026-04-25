@@ -7,26 +7,13 @@ cargo_flags=${CARGO_FLAGS:-}
 
 cd "$repo_root"
 
-./tests/build_ir.sh --out-dir "$out_dir" \
-    tests/smash_must.c \
-    tests/smt_assert_safe.c
+rm -f "$out_dir"/*.bc "$out_dir"/*.ll
+./tests/build_ir.sh --out-dir "$out_dir"
 mkdir -p graph_dot
 
-bug_output=$(cargo run $cargo_flags --bin main -- "$out_dir/smash_must.bc")
-printf '%s\n' "$bug_output"
+cargo build $cargo_flags --bin main >/dev/null
 
-printf '%s\n' "$bug_output" | grep 'Assertion Site <main:e' >/dev/null
-printf '%s\n' "$bug_output" | grep 'Query <main: true => assert_violation(' >/dev/null
-printf '%s\n' "$bug_output" | grep 'Result: REACHABLE' >/dev/null
-printf '%s\n' "$bug_output" | grep 'Verdict: ASSERTION VIOLATION REACHABLE' >/dev/null
-printf '%s\n' "$bug_output" | grep 'Stats:' >/dev/null
-
-safe_output=$(cargo run $cargo_flags --bin main -- "$out_dir/smt_assert_safe.bc")
-printf '%s\n' "$safe_output"
-
-printf '%s\n' "$safe_output" | grep 'Assertion Site <main:e' >/dev/null
-printf '%s\n' "$safe_output" | grep 'Query <main: true => assert_violation(' >/dev/null
-printf '%s\n' "$safe_output" | grep 'Query <main: true => false>' >/dev/null
-printf '%s\n' "$safe_output" | grep 'Result: NOT REACHED' >/dev/null
-printf '%s\n' "$safe_output" | grep 'Verdict: ASSERTION TRUE WHEN REACHED' >/dev/null
-printf '%s\n' "$safe_output" | grep 'Stats:' >/dev/null
+for src in tests/flow/*.c; do
+    stem=$(basename "$src" .c)
+    "$repo_root/target/debug/main" --no-dot "$out_dir/$stem.bc" >/dev/null
+done
