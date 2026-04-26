@@ -2,7 +2,8 @@
 
 ## Current Phase
 
-The active codebase has been reconstructed to the pre-driver milestone:
+The active codebase now has both a temporary bounded explorer and a local
+paper-rule driver:
 
 - implemented and CLI-active:
   - LLVM bitcode parsing
@@ -10,7 +11,10 @@ The active codebase has been reconstructed to the pre-driver milestone:
   - DOT dumping for those graphs
   - C fixture compilation under `tests/flow/`
   - `--simple-check` for the current bounded single-procedure checker
+  - `--rule-check` for the current acyclic scalar rule-driven checker
   - temporary `max_step` loop bounding in `analysis::driver`
+  - query-specific assertion lowering plus local Figure 5/6/7 scheduling in
+    `analysis::driver`
   - integer-array memory modeling and conservative call-memory havoc
 - implemented but not wired:
   - assertion-to-formula translation
@@ -20,11 +24,10 @@ The active codebase has been reconstructed to the pre-driver milestone:
   - SMT oracle feasibility/implication queries
   - named paper rules from Figures 5-10
   - paper summary tables
-  - normalized transfer effects
-  - LLVM-to-paper lowering in `llvm_adapter.rs`
+  - summary-driven call scheduling
+  - memory-aware rule candidate generation
 - planned:
-  - full driver orchestration over the implemented rules
-  - `Pre` / `Post` candidate generation from lowered effects
+  - full driver orchestration over the summary rules
   - loop summaries/invariants
 
 ## Module Mapping
@@ -39,7 +42,7 @@ paper state (Pi_n, Omega_n)    -> src/analysis/state.rs
 oracle SAT/implication         -> src/analysis/oracle.rs
 named paper rules             -> src/analysis/rules.rs
 summary facts                 -> src/analysis/summaries.rs
-temporary bounded driver      -> src/analysis/driver.rs
+bounded + rule driver         -> src/analysis/driver.rs
 normalized local effects       -> src/analysis/transfer.rs
 LLVM adapter lowering          -> src/analysis/llvm_adapter.rs
 raw solver layer               -> src/smt/solver.rs
@@ -54,11 +57,15 @@ raw solver layer               -> src/smt/solver.rs
   to the paper.
 - `summaries.rs` stores summary facts, but summary scheduling still belongs in
   the future driver.
-- `driver.rs` is currently a temporary bounded path explorer that wires the
-  existing lowering, transfer, and oracle pieces into one end-to-end check.
+- `driver.rs` now contains two executable slices:
+  - the broader temporary bounded path explorer
+  - the narrower local rule scheduler for acyclic scalar procedures
 - that bounded driver now produces an explicit per-assertion result and, for
   failing assertions, a symbolic evidence trace built from the explored
   state/edge formulas.
+- the rule-driven slice rewrites each assertion into a synthetic violation-exit
+  query and computes scalar `β` / `θ` candidates from normalized `Assign` /
+  `Assume` effects plus `Gamma_e`.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
   most `max_step` times on one explored path; budget exhaustion yields
   `Unknown`.
@@ -117,10 +124,11 @@ representation choices are deliberately minimal:
 - `Π_n` is stored as a vector of regions; there is no separate partition object
 - `Ω_n` is accumulated as one disjunction per node
 - `N_e` stores exact blocked region pairs rather than a symbolic relation
-- `β`, `θ`, and local-variable projection are explicit rule inputs; the rules do
-  not derive them themselves
-- the current `driver.rs` explores bounded paths directly instead of scheduling
-  the paper rules
+- `β`, `θ`, and local-variable projection remain explicit rule inputs in
+  `rules.rs`; the current `driver.rs` now computes only the scalar acyclic
+  subset of those candidates
+- the current `driver.rs` still uses a separate bounded path explorer for loops,
+  calls, and memory-heavy shapes
 - the current memory model is path-execution-oriented rather than a full paper
   memory abstraction
 

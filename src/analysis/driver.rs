@@ -1,19 +1,29 @@
-//! Minimal intraprocedural driver for the current milestone.
+//! Executable driver slices for the current milestone.
 //!
-//! This driver is intentionally narrow. It handles one lowered procedure at a
-//! time, explores branch paths under a temporary `max_step` loop budget,
-//! applies normalized transfer effects, and uses the SMT oracle to decide
-//! whether embedded `may_assert` obligations are feasible.
+//! This module currently exposes two CLI-usable paths:
 //!
-//! It is not yet the full paper scheduler:
+//! - a temporary bounded path explorer for the wider single-procedure subset
+//! - a first rule-driven scheduler over the paper's local Figure 5/6/7 rules
 //!
-//! - loop handling is temporary and bounded by `max_step`
-//! - no interprocedural summaries
-//! - no automatic `β` / `θ` generation for the named rule layer
+//! The bounded explorer handles one lowered procedure at a time, explores
+//! branch paths under a temporary `max_step` loop budget, applies normalized
+//! transfer effects, and uses the SMT oracle to decide whether embedded
+//! `may_assert` obligations are feasible.
 //!
-//! The purpose is to wire the existing lowering/oracle/transfer pieces into one
-//! honest end-to-end slice for straightline, branchy, and bounded-loop
-//! single-procedure code.
+//! The rule-driven slice is deliberately narrower but closer to the paper. It
+//! constructs one paper query per lowered assertion, derives scalar `β` / `θ`
+//! candidates from normalized edge/node effects, and schedules
+//! `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`, `BUGFOUND`, and
+//! `VERIFIED`.
+//!
+//! It is still not the full paper scheduler:
+//!
+//! - the path explorer still owns the temporary `max_step` loop policy
+//! - the rule scheduler is currently limited to acyclic scalar/SSA procedures
+//! - interprocedural summary rules are implemented but not yet scheduled here
+//!
+//! The purpose is to keep one honest executable slice for the current broader
+//! subset while also making the local paper rules runnable end to end.
 //!
 //! The active CLI-visible result is a per-procedure report with explicit
 //! per-assertion truth values:
@@ -26,18 +36,19 @@
 //! trace showing the explored state formulas that led to the failing
 //! obligation.
 
-use crate::analysis::cfg::{CfgEdge, CfgEdgeId, CfgNodeId};
-use crate::analysis::formula::Formula;
+use crate::analysis::cfg::{Cfg, CfgEdge, CfgEdgeId, CfgNodeId};
+use crate::analysis::formula::{Formula, Memory, Term, Var};
 use crate::analysis::llvm_adapter::{
-    adapt_function_graph, adapt_function_graph_with_purity, AdaptedProcedure, AdapterError,
+    adapt_function_graph, adapt_function_graph_with_purity, AdaptedAssertionSite, AdaptedProcedure,
+    AdapterError,
 };
 use crate::analysis::oracle::{Feasibility, Oracle, OracleError};
-use crate::analysis::rules::QueryJudgement;
+use crate::analysis::rules::{self, ProcedureFrame, QueryJudgement, ReachabilityQuery, RuleError};
 use crate::analysis::state::NodeState;
-use crate::analysis::transfer::{apply_effects, TransferEffect, TransferError};
+use crate::analysis::transfer::{apply_effects, AssignValue, TransferEffect, TransferError};
 use crate::llvm_utils::program_graph::FunctionGraph;
 use log::{debug, log_enabled, Level};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use thiserror::Error;
 
@@ -305,12 +316,80 @@ pub enum DriverError {
     Oracle(#[from] OracleError),
     #[error(transparent)]
     Transfer(#[from] TransferError),
+    #[error(transparent)]
+    Rule(#[from] RuleError),
     #[error("max_step must be at least 1 but found {max_step}")]
     InvalidMaxStep { max_step: usize },
     #[error("unknown CFG node {node:?}")]
     UnknownNode { node: CfgNodeId },
     #[error("missing CFG edge {edge}")]
     MissingEdge { edge: usize },
+    #[error(
+        "rule driver currently supports only acyclic scalar assign/assume procedures; unsupported effect: {effect}"
+    )]
+    UnsupportedRuleEffect { effect: String },
+    #[error(
+        "rule driver currently requires an acyclic CFG until loop summaries/invariants are implemented"
+    )]
+    CyclicRuleProcedure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleProcedureReport {
+    pub procedure: String,
+    pub judgement: QueryJudgement,
+    pub assertions: Vec<RuleAssertionReport>,
+}
+
+impl fmt::Display for RuleProcedureReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut lines = vec![
+            format!("procedure {}", self.procedure),
+            format!("  judgement: {:?}", self.judgement),
+            format!("  assertions: {}", self.assertions.len()),
+        ];
+        for assertion in &self.assertions {
+            lines.push(format!("  assertion {}", assertion.id));
+            lines.push(format!("    location: {}", assertion.location));
+            lines.push(format!("    result: {}", assertion.result));
+            lines.push(format!("    judgement: {:?}", assertion.judgement));
+            lines.push(format!("    rule rounds: {}", assertion.rule_rounds));
+            lines.push(format!(
+                "    rule applications: {}",
+                assertion.rule_applications
+            ));
+            lines.push(format!(
+                "    unknown premises: {}",
+                assertion.unknown_premises
+            ));
+        }
+        write!(f, "{}", lines.join("\n"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleAssertionReport {
+    pub id: usize,
+    pub location: String,
+    pub result: AssertionResult,
+    pub judgement: QueryJudgement,
+    pub rule_rounds: usize,
+    pub rule_applications: usize,
+    pub unknown_premises: usize,
+}
+
+#[derive(Clone, Debug)]
+struct AssertionQueryProcedure {
+    cfg: Cfg,
+    node_effects: BTreeMap<CfgNodeId, Vec<TransferEffect>>,
+    edge_effects: BTreeMap<CfgEdgeId, Vec<TransferEffect>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RuleSearchStats {
+    rounds: usize,
+    applications: usize,
+    unknown_premises: usize,
 }
 
 pub fn analyze_function_graph_simple(
@@ -832,6 +911,652 @@ impl<'a> SimpleExplorer<'a> {
     }
 }
 
+pub fn analyze_function_graph_rules(
+    graph: &FunctionGraph,
+) -> Result<RuleProcedureReport, DriverError> {
+    let adapted = adapt_function_graph(graph)?;
+    analyze_adapted_procedure_rules(&graph.name, &adapted)
+}
+
+pub fn analyze_function_graph_rules_with_purity(
+    graph: &FunctionGraph,
+    memory_pure_functions: &BTreeSet<String>,
+) -> Result<RuleProcedureReport, DriverError> {
+    let adapted = adapt_function_graph_with_purity(graph, memory_pure_functions)?;
+    analyze_adapted_procedure_rules(&graph.name, &adapted)
+}
+
+pub fn analyze_adapted_procedure_rules(
+    procedure: &str,
+    adapted: &AdaptedProcedure,
+) -> Result<RuleProcedureReport, DriverError> {
+    let assertion_sites = collect_assertion_sites(adapted);
+    let mut assertions = Vec::new();
+    for (node, site) in assertion_sites {
+        let query_procedure = build_assertion_query_procedure(adapted, node, &site)?;
+        ensure_rule_query_supported(&query_procedure)?;
+        assertions.push(analyze_assertion_query(procedure, &site, &query_procedure)?);
+    }
+    Ok(RuleProcedureReport {
+        procedure: procedure.to_string(),
+        judgement: aggregate_assertion_judgement(&assertions),
+        assertions,
+    })
+}
+
+fn analyze_assertion_query(
+    procedure: &str,
+    site: &AdaptedAssertionSite,
+    query_procedure: &AssertionQueryProcedure,
+) -> Result<RuleAssertionReport, DriverError> {
+    let oracle = Oracle::new();
+    let query = ReachabilityQuery::new(procedure, Formula::True, Formula::True);
+    let mut frame = ProcedureFrame::new(query_procedure.cfg.clone(), query);
+    rules::figure5::INIT_PI_NE(&mut frame)?;
+    rules::figure6::INIT_OMEGA(&mut frame)?;
+
+    let mut stats = RuleSearchStats::default();
+    loop {
+        match rules::figure6::BUGFOUND(&frame, &oracle)? {
+            QueryJudgement::Yes => {
+                return Ok(rule_assertion_report(site, QueryJudgement::Yes, stats));
+            }
+            QueryJudgement::No | QueryJudgement::Unknown => {}
+        }
+        match rules::figure5::VERIFIED(&frame, &oracle)? {
+            QueryJudgement::No => {
+                return Ok(rule_assertion_report(site, QueryJudgement::No, stats));
+            }
+            QueryJudgement::Yes | QueryJudgement::Unknown => {}
+        }
+
+        stats.rounds += 1;
+        let mut changed = false;
+        changed |= apply_must_post_round(&mut frame, query_procedure, &oracle, &mut stats)?;
+        changed |= apply_notmay_pre_round(&mut frame, query_procedure, &oracle, &mut stats)?;
+        changed |= apply_notmay_closure_round(&mut frame, &oracle, &mut stats)?;
+
+        if !changed {
+            break;
+        }
+    }
+
+    let final_judgement = match rules::figure6::BUGFOUND(&frame, &oracle)? {
+        QueryJudgement::Yes => QueryJudgement::Yes,
+        QueryJudgement::No | QueryJudgement::Unknown => {
+            match rules::figure5::VERIFIED(&frame, &oracle)? {
+                QueryJudgement::No => QueryJudgement::No,
+                QueryJudgement::Yes | QueryJudgement::Unknown => QueryJudgement::Unknown,
+            }
+        }
+    };
+    Ok(rule_assertion_report(site, final_judgement, stats))
+}
+
+fn rule_assertion_report(
+    site: &AdaptedAssertionSite,
+    judgement: QueryJudgement,
+    stats: RuleSearchStats,
+) -> RuleAssertionReport {
+    let result = match judgement {
+        QueryJudgement::No => AssertionResult::True,
+        QueryJudgement::Yes => AssertionResult::False,
+        QueryJudgement::Unknown => AssertionResult::Unknown,
+    };
+    RuleAssertionReport {
+        id: site.id,
+        location: site.location.clone(),
+        result,
+        judgement,
+        rule_rounds: stats.rounds,
+        rule_applications: stats.applications,
+        unknown_premises: stats.unknown_premises,
+    }
+}
+
+fn aggregate_assertion_judgement(assertions: &[RuleAssertionReport]) -> QueryJudgement {
+    if assertions
+        .iter()
+        .any(|assertion| assertion.judgement == QueryJudgement::Yes)
+    {
+        QueryJudgement::Yes
+    } else if assertions
+        .iter()
+        .any(|assertion| assertion.judgement == QueryJudgement::Unknown)
+    {
+        QueryJudgement::Unknown
+    } else {
+        QueryJudgement::No
+    }
+}
+
+fn collect_assertion_sites(adapted: &AdaptedProcedure) -> Vec<(CfgNodeId, AdaptedAssertionSite)> {
+    let mut assertions = adapted
+        .assertions_by_node
+        .iter()
+        .flat_map(|(node, sites)| sites.iter().cloned().map(move |site| (*node, site)))
+        .collect::<Vec<_>>();
+    assertions.sort_by_key(|(_, site)| site.id);
+    assertions
+}
+
+fn build_assertion_query_procedure(
+    adapted: &AdaptedProcedure,
+    assertion_node: CfgNodeId,
+    site: &AdaptedAssertionSite,
+) -> Result<AssertionQueryProcedure, DriverError> {
+    let original_entry = adapted.cfg.entry();
+    let mut cfg = Cfg::new("__query_entry");
+    let mut node_map = BTreeMap::<CfgNodeId, CfgNodeId>::new();
+
+    for original_node in adapted.cfg.nodes().keys().copied() {
+        let label = adapted
+            .cfg
+            .node(original_node)
+            .ok_or(DriverError::UnknownNode {
+                node: original_node,
+            })?
+            .label
+            .clone();
+        node_map.insert(original_node, cfg.add_node(label));
+    }
+
+    cfg.add_edge(cfg.entry(), node_map[&original_entry], Formula::True)
+        .expect("synthetic query entry should connect to the original entry");
+
+    let mut edge_map = BTreeMap::<CfgEdgeId, CfgEdgeId>::new();
+    for (edge_id, edge) in adapted.cfg.edges() {
+        let copied_edge = cfg
+            .add_edge(
+                node_map[&edge.source],
+                node_map[&edge.target],
+                edge.relation.clone(),
+            )
+            .expect("copied edge endpoints should exist");
+        edge_map.insert(*edge_id, copied_edge);
+    }
+
+    let mut node_effects = BTreeMap::<CfgNodeId, Vec<TransferEffect>>::new();
+    for (node, effects) in &adapted.node_effects {
+        let filtered = effects
+            .iter()
+            .filter(|effect| !matches!(effect, TransferEffect::Obligation(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !filtered.is_empty() {
+            node_effects.insert(node_map[node], filtered);
+        }
+    }
+
+    let mut edge_effects = BTreeMap::<CfgEdgeId, Vec<TransferEffect>>::new();
+    for (edge, effects) in &adapted.edge_effects {
+        edge_effects.insert(edge_map[edge], effects.clone());
+    }
+
+    let violation_exit = cfg.add_node(format!("__assert{}_violation", site.id));
+    cfg.mark_exit(violation_exit)
+        .expect("fresh violation exit should be markable");
+    cfg.add_edge(
+        node_map[&assertion_node],
+        violation_exit,
+        site.obligation.clone(),
+    )
+    .expect("violation edge should connect existing nodes");
+    cfg.ensure_single_exit()
+        .expect("assertion query CFG should have one violation exit");
+
+    Ok(AssertionQueryProcedure {
+        cfg,
+        node_effects,
+        edge_effects,
+    })
+}
+
+fn ensure_rule_query_supported(
+    query_procedure: &AssertionQueryProcedure,
+) -> Result<(), DriverError> {
+    // APPROX_HEAVY: until loop summaries/invariants exist, the rule-driven
+    // slice rejects cyclic CFGs and leaves loop handling to the temporary
+    // bounded explorer.
+    if !cfg_is_acyclic(&query_procedure.cfg) {
+        return Err(DriverError::CyclicRuleProcedure);
+    }
+    for effects in query_procedure
+        .node_effects
+        .values()
+        .chain(query_procedure.edge_effects.values())
+    {
+        for effect in effects {
+            match effect {
+                TransferEffect::Assign { .. } | TransferEffect::Assume(_) | TransferEffect::Nop => {
+                }
+                other => {
+                    return Err(DriverError::UnsupportedRuleEffect {
+                        effect: format!("{other:?}"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cfg_is_acyclic(cfg: &Cfg) -> bool {
+    let mut indegree = cfg
+        .nodes()
+        .keys()
+        .copied()
+        .map(|node| (node, 0usize))
+        .collect::<BTreeMap<_, _>>();
+    for edge in cfg.edges().values() {
+        *indegree.entry(edge.target).or_default() += 1;
+    }
+    let mut queue = indegree
+        .iter()
+        .filter_map(|(node, degree)| (*degree == 0).then_some(*node))
+        .collect::<VecDeque<_>>();
+    let mut visited = 0usize;
+    let mut remaining = indegree;
+    while let Some(node) = queue.pop_front() {
+        visited += 1;
+        for edge in cfg
+            .outgoing_edges(node)
+            .expect("acyclicity check only visits known nodes")
+        {
+            let target = cfg
+                .edge(edge)
+                .expect("known edge id should exist during acyclicity check")
+                .target;
+            let degree = remaining
+                .get_mut(&target)
+                .expect("target node should exist during acyclicity check");
+            *degree -= 1;
+            if *degree == 0 {
+                queue.push_back(target);
+            }
+        }
+    }
+    visited == cfg.nodes().len()
+}
+
+fn apply_must_post_round(
+    frame: &mut ProcedureFrame,
+    query_procedure: &AssertionQueryProcedure,
+    oracle: &Oracle,
+    stats: &mut RuleSearchStats,
+) -> Result<bool, DriverError> {
+    let mut changed = false;
+    let edges = frame.cfg().edges().keys().copied().collect::<Vec<_>>();
+    for edge_id in edges {
+        let edge = frame
+            .cfg()
+            .edge(edge_id)
+            .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+        let source_regions = frame
+            .partition(edge.source)
+            .ok_or(DriverError::Rule(RuleError::MissingPartition {
+                node: edge.source,
+            }))?
+            .to_vec();
+        let target_regions = frame
+            .partition(edge.target)
+            .ok_or(DriverError::Rule(RuleError::MissingPartition {
+                node: edge.target,
+            }))?
+            .to_vec();
+        let omega_source = frame.omega(edge.source).cloned().unwrap_or(Formula::False);
+        let theta = Formula::and(
+            omega_source,
+            forward_step_formula(query_procedure, edge_id)?,
+        );
+        for phi_1 in &source_regions {
+            for phi_2 in &target_regions {
+                changed |= attempt_mutating_rule(frame, stats, |frame| {
+                    rules::figure7::MUST_POST(frame, edge_id, phi_1, phi_2, theta.clone(), oracle)
+                })?;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn apply_notmay_pre_round(
+    frame: &mut ProcedureFrame,
+    query_procedure: &AssertionQueryProcedure,
+    oracle: &Oracle,
+    stats: &mut RuleSearchStats,
+) -> Result<bool, DriverError> {
+    let mut changed = false;
+    let edges = frame.cfg().edges().keys().copied().collect::<Vec<_>>();
+    for edge_id in edges {
+        let edge = frame
+            .cfg()
+            .edge(edge_id)
+            .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+        let source_regions = frame
+            .partition(edge.source)
+            .ok_or(DriverError::Rule(RuleError::MissingPartition {
+                node: edge.source,
+            }))?
+            .to_vec();
+        let target_regions = frame
+            .partition(edge.target)
+            .ok_or(DriverError::Rule(RuleError::MissingPartition {
+                node: edge.target,
+            }))?
+            .to_vec();
+        for phi_1 in &source_regions {
+            for phi_2 in &target_regions {
+                let beta = backward_pre_candidate(query_procedure, edge_id, phi_2)?;
+                changed |= attempt_mutating_rule(frame, stats, |frame| {
+                    rules::figure7::NOTMAY_PRE(frame, edge_id, phi_1, phi_2, beta.clone(), oracle)
+                })?;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn apply_notmay_closure_round(
+    frame: &mut ProcedureFrame,
+    oracle: &Oracle,
+    stats: &mut RuleSearchStats,
+) -> Result<bool, DriverError> {
+    let mut changed = false;
+    let edges = frame.cfg().edges().keys().copied().collect::<Vec<_>>();
+    for edge_id in edges {
+        let edge = frame
+            .cfg()
+            .edge(edge_id)
+            .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+        let source_regions = frame
+            .partition(edge.source)
+            .ok_or(DriverError::Rule(RuleError::MissingPartition {
+                node: edge.source,
+            }))?
+            .to_vec();
+        let target_regions = frame
+            .partition(edge.target)
+            .ok_or(DriverError::Rule(RuleError::MissingPartition {
+                node: edge.target,
+            }))?
+            .to_vec();
+        let blocked_pairs = frame.notmay_pairs(edge_id).unwrap_or(&[]).to_vec();
+        for pair in &blocked_pairs {
+            for phi_prime_1 in &source_regions {
+                changed |= attempt_mutating_rule(frame, stats, |frame| {
+                    rules::figure5::IMPL_LEFT(
+                        frame,
+                        edge_id,
+                        &pair.pre_region,
+                        &pair.post_region,
+                        phi_prime_1,
+                        oracle,
+                    )
+                })?;
+            }
+            for phi_prime_2 in &target_regions {
+                changed |= attempt_mutating_rule(frame, stats, |frame| {
+                    rules::figure5::IMPL_RIGHT(
+                        frame,
+                        edge_id,
+                        &pair.pre_region,
+                        &pair.post_region,
+                        phi_prime_2,
+                        oracle,
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn attempt_mutating_rule<F>(
+    frame: &mut ProcedureFrame,
+    stats: &mut RuleSearchStats,
+    apply_rule: F,
+) -> Result<bool, DriverError>
+where
+    F: FnOnce(&mut ProcedureFrame) -> Result<(), RuleError>,
+{
+    let before = frame.clone();
+    match apply_rule(frame) {
+        Ok(()) => {
+            let changed = *frame != before;
+            if changed {
+                stats.applications += 1;
+            }
+            Ok(changed)
+        }
+        Err(RuleError::PremiseUnknown { .. }) => {
+            stats.unknown_premises += 1;
+            Ok(false)
+        }
+        Err(RuleError::PremiseNotSatisfied { .. })
+        | Err(RuleError::RegionNotInPartition { .. })
+        | Err(RuleError::MissingNotMayPair { .. }) => Ok(false),
+        Err(error) => Err(DriverError::Rule(error)),
+    }
+}
+
+fn forward_step_formula(
+    query_procedure: &AssertionQueryProcedure,
+    edge_id: CfgEdgeId,
+) -> Result<Formula, DriverError> {
+    let edge = query_procedure
+        .cfg
+        .edge(edge_id)
+        .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+    let mut formulas = Vec::new();
+    if edge.relation != Formula::True {
+        formulas.push(edge.relation.clone());
+    }
+    if let Some(effects) = query_procedure.edge_effects.get(&edge_id) {
+        formulas.extend(effect_formulas_for_rules(effects)?);
+    }
+    if let Some(effects) = query_procedure.node_effects.get(&edge.target) {
+        formulas.extend(effect_formulas_for_rules(effects)?);
+    }
+    Ok(Formula::and_all(formulas))
+}
+
+fn backward_pre_candidate(
+    query_procedure: &AssertionQueryProcedure,
+    edge_id: CfgEdgeId,
+    phi_2: &Formula,
+) -> Result<Formula, DriverError> {
+    let edge = query_procedure
+        .cfg
+        .edge(edge_id)
+        .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+    let mut current = phi_2.clone();
+    if let Some(effects) = query_procedure.node_effects.get(&edge.target) {
+        for effect in effects.iter().rev() {
+            current = backward_pre_through_effect(current, effect)?;
+        }
+    }
+    if let Some(effects) = query_procedure.edge_effects.get(&edge_id) {
+        for effect in effects.iter().rev() {
+            current = backward_pre_through_effect(current, effect)?;
+        }
+    }
+    if edge.relation != Formula::True {
+        current = Formula::and(edge.relation.clone(), current);
+    }
+    Ok(current)
+}
+
+fn effect_formulas_for_rules(effects: &[TransferEffect]) -> Result<Vec<Formula>, DriverError> {
+    let mut formulas = Vec::new();
+    for effect in effects {
+        match effect {
+            TransferEffect::Assign { target, value } => match value {
+                AssignValue::Term(term) => {
+                    formulas.push(Formula::eq(Term::Var(target.clone()), term.clone()));
+                }
+                AssignValue::Predicate(formula) => {
+                    formulas.push(Formula::iff(Formula::Var(target.clone()), formula.clone()));
+                }
+            },
+            TransferEffect::Assume(formula) => formulas.push(formula.clone()),
+            TransferEffect::Nop => {}
+            other => {
+                return Err(DriverError::UnsupportedRuleEffect {
+                    effect: format!("{other:?}"),
+                });
+            }
+        }
+    }
+    Ok(formulas)
+}
+
+fn backward_pre_through_effect(
+    formula: Formula,
+    effect: &TransferEffect,
+) -> Result<Formula, DriverError> {
+    match effect {
+        TransferEffect::Assign { target, value } => match value {
+            AssignValue::Term(term) => Ok(substitute_term_assignment(&formula, target, term)),
+            AssignValue::Predicate(predicate) => {
+                Ok(substitute_bool_assignment(&formula, target, predicate))
+            }
+        },
+        TransferEffect::Assume(guard) => Ok(Formula::and(guard.clone(), formula)),
+        TransferEffect::Nop => Ok(formula),
+        other => Err(DriverError::UnsupportedRuleEffect {
+            effect: format!("{other:?}"),
+        }),
+    }
+}
+
+fn substitute_term_assignment(formula: &Formula, target: &Var, replacement: &Term) -> Formula {
+    match formula {
+        Formula::True => Formula::True,
+        Formula::False => Formula::False,
+        Formula::Var(var) => Formula::Var(var.clone()),
+        Formula::Not(inner) => Formula::not(substitute_term_assignment(inner, target, replacement)),
+        Formula::And(items) => Formula::and_all(
+            items
+                .iter()
+                .map(|item| substitute_term_assignment(item, target, replacement))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Or(items) => Formula::or_all(
+            items
+                .iter()
+                .map(|item| substitute_term_assignment(item, target, replacement))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Implies(lhs, rhs) => Formula::implies(
+            substitute_term_assignment(lhs, target, replacement),
+            substitute_term_assignment(rhs, target, replacement),
+        ),
+        Formula::Eq(lhs, rhs) => Formula::eq(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Formula::Lt(lhs, rhs) => Formula::lt(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Formula::Le(lhs, rhs) => Formula::le(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Formula::Gt(lhs, rhs) => Formula::gt(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Formula::Ge(lhs, rhs) => Formula::ge(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+    }
+}
+
+fn substitute_bool_assignment(formula: &Formula, target: &Var, replacement: &Formula) -> Formula {
+    match formula {
+        Formula::True => Formula::True,
+        Formula::False => Formula::False,
+        Formula::Var(var) => {
+            if var == target {
+                replacement.clone()
+            } else {
+                Formula::Var(var.clone())
+            }
+        }
+        Formula::Not(inner) => Formula::not(substitute_bool_assignment(inner, target, replacement)),
+        Formula::And(items) => Formula::and_all(
+            items
+                .iter()
+                .map(|item| substitute_bool_assignment(item, target, replacement))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Or(items) => Formula::or_all(
+            items
+                .iter()
+                .map(|item| substitute_bool_assignment(item, target, replacement))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Implies(lhs, rhs) => Formula::implies(
+            substitute_bool_assignment(lhs, target, replacement),
+            substitute_bool_assignment(rhs, target, replacement),
+        ),
+        Formula::Eq(lhs, rhs) => Formula::eq(lhs.clone(), rhs.clone()),
+        Formula::Lt(lhs, rhs) => Formula::lt(lhs.clone(), rhs.clone()),
+        Formula::Le(lhs, rhs) => Formula::le(lhs.clone(), rhs.clone()),
+        Formula::Gt(lhs, rhs) => Formula::gt(lhs.clone(), rhs.clone()),
+        Formula::Ge(lhs, rhs) => Formula::ge(lhs.clone(), rhs.clone()),
+    }
+}
+
+fn substitute_term(term: &Term, target: &Var, replacement: &Term) -> Term {
+    match term {
+        Term::Var(var) => {
+            if var == target {
+                replacement.clone()
+            } else {
+                Term::Var(var.clone())
+            }
+        }
+        Term::Int(value) => Term::int(*value),
+        Term::Real(value) => Term::Real(value.clone()),
+        Term::Select(memory, index) => Term::select(
+            substitute_memory(memory, target, replacement),
+            substitute_term(index, target, replacement),
+        ),
+        Term::Add(lhs, rhs) => Term::add(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Term::Sub(lhs, rhs) => Term::sub(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Term::Mul(lhs, rhs) => Term::mul(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Term::Div(lhs, rhs) => Term::div(
+            substitute_term(lhs, target, replacement),
+            substitute_term(rhs, target, replacement),
+        ),
+        Term::Neg(inner) => Term::neg(substitute_term(inner, target, replacement)),
+    }
+}
+
+fn substitute_memory(memory: &Memory, target: &Var, replacement: &Term) -> Memory {
+    match memory {
+        Memory::Var(name) => Memory::var(name.clone()),
+        Memory::Store(inner, index, value) => Memory::store(
+            substitute_memory(inner, target, replacement),
+            substitute_term(index, target, replacement),
+            substitute_term(value, target, replacement),
+        ),
+    }
+}
+
 fn effect_predicates(effects: &[TransferEffect]) -> Vec<Formula> {
     let mut predicates = Vec::new();
     for effect in effects {
@@ -922,6 +1647,22 @@ mod tests {
         let pure = crate::analysis::llvm_adapter::infer_memory_pure_functions(&graphs);
         let graph = graphs.iter().find(|graph| graph.name == name).unwrap();
         analyze_function_graph_simple_with_purity(graph, &pure, options).unwrap()
+    }
+
+    fn analyze_first_rules(ir: &str) -> RuleProcedureReport {
+        initialize_target();
+        let context = Context::new();
+        let module = context.parse_ir_str(ir, "driver_rule_test").unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        analyze_function_graph_rules(&graphs[0]).unwrap()
+    }
+
+    fn analyze_first_rules_err(ir: &str) -> DriverError {
+        initialize_target();
+        let context = Context::new();
+        let module = context.parse_ir_str(ir, "driver_rule_test").unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        analyze_function_graph_rules(&graphs[0]).unwrap_err()
     }
 
     #[test]
@@ -1210,5 +1951,76 @@ mod tests {
         assert!(rendered.contains("result: false"));
         assert!(rendered.contains("evidence trace:"));
         assert!(rendered.contains("assertion 1"));
+    }
+
+    #[test]
+    fn rule_driver_proves_a_straight_line_assertion_safe() {
+        let report = analyze_first_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @main() {
+                entry:
+                    %x = add i32 2, 3
+                    %ok = icmp eq i32 %x, 5
+                    call void @may_assert(i1 %ok)
+                    ret i32 %x
+                }
+            "#,
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::True);
+    }
+
+    #[test]
+    fn rule_driver_finds_an_unsafe_branch_assertion() {
+        let report = analyze_first_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i32 %x) {
+                entry:
+                    %cond = icmp sgt i32 %x, 0
+                    br i1 %cond, label %then, label %else
+                then:
+                    %bad = icmp slt i32 %x, 0
+                    call void @may_assert(i1 %bad)
+                    br label %exit
+                else:
+                    call void @may_assert(i1 true)
+                    br label %exit
+                exit:
+                    ret void
+                }
+            "#,
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::Yes);
+        assert_eq!(report.assertions.len(), 2);
+        assert_eq!(report.assertions[0].result, AssertionResult::False);
+        assert!(report.assertions[0].rule_applications > 0);
+    }
+
+    #[test]
+    fn rule_driver_rejects_loops_before_invariants_exist() {
+        let error = analyze_first_rules_err(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i1 %keep_looping) {
+                entry:
+                    br label %loop
+                loop:
+                    call void @may_assert(i1 true)
+                    br i1 %keep_looping, label %loop, label %exit
+                exit:
+                    ret void
+                }
+            "#,
+        );
+
+        assert_eq!(error, DriverError::CyclicRuleProcedure);
     }
 }

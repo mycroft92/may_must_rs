@@ -2,7 +2,8 @@ Experimental LLVM may/must analysis work. MIT Licensed.
 
 ## Current Status
 
-The repository has been reconstructed to the paper-shaped pre-driver milestone.
+The repository now has two executable driver slices: a broader temporary
+bounded checker and a narrower paper-shaped local rule driver.
 
 Implemented and CLI-active:
 
@@ -11,6 +12,7 @@ Implemented and CLI-active:
 - DOT graph dumping
 - fixture compilation under `tests/flow/`
 - `--simple-check` for the current bounded single-procedure checker
+- `--rule-check` for the current acyclic scalar rule-driven checker
 - integer-array memory modeling for `alloca` / `load` / `store` / `gep`
 - conservative call handling with memory-preserving vs memory-havocing callees
 
@@ -25,12 +27,12 @@ Implemented but not wired:
 - paper summary tables for `¬may ⇒ P` and `must ⇒ P`
 - normalized transfer effects
 - LLVM adapter lowering into `Cfg + node_effects + edge_effects`
-- minimal intraprocedural bounded driver in `analysis::driver`
+- summary-driven calls and loop invariants in `analysis::driver`
 
 Planned:
 
-- full driver orchestration over the named paper rules
-- summaries and loop invariants
+- summary-rule scheduling for calls
+- loop summaries and invariants
 
 ## How To Run
 
@@ -69,6 +71,16 @@ Run the checker with per-step predicate tracing as debug logs:
 ```sh
 cargo run --bin main -- --trace-predicates --max-step 2 --no-dot tests/out/multi_exit.bc
 ```
+
+Run the current rule-driven checker:
+
+```sh
+cargo run --bin main -- --rule-check --no-dot <bitcode-file>
+```
+
+That flag is CLI-active today, but it currently supports only acyclic
+scalar/SSA-like bitcode. Many `-O0` C fixtures are still reported unsupported
+there because Clang lowers them through stack memory operations.
 
 Run unit tests:
 
@@ -131,6 +143,21 @@ That checker is intentionally limited:
   directly by the `analysis::driver` unit tests today
 - it explores paths directly instead of scheduling the full paper rule engine
 
+With `--rule-check`, the CLI runs the current local Figure 5/6/7 scheduler
+over one assertion query at a time and prints one summary block per procedure.
+
+That rule-driven checker is intentionally narrower:
+
+- it rewrites each assertion into a query-specific synthetic violation exit and
+  computes scalar `β` / `θ` candidates from `Assign` / `Assume` effects plus
+  `Gamma_e`
+- it currently requires an acyclic scalar/SSA-like CFG; loops, calls, and
+  memory effects are reported unsupported there for now
+- many `-O0` C fixtures therefore remain unsupported under `--rule-check`
+  today because Clang lowers them through stack memory operations
+- it schedules local `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`,
+  `IMPL_LEFT`, `IMPL_RIGHT`, `BUGFOUND`, and `VERIFIED`
+
 ## Active Architecture
 
 ```text
@@ -142,7 +169,7 @@ src/analysis/cfg.rs             -> P / n / e / Gamma_e
 src/analysis/oracle.rs          -> SMT feasibility / implication boundary
 src/analysis/rules.rs           -> named rules from Figures 5-10
 src/analysis/summaries.rs       -> `¬may ⇒ P` / `must ⇒ P` tables
-src/analysis/driver.rs          -> current bounded end-to-end checker
+src/analysis/driver.rs          -> bounded explorer + local rule-driven scheduler
 src/analysis/transfer.rs        -> normalized local effects
 src/analysis/llvm_adapter.rs    -> FunctionGraph -> cfg + node/edge effects
 src/smt/solver.rs               -> raw Z3 lowering
@@ -173,18 +200,21 @@ The rule implementation in [src/analysis/rules.rs](/Users/mycroft/work/pl_projec
 - `figure5` through `figure10` expose the named rule entry points directly
 - `SummaryTables` in [src/analysis/summaries.rs](/Users/mycroft/work/pl_projects/may_must/src/analysis/summaries.rs:1) stores `¬may ⇒ P` and `must ⇒ P` facts
 
-The rules are paper-shaped but still unwired:
+The rules are now partially wired:
 
-- they do not compute `β`, `θ`, `Pre`, or `Post`
-- they do not schedule themselves
-- they do not yet consume real call edges from the LLVM adapter
+- `driver.rs` computes scalar `β` / `θ` candidates for local acyclic
+  `Assign` / `Assume` procedures
+- `driver.rs` schedules the local Figure 5/6/7 rules per assertion query
 
-Those pieces are the next job for the full paper driver, beyond the current
-bounded checker in `analysis::driver`.
+Still unwired:
+
+- summary-driven call rules from Figures 8-10
+- memory-aware rule candidates
+- loop invariants / loop summaries
 
 ## Next Milestone
 
-1. Replace the current bounded checker with rule-driven orchestration over lowered procedures.
-2. Wire the current `rules.rs` over `Cfg + state + oracle + summaries`.
-3. Add CLI assertion selection/query integration.
-4. Replace temporary `max_step` handling with loop summaries/invariants.
+1. Extend the rule-driven driver beyond the current acyclic scalar Figure 5/6/7 slice.
+2. Wire summary-driven call scheduling from Figures 8-10.
+3. Add loop summaries / invariants and retire the temporary bounded loop explorer.
+4. Add real solver model/evidence queries for rule-driven counterexamples.

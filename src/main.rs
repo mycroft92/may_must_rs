@@ -1,8 +1,11 @@
 //! CLI entry point for the reconstructed milestone.
 //!
 //! The active CLI surface stops at LLVM graph construction and DOT dumping.
-//! The paper-shaped CFG/effect lowering exists in the crate and is unit-tested,
-//! and a minimal bounded single-procedure checker can now be run explicitly.
+//! The paper-shaped CFG/effect lowering exists in the crate and is unit-tested.
+//! The current executable surfaces are:
+//!
+//! - `--simple-check` for the broader temporary bounded checker
+//! - `--rule-check` for the narrower local rule-driven scheduler
 
 mod analysis;
 mod assertions;
@@ -18,8 +21,13 @@ use llvm_utils::program_graph::{dump_graphs, generate_program_graph};
 use log::LevelFilter;
 use std::path::Path;
 
-enum ProcedureSummary {
+enum SimpleProcedureSummary {
     Checked(analysis::driver::SimpleProcedureReport),
+    Unsupported { procedure: String, reason: String },
+}
+
+enum RuleProcedureSummary {
+    Checked(analysis::driver::RuleProcedureReport),
     Unsupported { procedure: String, reason: String },
 }
 
@@ -28,6 +36,7 @@ fn main() {
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
         .arg(arg!(--"simple-check" "Run the current bounded single-procedure checker"))
+        .arg(arg!(--"rule-check" "Run the current acyclic scalar rule-driven checker"))
         .arg(arg!(--"trace-predicates" "Emit predicate traces for the simple checker as debug logs"))
         .arg(
             arg!(--"max-step" <MAX_STEP> "Temporary per-edge loop visit bound for the simple checker")
@@ -42,6 +51,7 @@ fn main() {
     let trace_predicates = matches.get_flag("trace-predicates");
     let max_step = *matches.get_one::<usize>("max-step").unwrap();
     let simple_check = matches.get_flag("simple-check") || trace_predicates;
+    let rule_check = matches.get_flag("rule-check");
     init_logging(trace_predicates);
     initialize_target();
 
@@ -55,6 +65,7 @@ fn main() {
         input,
         dump_dot,
         simple_check,
+        rule_check,
         analysis::driver::SimpleDriverOptions {
             max_step,
             trace_predicates,
@@ -77,11 +88,13 @@ fn handle(
     input_file: &str,
     dump_dot: bool,
     simple_check: bool,
+    rule_check: bool,
     options: analysis::driver::SimpleDriverOptions,
 ) {
     match generate_program_graph(&module) {
         Ok(graphs) => {
-            let mut summaries = Vec::<ProcedureSummary>::new();
+            let mut simple_summaries = Vec::<SimpleProcedureSummary>::new();
+            let mut rule_summaries = Vec::<RuleProcedureSummary>::new();
             let memory_pure_functions =
                 analysis::llvm_adapter::infer_memory_pure_functions(&graphs);
             if dump_dot {
@@ -102,8 +115,22 @@ fn handle(
                         &memory_pure_functions,
                         options.clone(),
                     ) {
-                        Ok(report) => summaries.push(ProcedureSummary::Checked(report)),
-                        Err(error) => summaries.push(ProcedureSummary::Unsupported {
+                        Ok(report) => {
+                            simple_summaries.push(SimpleProcedureSummary::Checked(report))
+                        }
+                        Err(error) => simple_summaries.push(SimpleProcedureSummary::Unsupported {
+                            procedure: graph.name.clone(),
+                            reason: error.to_string(),
+                        }),
+                    }
+                }
+                if rule_check {
+                    match analysis::driver::analyze_function_graph_rules_with_purity(
+                        graph,
+                        &memory_pure_functions,
+                    ) {
+                        Ok(report) => rule_summaries.push(RuleProcedureSummary::Checked(report)),
+                        Err(error) => rule_summaries.push(RuleProcedureSummary::Unsupported {
                             procedure: graph.name.clone(),
                             reason: error.to_string(),
                         }),
@@ -113,19 +140,34 @@ fn handle(
             if simple_check {
                 println!();
                 println!("Simple-check summaries:");
-                for summary in summaries {
+                for summary in simple_summaries {
                     match summary {
-                        ProcedureSummary::Checked(report) => println!("{report}"),
-                        ProcedureSummary::Unsupported { procedure, reason } => {
+                        SimpleProcedureSummary::Checked(report) => println!("{report}"),
+                        SimpleProcedureSummary::Unsupported { procedure, reason } => {
                             println!("procedure {procedure}");
                             println!("  unsupported: {reason}");
                         }
                     }
                     println!();
                 }
-            } else {
+            }
+            if rule_check {
+                println!();
+                println!("Rule-check summaries:");
+                for summary in rule_summaries {
+                    match summary {
+                        RuleProcedureSummary::Checked(report) => println!("{report}"),
+                        RuleProcedureSummary::Unsupported { procedure, reason } => {
+                            println!("procedure {procedure}");
+                            println!("  unsupported: {reason}");
+                        }
+                    }
+                    println!();
+                }
+            }
+            if !simple_check && !rule_check {
                 println!(
-                    "Paper CFG/transfer lowering is implemented; use --simple-check for the current bounded branch checker."
+                    "Paper CFG/transfer lowering is implemented; use --simple-check for the bounded checker or --rule-check for the current rule-driven scalar DAG checker."
                 );
             }
         }

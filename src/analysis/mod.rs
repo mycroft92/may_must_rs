@@ -5,9 +5,9 @@
 //! Current milestone status:
 //!
 //! - implemented but not wired: `formula`, `state`, `cfg`, `transfer`,
-//!   `llvm_adapter`, `oracle`, `rules`, `summaries`;
-//! - implemented for the current bounded subset: `driver`;
-//! - planned: full forward/backward rule scheduling and loop invariants.
+//!   `llvm_adapter`, `oracle`, `summaries`;
+//! - implemented and CLI-active for local paper execution: `rules`, `driver`;
+//! - planned: summary-driven call scheduling and loop invariants.
 //!
 //! The intention is to keep this tree LLVM-independent except for
 //! `llvm_adapter`, which lowers one `FunctionGraph` into the paper-shaped CFG

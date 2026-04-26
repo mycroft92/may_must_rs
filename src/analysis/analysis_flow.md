@@ -8,6 +8,7 @@ LLVM bitcode
   -> program_graph::generate_program_graph
   -> optional DOT dump
   -> optional driver::analyze_function_graph_simple
+  -> optional driver::analyze_function_graph_rules
 ```
 
 ## Implemented But Not Wired
@@ -21,7 +22,7 @@ FunctionGraph
   -> transfer::apply_effects
   -> state::AnalysisState
   -> oracle::Oracle feasibility / implication queries
-  -> driver::analyze_adapted_procedure_simple
+  -> driver::{analyze_adapted_procedure_simple, analyze_adapted_procedure_rules}
   -> rules::{figure5..figure10}
   -> summaries::SummaryTables
 ```
@@ -43,17 +44,20 @@ FunctionGraph
   - `Assume`
   - `Obligation`
   - `Call`
-- `driver.rs` currently explores one bounded path at a time and checks each
-  obligation independently against the current path formula
+- `driver.rs` currently offers two executable slices:
+  - a bounded path explorer that checks obligations against the current path
+    formula
+  - a local rule scheduler that rewrites each assertion into a synthetic
+    violation-exit query and runs Figure 5/6/7 over it
 - repeated loop traversals are cut off by the temporary per-edge `max_step`
-  budget in `driver.rs`
+  budget in the bounded slice of `driver.rs`
 - impure calls havoc the currently tracked integer-array memory regions
 - false assertions already carry a symbolic driver-collected evidence trace,
   but solver model/evidence queries still do not exist yet in the active flow
 
 ## Current Rule API
 
-The implemented rule layer is declarative, not yet scheduled by a full driver.
+The implemented rule layer is now partially scheduled by `driver.rs`.
 
 - `rules::ReachabilityQuery`
   is the paper query `⟨ϕ1 ?⇒_P ϕ2⟩`
@@ -64,14 +68,15 @@ The implemented rule layer is declarative, not yet scheduled by a full driver.
 - `summaries::SummaryTables`
   stores reusable `¬may ⇒ P` and `must ⇒ P` facts
 
-Today the caller must still provide:
+Today the remaining caller/driver work is:
 
-- candidate `β` formulas for `NOTMAY_PRE`
-- candidate `θ` formulas for `MUST_POST`
+- candidate `β` formulas for memory/call-aware `NOTMAY_PRE`
+- candidate `θ` formulas for memory/call-aware `MUST_POST`
 - local-variable projection closures for summary creation
 
-Those inputs will come from the future driver and the lowered transfer/effect
-layer. The rule module intentionally does not guess them.
+The current driver already computes the scalar acyclic `Assign` / `Assume`
+subset of `β` / `θ`. The remaining pieces belong to the future summary-aware
+driver work.
 
 ## Conservative Checks
 
@@ -87,21 +92,30 @@ Two rule-level checks deserve explicit mention:
 `driver.rs` currently implements a smaller, executable slice than the paper
 driver:
 
-- it supports one procedure at a time
-- it bounds loop exploration by per-edge `max_step`
-- it supports local integer-array memory
-- it treats calls conservatively: unconstrained returns plus memory havoc unless
-  the callee is inferred memory-pure
-- it uses `transfer.rs` plus SMT feasibility checks to explore concrete branch
-  paths and report explicit per-assertion `true` / `false` / `unknown`
-  outcomes
+- bounded slice:
+  - it supports one procedure at a time
+  - it bounds loop exploration by per-edge `max_step`
+  - it supports local integer-array memory
+  - it treats calls conservatively: unconstrained returns plus memory havoc
+    unless the callee is inferred memory-pure
+  - it uses `transfer.rs` plus SMT feasibility checks to explore concrete
+    branch paths and report explicit per-assertion `true` / `false` /
+    `unknown` outcomes
+- rule-driven slice:
+  - it supports one procedure at a time
+  - it currently requires an acyclic scalar/SSA-like CFG
+  - it builds one query-specific synthetic violation exit per assertion
+  - it computes scalar `β` / `θ` candidates from normalized `Assign` /
+    `Assume` effects and `Gamma_e`
+  - it schedules local Figure 5/6/7 rules plus `IMPL_LEFT` / `IMPL_RIGHT`
 
-That is enough to run simple straightline, branchy, and bounded-loop assertion
-tests, but it is still a temporary bridge to the future rule-driven scheduler.
+That is enough to run straightline and branchy rule-driven unit tests plus the
+broader bounded-loop temporary checker, but summary-driven calls and loop
+invariants still remain for the future driver.
 
 ## Next Wiring Steps
 
-1. Add `driver.rs` to orchestrate the implemented figure modules.
-2. Connect lowered effects to rule-premise generation (`β`, `θ`, and call summaries).
-3. Add CLI query integration for assertions.
-4. Replace temporary `max_step` handling with loop summaries / invariants.
+1. Extend the current rule scheduler to Figures 8-10 call/summary rules.
+2. Connect lowered memory/call effects to richer `β` / `θ` generation.
+3. Replace temporary `max_step` handling with loop summaries / invariants.
+4. Add real solver model/evidence extraction for rule-driven counterexamples.

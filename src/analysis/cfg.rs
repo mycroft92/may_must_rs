@@ -47,7 +47,7 @@ impl CfgEdge {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cfg {
     nodes: BTreeMap<CfgNodeId, CfgNode>,
     edges: BTreeMap<CfgEdgeId, CfgEdge>,

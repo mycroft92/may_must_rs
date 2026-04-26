@@ -76,7 +76,7 @@ pub struct NotMayPair {
 /// This is the mutable frame over which the named rules operate. It does not
 /// choose which rule to apply; it only stores the state those rules read and
 /// update.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcedureFrame {
     cfg: Cfg,
     query: ReachabilityQuery,
@@ -119,7 +119,7 @@ impl ProcedureFrame {
     }
 
     /// Returns the blocked abstract pairs currently stored in `N_e`.
-    pub fn ne(&self, edge: CfgEdgeId) -> Option<&[NotMayPair]> {
+    pub fn notmay_pairs(&self, edge: CfgEdgeId) -> Option<&[NotMayPair]> {
         self.ne.get(&edge).map(Vec::as_slice)
     }
 
@@ -1155,7 +1155,7 @@ fn abstract_path_exists(frame: &ProcedureFrame, oracle: &Oracle) -> Result<bool,
                         node: cfg_edge.target,
                     })?;
             for (target_index, target_region) in target_partition.iter().enumerate() {
-                let blocked = frame.ne(edge).unwrap_or(&[]).iter().any(|pair| {
+                let blocked = frame.notmay_pairs(edge).unwrap_or(&[]).iter().any(|pair| {
                     pair.pre_region == source_region && pair.post_region == *target_region
                 });
                 if !blocked {
@@ -1203,7 +1203,7 @@ mod tests {
             ]
         );
         assert!(frame
-            .ne(frame.cfg().edges().keys().next().copied().unwrap())
+            .notmay_pairs(frame.cfg().edges().keys().next().copied().unwrap())
             .unwrap()
             .is_empty());
     }
@@ -1309,7 +1309,7 @@ mod tests {
             &oracle,
         )
         .unwrap();
-        assert!(notmay_frame.ne(edge).unwrap().len() >= 1);
+        assert!(notmay_frame.notmay_pairs(edge).unwrap().len() >= 1);
     }
 
     #[test]
