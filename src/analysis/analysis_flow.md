@@ -48,7 +48,8 @@ FunctionGraph
 - repeated loop traversals are cut off by the temporary per-edge `max_step`
   budget in `driver.rs`
 - impure calls havoc the currently tracked integer-array memory regions
-- evidence/model queries still do not exist yet in the active flow
+- false assertions already carry a symbolic driver-collected evidence trace,
+  but solver model/evidence queries still do not exist yet in the active flow
 
 ## Current Rule API
 
@@ -92,7 +93,8 @@ driver:
 - it treats calls conservatively: unconstrained returns plus memory havoc unless
   the callee is inferred memory-pure
 - it uses `transfer.rs` plus SMT feasibility checks to explore concrete branch
-  paths
+  paths and report explicit per-assertion `true` / `false` / `unknown`
+  outcomes
 
 That is enough to run simple straightline, branchy, and bounded-loop assertion
 tests, but it is still a temporary bridge to the future rule-driven scheduler.

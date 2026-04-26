@@ -104,6 +104,12 @@ Those per-procedure summaries include:
 - bounded path count
 - checked obligation count
 - feasible obligation count
+- one explicit `true` / `false` / `unknown` result per lowered assertion
+
+If an assertion is reported `false`, the summary also prints a symbolic
+evidence trace showing the node/edge formulas and the failing obligation query
+that made the negated assertion feasible. This is not yet a solver model; real
+model/evidence queries still belong to the future rule-driven driver work.
 
 With `--trace-predicates`, the checker emits debug logs on the dedicated
 `analysis_trace` target for generated formulas after each ordinary node/edge

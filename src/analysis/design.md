@@ -56,6 +56,9 @@ raw solver layer               -> src/smt/solver.rs
   the future driver.
 - `driver.rs` is currently a temporary bounded path explorer that wires the
   existing lowering, transfer, and oracle pieces into one end-to-end check.
+- that bounded driver now produces an explicit per-assertion result and, for
+  failing assertions, a symbolic evidence trace built from the explored
+  state/edge formulas.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
   most `max_step` times on one explored path; budget exhaustion yields
   `Unknown`.

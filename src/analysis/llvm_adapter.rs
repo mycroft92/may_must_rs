@@ -18,6 +18,8 @@ pub struct AdaptedProcedure {
     pub cfg: Cfg,
     pub node_effects: BTreeMap<CfgNodeId, Vec<TransferEffect>>,
     pub edge_effects: BTreeMap<CfgEdgeId, Vec<TransferEffect>>,
+    /// Lowered assertion sites keyed by the CFG node where the obligation is checked.
+    pub assertions_by_node: BTreeMap<CfgNodeId, Vec<AdaptedAssertionSite>>,
     pub instruction_nodes: HashMap<Instruction, CfgNodeId>,
 }
 
@@ -25,6 +27,16 @@ impl AdaptedProcedure {
     pub fn node_for_instruction(&self, instruction: Instruction) -> Option<CfgNodeId> {
         self.instruction_nodes.get(&instruction).copied()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdaptedAssertionSite {
+    /// Stable 1-based identifier in the source graph assertion order.
+    pub id: usize,
+    /// Human-readable location used in CLI reports.
+    pub location: String,
+    /// Negated assertion formula checked at this node.
+    pub obligation: Formula,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -98,7 +110,8 @@ pub fn adapt_function_graph_with_purity(
     }
 
     lower_phi_edge_effects(graph, &edge_ids, &mut edge_effects)?;
-    lower_assert_obligations(graph, &instruction_nodes, &mut node_effects)?;
+    let assertions_by_node =
+        lower_assert_obligations(graph, &instruction_nodes, &mut node_effects)?;
 
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
@@ -107,6 +120,7 @@ pub fn adapt_function_graph_with_purity(
         cfg,
         node_effects,
         edge_effects,
+        assertions_by_node,
         instruction_nodes,
     })
 }
@@ -453,14 +467,24 @@ fn lower_assert_obligations(
     graph: &FunctionGraph,
     instruction_nodes: &HashMap<Instruction, CfgNodeId>,
     node_effects: &mut BTreeMap<CfgNodeId, Vec<TransferEffect>>,
-) -> Result<(), AdapterError> {
-    for site in &graph.asserts {
+) -> Result<BTreeMap<CfgNodeId, Vec<AdaptedAssertionSite>>, AdapterError> {
+    let mut assertions_by_node = BTreeMap::<CfgNodeId, Vec<AdaptedAssertionSite>>::new();
+    for (index, site) in graph.asserts.iter().enumerate() {
         let node = choose_assert_node(site, instruction_nodes).ok_or(AdapterError::MissingStart)?;
-        let obligation =
-            TransferEffect::Obligation(Formula::not(lower_bool_value(site.asserted_value)?));
-        node_effects.entry(node).or_default().push(obligation);
+        let obligation = Formula::not(lower_bool_value(site.asserted_value)?);
+        let location = assertion_location(site);
+        let effect = TransferEffect::Obligation(obligation.clone());
+        assertions_by_node
+            .entry(node)
+            .or_default()
+            .push(AdaptedAssertionSite {
+                id: index + 1,
+                location,
+                obligation: obligation.clone(),
+            });
+        node_effects.entry(node).or_default().push(effect);
     }
-    Ok(())
+    Ok(assertions_by_node)
 }
 
 fn choose_assert_node(
@@ -478,6 +502,16 @@ fn choose_assert_node(
             site.successor
                 .and_then(|instruction| instruction_nodes.get(&instruction).copied())
         })
+}
+
+fn assertion_location(site: &AssertSite) -> String {
+    if let Some(predecessor) = site.predecessor {
+        format!("after {}", normalize_label(&predecessor.print()))
+    } else if let Some(successor) = site.successor {
+        format!("before {}", normalize_label(&successor.print()))
+    } else {
+        normalize_label(&site.asserted_value.print())
+    }
 }
 
 fn assigned_var(instruction: Instruction) -> Result<Var, AdapterError> {
@@ -547,6 +581,10 @@ fn is_pointer_value(value: Instruction) -> bool {
         .get_type()
         .map(|ty| ty.kind() == TypeKind::Pointer)
         .unwrap_or(false)
+}
+
+fn normalize_label(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn lower_bool_value(value: Instruction) -> Result<Formula, AdapterError> {

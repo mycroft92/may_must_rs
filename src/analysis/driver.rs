@@ -14,6 +14,17 @@
 //! The purpose is to wire the existing lowering/oracle/transfer pieces into one
 //! honest end-to-end slice for straightline, branchy, and bounded-loop
 //! single-procedure code.
+//!
+//! The active CLI-visible result is a per-procedure report with explicit
+//! per-assertion truth values:
+//!
+//! - `true` means every explored reachable check of that assertion is safe
+//! - `false` means a feasible negated obligation was found
+//! - `unknown` means the temporary bounded explorer could not decide
+//!
+//! When an assertion is `false`, the driver also records a symbolic evidence
+//! trace showing the explored state formulas that led to the failing
+//! obligation.
 
 use crate::analysis::cfg::{CfgEdge, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::Formula;
@@ -58,18 +69,68 @@ pub struct SimpleProcedureReport {
     pub bounded_paths: usize,
     pub checked_obligations: usize,
     pub feasible_obligations: usize,
+    pub assertions: Vec<AssertionReport>,
 }
 
 impl fmt::Display for SimpleProcedureReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "procedure {}", self.procedure)?;
-        writeln!(f, "  judgement: {:?}", self.judgement)?;
-        writeln!(f, "  max step: {}", self.max_step)?;
-        writeln!(f, "  explored paths: {}", self.explored_paths)?;
-        writeln!(f, "  pruned paths: {}", self.pruned_paths)?;
-        writeln!(f, "  bounded paths: {}", self.bounded_paths)?;
-        writeln!(f, "  obligations checked: {}", self.checked_obligations)?;
-        write!(f, "  feasible obligations: {}", self.feasible_obligations)
+        let mut lines = vec![
+            format!("procedure {}", self.procedure),
+            format!("  judgement: {:?}", self.judgement),
+            format!("  max step: {}", self.max_step),
+            format!("  explored paths: {}", self.explored_paths),
+            format!("  pruned paths: {}", self.pruned_paths),
+            format!("  bounded paths: {}", self.bounded_paths),
+            format!("  obligations checked: {}", self.checked_obligations),
+            format!("  feasible obligations: {}", self.feasible_obligations),
+        ];
+        for assertion in &self.assertions {
+            lines.push(format!("  assertion {}", assertion.id));
+            lines.push(format!("    location: {}", assertion.location));
+            if assertion.result == AssertionResult::True && assertion.checked_count == 0 {
+                lines.push("    result: true (unreachable)".to_string());
+            } else {
+                lines.push(format!("    result: {}", assertion.result));
+            }
+            if let Some(evidence) = &assertion.evidence {
+                lines.push("    evidence trace:".to_string());
+                for step in &evidence.steps {
+                    lines.push(format!("      {}", step.heading()));
+                    match step {
+                        EvidenceTraceStep::State {
+                            generated,
+                            path_summary,
+                            facts,
+                            memory,
+                            obligations,
+                            feasibility,
+                            ..
+                        } => {
+                            lines.push(format!(
+                                "        generated: {}",
+                                format_generated(generated)
+                            ));
+                            lines.push(format!("        path summary: {path_summary}"));
+                            lines.push(format!("        facts: {facts}"));
+                            lines.push(format!("        memory: {memory}"));
+                            lines.push(format!("        obligations: {obligations}"));
+                            lines.push(format!("        feasibility: {:?}", feasibility));
+                        }
+                        EvidenceTraceStep::Obligation {
+                            obligation,
+                            query,
+                            result,
+                            ..
+                        } => {
+                            lines.push(format!("        obligation: {obligation}"));
+                            lines.push(format!("        check: {query}"));
+                            lines.push(format!("        result: {:?}", result));
+                        }
+                    }
+                }
+            }
+        }
+        write!(f, "{}", lines.join("\n"))
     }
 }
 
@@ -93,8 +154,119 @@ impl SimpleProcedureReport {
             bounded_paths,
             checked_obligations,
             feasible_obligations,
+            assertions: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssertionReport {
+    /// Stable 1-based identifier in the adapted procedure report.
+    pub id: usize,
+    /// Human-readable source position derived from the surrounding LLVM graph.
+    pub location: String,
+    /// Final truth value for this assertion within the current bounded run.
+    pub result: AssertionResult,
+    /// Number of explored reachable checks performed for this assertion.
+    pub checked_count: usize,
+    /// Symbolic counterexample trace when the assertion is false.
+    pub evidence: Option<EvidenceTrace>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssertionResult {
+    True,
+    False,
+    Unknown,
+}
+
+impl fmt::Display for AssertionResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AssertionResult::True => write!(f, "true"),
+            AssertionResult::False => write!(f, "false"),
+            AssertionResult::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EvidenceTrace {
+    /// Ordered symbolic steps ending at a failing obligation check.
+    steps: Vec<EvidenceTraceStep>,
+}
+
+impl EvidenceTrace {
+    fn push_state(
+        &mut self,
+        location: impl Into<String>,
+        generated: Vec<Formula>,
+        state: &NodeState,
+        feasibility: Feasibility,
+    ) {
+        self.steps.push(EvidenceTraceStep::State {
+            location: location.into(),
+            generated,
+            path_summary: state.path_summary().as_formula(),
+            facts: state.facts().collapse(),
+            memory: state.memory_summary(),
+            obligations: state.obligations().collapse(),
+            feasibility,
+        });
+    }
+
+    fn push_obligation(
+        &mut self,
+        location: impl Into<String>,
+        obligation: Formula,
+        query: Formula,
+        result: Feasibility,
+    ) {
+        self.steps.push(EvidenceTraceStep::Obligation {
+            location: location.into(),
+            obligation,
+            query,
+            result,
+        });
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EvidenceTraceStep {
+    State {
+        location: String,
+        generated: Vec<Formula>,
+        path_summary: Formula,
+        facts: Formula,
+        memory: String,
+        obligations: Formula,
+        feasibility: Feasibility,
+    },
+    Obligation {
+        location: String,
+        obligation: Formula,
+        query: Formula,
+        result: Feasibility,
+    },
+}
+
+impl EvidenceTraceStep {
+    fn heading(&self) -> &str {
+        match self {
+            EvidenceTraceStep::State { location, .. }
+            | EvidenceTraceStep::Obligation { location, .. } => location,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssertionAccumulator {
+    id: usize,
+    location: String,
+    checked_count: usize,
+    false_seen: bool,
+    unknown_seen: bool,
+    evidence: Option<EvidenceTrace>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -203,6 +375,7 @@ struct SimpleExplorer<'a> {
     feasible_obligations: usize,
     unknown_seen: bool,
     next_path_id: usize,
+    assertion_accumulators: BTreeMap<usize, AssertionAccumulator>,
 }
 
 impl<'a> SimpleExplorer<'a> {
@@ -212,6 +385,20 @@ impl<'a> SimpleExplorer<'a> {
         oracle: &'a Oracle,
         options: SimpleDriverOptions,
     ) -> Self {
+        let mut assertion_accumulators = BTreeMap::new();
+        for site in adapted.assertions_by_node.values().flatten() {
+            assertion_accumulators.insert(
+                site.id,
+                AssertionAccumulator {
+                    id: site.id,
+                    location: site.location.clone(),
+                    checked_count: 0,
+                    false_seen: false,
+                    unknown_seen: false,
+                    evidence: None,
+                },
+            );
+        }
         Self {
             procedure,
             adapted,
@@ -224,6 +411,7 @@ impl<'a> SimpleExplorer<'a> {
             feasible_obligations: 0,
             unknown_seen: false,
             next_path_id: 1,
+            assertion_accumulators,
         }
     }
 
@@ -235,6 +423,27 @@ impl<'a> SimpleExplorer<'a> {
         } else {
             QueryJudgement::No
         };
+        let procedure_unknown = self.unknown_seen;
+        let assertions = self
+            .assertion_accumulators
+            .into_values()
+            .map(|accumulator| {
+                let result = if accumulator.false_seen {
+                    AssertionResult::False
+                } else if procedure_unknown || accumulator.unknown_seen {
+                    AssertionResult::Unknown
+                } else {
+                    AssertionResult::True
+                };
+                AssertionReport {
+                    id: accumulator.id,
+                    location: accumulator.location,
+                    result,
+                    checked_count: accumulator.checked_count,
+                    evidence: accumulator.evidence,
+                }
+            })
+            .collect();
         SimpleProcedureReport {
             procedure: self.procedure.to_string(),
             judgement,
@@ -244,13 +453,20 @@ impl<'a> SimpleExplorer<'a> {
             bounded_paths: self.bounded_paths,
             checked_obligations: self.checked_obligations,
             feasible_obligations: self.feasible_obligations,
+            assertions,
         }
     }
 
     fn explore_entry(&mut self) -> Result<(), DriverError> {
         let entry = self.adapted.cfg.entry();
         let path_id = self.allocate_path_id();
-        self.explore_node(entry, NodeState::entry(), PathContext::default(), path_id)
+        self.explore_node(
+            entry,
+            NodeState::entry(),
+            PathContext::default(),
+            path_id,
+            EvidenceTrace::default(),
+        )
     }
 
     fn explore_node(
@@ -259,6 +475,7 @@ impl<'a> SimpleExplorer<'a> {
         mut state: NodeState,
         context: PathContext,
         path_id: usize,
+        mut trace: EvidenceTrace,
     ) -> Result<(), DriverError> {
         let context = context.enter_node(node);
         let node_label = self.node_label(node)?;
@@ -275,6 +492,12 @@ impl<'a> SimpleExplorer<'a> {
             .map(|effects| effect_predicates(effects))
             .unwrap_or_default();
         let node_feasibility = self.oracle.state_feasibility(&state)?;
+        trace.push_state(
+            format!("step {}: node {node_label}", trace.steps.len() + 1),
+            node_generated.clone(),
+            &state,
+            node_feasibility,
+        );
         if !repeated_node {
             self.debug_state_step(
                 path_id,
@@ -297,10 +520,7 @@ impl<'a> SimpleExplorer<'a> {
             }
         }
 
-        self.check_obligations(node, &mut state, path_id)?;
-        if self.feasible_obligations > 0 {
-            return Ok(());
-        }
+        self.check_obligations(node, &mut state, path_id, &trace)?;
 
         let outgoing = self
             .adapted
@@ -315,9 +535,6 @@ impl<'a> SimpleExplorer<'a> {
 
         let edge_count = outgoing.len();
         for (edge_index, edge_id) in outgoing.into_iter().enumerate() {
-            if self.feasible_obligations > 0 {
-                break;
-            }
             let edge = self
                 .adapted
                 .cfg
@@ -352,6 +569,18 @@ impl<'a> SimpleExplorer<'a> {
                 edge.relation.clone(),
                 self.adapted.edge_effects.get(&edge_id),
             );
+            let mut next_trace = trace.clone();
+            next_trace.push_state(
+                format!(
+                    "step {}: edge {} -> {}",
+                    next_trace.steps.len() + 1,
+                    node_label,
+                    target_label
+                ),
+                generated.clone(),
+                &next_state,
+                edge_feasibility,
+            );
 
             if context.active_node_count(edge.target) > 0 || visit_count > 1 {
                 self.debug_loop_iteration(
@@ -376,7 +605,13 @@ impl<'a> SimpleExplorer<'a> {
 
             match edge_feasibility {
                 Feasibility::Feasible => {
-                    self.explore_node(edge.target, next_state, next_context, branch_path_id)?;
+                    self.explore_node(
+                        edge.target,
+                        next_state,
+                        next_context,
+                        branch_path_id,
+                        next_trace,
+                    )?;
                 }
                 Feasibility::Infeasible => {
                     self.pruned_paths += 1;
@@ -395,6 +630,7 @@ impl<'a> SimpleExplorer<'a> {
         node: CfgNodeId,
         state: &mut NodeState,
         path_id: usize,
+        trace: &EvidenceTrace,
     ) -> Result<(), DriverError> {
         let obligations = state.obligations().formulas().to_vec();
         if obligations.is_empty() {
@@ -403,18 +639,67 @@ impl<'a> SimpleExplorer<'a> {
 
         let path_formula = state.feasibility_formula();
         let node_label = self.node_label(node)?;
-        for obligation in obligations {
+        let assertion_sites = self
+            .adapted
+            .assertions_by_node
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for (index, obligation) in obligations.into_iter().enumerate() {
             self.checked_obligations += 1;
             let query = Formula::and(path_formula.clone(), obligation.clone());
             let result = self.oracle.feasibility(&query)?;
+            let assertion_site = assertion_sites
+                .get(index)
+                .filter(|site| site.obligation == obligation)
+                .cloned();
+            let evidence_location = assertion_site
+                .as_ref()
+                .map(|site| {
+                    format!(
+                        "step {}: assertion {} at {}",
+                        trace.steps.len() + 1,
+                        site.id,
+                        site.location
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!("step {}: obligation at {node_label}", trace.steps.len() + 1)
+                });
             self.debug_obligation_step(path_id, &node_label, &obligation, &query, result);
+            if let Some(site) = &assertion_site {
+                let accumulator = self
+                    .assertion_accumulators
+                    .get_mut(&site.id)
+                    .expect("assertion accumulator should exist");
+                accumulator.checked_count += 1;
+            }
             match result {
                 Feasibility::Feasible => {
                     self.feasible_obligations += 1;
+                    if let Some(site) = assertion_site {
+                        let accumulator = self
+                            .assertion_accumulators
+                            .get_mut(&site.id)
+                            .expect("assertion accumulator should exist");
+                        accumulator.false_seen = true;
+                        if accumulator.evidence.is_none() {
+                            let mut evidence = trace.clone();
+                            evidence.push_obligation(evidence_location, obligation, query, result);
+                            accumulator.evidence = Some(evidence);
+                        }
+                    }
                 }
                 Feasibility::Infeasible => {}
                 Feasibility::Unknown => {
                     self.unknown_seen = true;
+                    if let Some(site) = assertion_site {
+                        let accumulator = self
+                            .assertion_accumulators
+                            .get_mut(&site.id)
+                            .expect("assertion accumulator should exist");
+                        accumulator.unknown_seen = true;
+                    }
                 }
             }
         }
@@ -658,6 +943,8 @@ mod tests {
         assert_eq!(report.feasible_obligations, 0);
         assert_eq!(report.checked_obligations, 1);
         assert_eq!(report.bounded_paths, 0);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::True);
     }
 
     #[test]
@@ -713,6 +1000,9 @@ mod tests {
         );
         assert_eq!(report.judgement, QueryJudgement::Yes);
         assert_eq!(report.feasible_obligations, 1);
+        assert_eq!(report.assertions.len(), 2);
+        assert_eq!(report.assertions[0].result, AssertionResult::False);
+        assert!(report.assertions[0].evidence.is_some());
     }
 
     #[test]
@@ -846,7 +1136,10 @@ mod tests {
             },
         );
         assert_eq!(report.judgement, QueryJudgement::Yes);
-        assert_eq!(report.feasible_obligations, 1);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::False);
+        assert!(report.assertions[0].evidence.is_some());
+        assert!(report.feasible_obligations >= 1);
     }
 
     #[test]
@@ -896,5 +1189,26 @@ mod tests {
             report.to_string(),
             "procedure subject\n  judgement: Unknown\n  max step: 3\n  explored paths: 2\n  pruned paths: 1\n  bounded paths: 1\n  obligations checked: 3\n  feasible obligations: 0"
         );
+    }
+
+    #[test]
+    fn false_assertions_render_with_evidence() {
+        let report = analyze_first(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i32 %x) {
+                entry:
+                    %bad = icmp slt i32 %x, 0
+                    call void @may_assert(i1 %bad)
+                    ret void
+                }
+            "#,
+        );
+
+        let rendered = report.to_string();
+        assert!(rendered.contains("result: false"));
+        assert!(rendered.contains("evidence trace:"));
+        assert!(rendered.contains("assertion 1"));
     }
 }
