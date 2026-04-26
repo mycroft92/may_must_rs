@@ -5,12 +5,13 @@
 The fixtures are compiled with:
 
 ```sh
-clang -emit-llvm -c -O1 -fno-inline -I.
+clang -emit-llvm -c -O0 -fno-inline -I.
 ```
 
 Those flags matter:
 
-- `-O1` keeps the IR close to SSA form without the extra noise from `-O0`;
+- `-O0` keeps optimization disabled so the current fixtures preserve the
+  original instruction structure;
 - `-fno-inline` preserves helper calls so the adapter still sees them;
 - `-I.` lets fixtures include `tests/local_assert.h`.
 

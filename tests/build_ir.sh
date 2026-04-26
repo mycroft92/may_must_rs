@@ -2,7 +2,7 @@
 set -eu
 
 out_dir="tests/out"
-cflags="${CFLAGS:--O1 -fno-inline -I.}"
+cflags="${CFLAGS:--O0 -fno-inline -I.}"
 
 if [ "${CLANG:-}" ]; then
     clang_bin="$CLANG"
