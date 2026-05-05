@@ -53,8 +53,8 @@ FunctionGraph
   budget in the bounded slice of `driver.rs`
 - impure calls havoc the currently tracked integer-array memory regions
 - false assertions already carry a symbolic driver-collected evidence trace,
-  and `--rule-witness` can now replay one local rule-driven witness plus the
-  final SMT model for false results
+  and `--rule-check` now replays one local rule-driven witness plus the final
+  SMT model for false results
 
 ## Current Rule API
 
@@ -109,8 +109,8 @@ driver:
   - it computes scalar `β` / `θ` candidates from normalized `Assign` /
     `Assume` effects and `Gamma_e`
   - it schedules local Figure 5/6/7 rules plus `IMPL_LEFT` / `IMPL_RIGHT`
-  - when requested, it also replays one feasible violating path through that
-    query CFG and prints the final SMT model
+  - it also replays one feasible violating path through that query CFG and
+    prints the final SMT model
 
 That is enough to run straightline and branchy rule-driven unit tests plus the
 broader bounded-loop temporary checker, but summary-driven calls and loop

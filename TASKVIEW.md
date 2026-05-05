@@ -2,7 +2,7 @@
 
 ## Phase
 
-Current phase: local paper rule driving with optional on-demand witnesses, plus a temporary bounded checker.
+Current phase: local paper rule driving with default witnesses, plus a temporary bounded checker.
 
 Implemented:
 

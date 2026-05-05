@@ -15,9 +15,9 @@
 //! candidates from normalized edge/node effects, and schedules
 //! `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`, `BUGFOUND`, and
 //! `VERIFIED`.
-//! When requested, that slice can also replay one feasible must-side witness
-//! path through the query CFG and attach the resulting SMT model to the final
-//! violating state.
+//! For false results, that slice also replays one feasible must-side witness
+//! path through the query CFG and attaches the resulting SMT model to the
+//! final violating state.
 //!
 //! It is still not the full paper scheduler:
 //!
@@ -71,12 +71,6 @@ impl Default for SimpleDriverOptions {
             trace_predicates: false,
         }
     }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RuleDriverOptions {
-    /// Generate one witness trace and final solver model for `Yes` results.
-    pub generate_witnesses: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -425,7 +419,7 @@ pub struct RuleAssertionReport {
     pub rule_rounds: usize,
     pub rule_applications: usize,
     pub unknown_premises: usize,
-    /// Optional on-demand witness for `Yes` results in the current local rule slice.
+    /// Witness for `Yes` results in the current local rule slice.
     pub witness: Option<RuleWitnessTrace>,
 }
 
@@ -1032,11 +1026,7 @@ pub fn analyze_function_graph_rules(
     graph: &FunctionGraph,
 ) -> Result<RuleProcedureReport, DriverError> {
     let adapted = adapt_function_graph(graph)?;
-    analyze_adapted_procedure_rules_with_options(
-        &graph.name,
-        &adapted,
-        RuleDriverOptions::default(),
-    )
+    analyze_adapted_procedure_rules(&graph.name, &adapted)
 }
 
 pub fn analyze_function_graph_rules_with_purity(
@@ -1044,53 +1034,19 @@ pub fn analyze_function_graph_rules_with_purity(
     memory_pure_functions: &BTreeSet<String>,
 ) -> Result<RuleProcedureReport, DriverError> {
     let adapted = adapt_function_graph_with_purity(graph, memory_pure_functions)?;
-    analyze_adapted_procedure_rules_with_options(
-        &graph.name,
-        &adapted,
-        RuleDriverOptions::default(),
-    )
-}
-
-pub fn analyze_function_graph_rules_with_options(
-    graph: &FunctionGraph,
-    options: RuleDriverOptions,
-) -> Result<RuleProcedureReport, DriverError> {
-    let adapted = adapt_function_graph(graph)?;
-    analyze_adapted_procedure_rules_with_options(&graph.name, &adapted, options)
-}
-
-pub fn analyze_function_graph_rules_with_purity_and_options(
-    graph: &FunctionGraph,
-    memory_pure_functions: &BTreeSet<String>,
-    options: RuleDriverOptions,
-) -> Result<RuleProcedureReport, DriverError> {
-    let adapted = adapt_function_graph_with_purity(graph, memory_pure_functions)?;
-    analyze_adapted_procedure_rules_with_options(&graph.name, &adapted, options)
+    analyze_adapted_procedure_rules(&graph.name, &adapted)
 }
 
 pub fn analyze_adapted_procedure_rules(
     procedure: &str,
     adapted: &AdaptedProcedure,
 ) -> Result<RuleProcedureReport, DriverError> {
-    analyze_adapted_procedure_rules_with_options(procedure, adapted, RuleDriverOptions::default())
-}
-
-pub fn analyze_adapted_procedure_rules_with_options(
-    procedure: &str,
-    adapted: &AdaptedProcedure,
-    options: RuleDriverOptions,
-) -> Result<RuleProcedureReport, DriverError> {
     let assertion_sites = collect_assertion_sites(adapted);
     let mut assertions = Vec::new();
     for (node, site) in assertion_sites {
         let query_procedure = build_assertion_query_procedure(adapted, node, &site)?;
         ensure_rule_query_supported(&query_procedure)?;
-        assertions.push(analyze_assertion_query(
-            procedure,
-            &site,
-            &query_procedure,
-            &options,
-        )?);
+        assertions.push(analyze_assertion_query(procedure, &site, &query_procedure)?);
     }
     Ok(RuleProcedureReport {
         procedure: procedure.to_string(),
@@ -1103,7 +1059,6 @@ fn analyze_assertion_query(
     procedure: &str,
     site: &AdaptedAssertionSite,
     query_procedure: &AssertionQueryProcedure,
-    options: &RuleDriverOptions,
 ) -> Result<RuleAssertionReport, DriverError> {
     let oracle = Oracle::new();
     let query = ReachabilityQuery::new(procedure, Formula::True, Formula::True);
@@ -1121,7 +1076,6 @@ fn analyze_assertion_query(
                     stats,
                     query_procedure,
                     &oracle,
-                    options,
                 );
             }
             QueryJudgement::No | QueryJudgement::Unknown => {}
@@ -1134,7 +1088,6 @@ fn analyze_assertion_query(
                     stats,
                     query_procedure,
                     &oracle,
-                    options,
                 );
             }
             QueryJudgement::Yes | QueryJudgement::Unknown => {}
@@ -1160,14 +1113,7 @@ fn analyze_assertion_query(
             }
         }
     };
-    rule_assertion_report(
-        site,
-        final_judgement,
-        stats,
-        query_procedure,
-        &oracle,
-        options,
-    )
+    rule_assertion_report(site, final_judgement, stats, query_procedure, &oracle)
 }
 
 fn rule_assertion_report(
@@ -1176,14 +1122,13 @@ fn rule_assertion_report(
     stats: RuleSearchStats,
     query_procedure: &AssertionQueryProcedure,
     oracle: &Oracle,
-    options: &RuleDriverOptions,
 ) -> Result<RuleAssertionReport, DriverError> {
     let result = match judgement {
         QueryJudgement::No => AssertionResult::True,
         QueryJudgement::Yes => AssertionResult::False,
         QueryJudgement::Unknown => AssertionResult::Unknown,
     };
-    let witness = if options.generate_witnesses && judgement == QueryJudgement::Yes {
+    let witness = if judgement == QueryJudgement::Yes {
         Some(generate_rule_witness(query_procedure, oracle)?.ok_or(
             DriverError::MissingRuleWitness {
                 assertion_id: site.id,
@@ -1956,19 +1901,12 @@ mod tests {
         analyze_function_graph_simple_with_purity(graph, &pure, options).unwrap()
     }
 
-    fn analyze_first_rules_with_options(
-        ir: &str,
-        options: RuleDriverOptions,
-    ) -> RuleProcedureReport {
+    fn analyze_first_rules(ir: &str) -> RuleProcedureReport {
         initialize_target();
         let context = Context::new();
         let module = context.parse_ir_str(ir, "driver_rule_test").unwrap();
         let graphs = generate_program_graph(&module).unwrap();
-        analyze_function_graph_rules_with_options(&graphs[0], options).unwrap()
-    }
-
-    fn analyze_first_rules(ir: &str) -> RuleProcedureReport {
-        analyze_first_rules_with_options(ir, RuleDriverOptions::default())
+        analyze_function_graph_rules(&graphs[0]).unwrap()
     }
 
     fn analyze_first_rules_err(ir: &str) -> DriverError {
@@ -2318,8 +2256,8 @@ mod tests {
     }
 
     #[test]
-    fn rule_driver_can_generate_a_witness_on_demand() {
-        let report = analyze_first_rules_with_options(
+    fn rule_driver_attaches_a_witness_by_default() {
+        let report = analyze_first_rules(
             r#"
                 declare void @may_assert(i1)
 
@@ -2338,9 +2276,6 @@ mod tests {
                     ret void
                 }
             "#,
-            RuleDriverOptions {
-                generate_witnesses: true,
-            },
         );
 
         assert_eq!(report.judgement, QueryJudgement::Yes);
@@ -2348,7 +2283,7 @@ mod tests {
         let witness = report.assertions[0]
             .witness
             .as_ref()
-            .expect("false rule result should carry a witness when requested");
+            .expect("false rule result should carry a witness by default");
         assert!(witness.steps.len() >= 2);
         match witness.steps.last().unwrap() {
             RuleWitnessStep::Outcome { model, result, .. } => {
@@ -2360,7 +2295,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_driver_does_not_attach_witnesses_by_default() {
+    fn rule_driver_false_results_render_with_witnesses_by_default() {
         let report = analyze_first_rules(
             r#"
                 declare void @may_assert(i1)
@@ -2375,12 +2310,12 @@ mod tests {
         );
 
         assert_eq!(report.judgement, QueryJudgement::Yes);
-        assert!(report.assertions[0].witness.is_none());
+        assert!(report.assertions[0].witness.is_some());
     }
 
     #[test]
     fn safe_rule_results_do_not_attach_witnesses() {
-        let report = analyze_first_rules_with_options(
+        let report = analyze_first_rules(
             r#"
                 declare void @may_assert(i1)
 
@@ -2392,9 +2327,6 @@ mod tests {
                     ret i32 %x
                 }
             "#,
-            RuleDriverOptions {
-                generate_witnesses: true,
-            },
         );
 
         assert_eq!(report.judgement, QueryJudgement::No);
@@ -2403,7 +2335,7 @@ mod tests {
 
     #[test]
     fn rule_report_display_renders_witness_trace() {
-        let report = analyze_first_rules_with_options(
+        let report = analyze_first_rules(
             r#"
                 declare void @may_assert(i1)
 
@@ -2414,9 +2346,6 @@ mod tests {
                     ret void
                 }
             "#,
-            RuleDriverOptions {
-                generate_witnesses: true,
-            },
         );
 
         let rendered = report.to_string();

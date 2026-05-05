@@ -12,7 +12,6 @@ paper-rule driver:
   - C fixture compilation under `tests/flow/`
   - `--simple-check` for the current bounded single-procedure checker
   - `--rule-check` for the current acyclic scalar rule-driven checker
-  - `--rule-witness` for on-demand witness/model replay on false rule results
   - temporary `max_step` loop bounding in `analysis::driver`
   - query-specific assertion lowering plus local Figure 5/6/7 scheduling in
     `analysis::driver`
@@ -68,9 +67,8 @@ raw solver layer               -> src/smt/solver.rs
 - the rule-driven slice rewrites each assertion into a synthetic violation-exit
   query and computes scalar `β` / `θ` candidates from normalized `Assign` /
   `Assume` effects plus `Gamma_e`.
-- when requested, that same rule-driven slice replays one feasible path
-  through the assertion query CFG and attaches the final SMT model for the
-  violating state.
+- that same rule-driven slice replays one feasible path through the assertion
+  query CFG and attaches the final SMT model for the violating state.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
   most `max_step` times on one explored path; budget exhaustion yields
   `Unknown`.
