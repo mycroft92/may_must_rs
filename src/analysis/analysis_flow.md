@@ -71,13 +71,14 @@ The implemented rule layer is now partially scheduled by `driver.rs`.
 
 Today the remaining caller/driver work is:
 
-- candidate `β` formulas for memory/call-aware `NOTMAY_PRE`
-- candidate `θ` formulas for memory/call-aware `MUST_POST`
+- broader candidate `β` formulas beyond the current rewritten memory/havoc slice
+- broader candidate `θ` formulas beyond the current rewritten memory/havoc slice
 - local-variable projection closures for summary creation
 
 The current driver already computes the scalar acyclic `Assign` / `Assume`
-subset of `β` / `θ`. The remaining pieces belong to the future summary-aware
-driver work.
+subset of `β` / `θ` and rewrites the current integer-array memory plus
+impure-call-havoc slice into that scalar form. The remaining pieces belong to
+the future summary-aware driver work.
 
 ## Conservative Checks
 
@@ -104,10 +105,13 @@ driver:
     `unknown` outcomes
 - rule-driven slice:
   - it supports one procedure at a time
-  - it currently requires an acyclic scalar/SSA-like CFG
+  - it currently requires an acyclic CFG
   - it builds one query-specific synthetic violation exit per assertion
   - it computes scalar `β` / `θ` candidates from normalized `Assign` /
     `Assume` effects and `Gamma_e`
+  - it rewrites the current `Alloca` / `GetElementPtr` / `Load` / `Store` and
+    impure-call-havoc slice into a path-expanded scalar query before those
+    rules run
   - it schedules local Figure 5/6/7 rules plus `IMPL_LEFT` / `IMPL_RIGHT`
   - it also replays one feasible violating path through that query CFG and
     prints the final SMT model

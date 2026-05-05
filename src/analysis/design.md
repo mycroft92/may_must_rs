@@ -11,11 +11,12 @@ paper-rule driver:
   - DOT dumping for those graphs
   - C fixture compilation under `tests/flow/`
   - `--simple-check` for the current bounded single-procedure checker
-  - `--rule-check` for the current acyclic scalar rule-driven checker
+  - `--rule-check` for the current acyclic rule-driven checker
   - temporary `max_step` loop bounding in `analysis::driver`
   - query-specific assertion lowering plus local Figure 5/6/7 scheduling in
     `analysis::driver`
   - integer-array memory modeling and conservative call-memory havoc
+  - rule-query rewriting for the current acyclic memory/call-havoc slice
 - implemented but not wired:
   - assertion-to-formula translation
   - paper formula language
@@ -25,7 +26,7 @@ paper-rule driver:
   - named paper rules from Figures 5-10
   - paper summary tables
   - summary-driven call scheduling
-  - memory-aware rule candidate generation
+  - broader instruction-aware rule candidate generation
 - planned:
   - full driver orchestration over the summary rules
   - loop summaries/invariants
@@ -60,13 +61,16 @@ raw solver layer               -> src/smt/solver.rs
   the future driver.
 - `driver.rs` now contains two executable slices:
   - the broader temporary bounded path explorer
-  - the narrower local rule scheduler for acyclic scalar procedures
+  - the narrower local rule scheduler for acyclic scalar-plus-memory procedures
 - that bounded driver now produces an explicit per-assertion result and, for
   failing assertions, a symbolic evidence trace built from the explored
   state/edge formulas.
 - the rule-driven slice rewrites each assertion into a synthetic violation-exit
   query and computes scalar `β` / `θ` candidates from normalized `Assign` /
   `Assume` effects plus `Gamma_e`.
+- before scheduling the rules, the rule-driven slice now rewrites the current
+  acyclic integer-array memory effects (`alloca` / `load` / `store` / `gep`)
+  and impure-call havoc into a path-expanded scalar query.
 - that same rule-driven slice replays one feasible path through the assertion
   query CFG and attaches the final SMT model for the violating state.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
@@ -134,8 +138,8 @@ representation choices are deliberately minimal:
   calls, and memory-heavy shapes
 - the current rule witnesses are postprocessed from the lowered query CFG
   rather than reconstructed from explicit must-rule provenance
-- the current memory model is path-execution-oriented rather than a full paper
-  memory abstraction
+- the current memory-aware rule rewrite is still path-expansion-oriented rather
+  than a full paper summary abstraction
 
 The main conservative check is the abstract path search used by `VERIFIED` and
 `CREATE_NOTMAYSUMMARY`:

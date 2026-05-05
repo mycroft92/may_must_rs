@@ -12,7 +12,7 @@ Implemented and CLI-active:
 - DOT graph dumping
 - fixture compilation under `tests/flow/`
 - `--simple-check` for the current bounded single-procedure checker
-- `--rule-check` for the current acyclic scalar rule-driven checker
+- `--rule-check` for the current acyclic rule-driven checker
 - integer-array memory modeling for `alloca` / `load` / `store` / `gep`
 - conservative call handling with memory-preserving vs memory-havocing callees
 
@@ -78,9 +78,10 @@ Run the current rule-driven checker:
 cargo run --bin main -- --rule-check --no-dot <bitcode-file>
 ```
 
-That flag is CLI-active today, but it currently supports only acyclic
-scalar/SSA-like bitcode. Many `-O0` C fixtures are still reported unsupported
-there because Clang lowers them through stack memory operations.
+That flag is CLI-active today. It currently supports acyclic procedures with
+scalar effects plus the current integer-array memory slice (`alloca` / `load` /
+`store` / `gep`) and conservative impure-call memory havoc. Loops, pointer
+phis, and richer interprocedural reasoning are still outside that rule slice.
 
 Run unit tests:
 
@@ -151,16 +152,16 @@ That rule-driven checker is intentionally narrower:
 - it rewrites each assertion into a query-specific synthetic violation exit and
   computes scalar `β` / `θ` candidates from `Assign` / `Assume` effects plus
   `Gamma_e`
+- it rewrites the current acyclic integer-array memory/call-havoc slice into a
+  path-expanded scalar query before running the paper rules
 - for false results, it replays one feasible path through that synthetic
   violation CFG and prints the final SMT model for the violating state
-- it currently requires an acyclic scalar/SSA-like CFG; loops, calls, and
-  memory effects are reported unsupported there for now
-- many `-O0` C fixtures therefore remain unsupported under `--rule-check`
-  today because Clang lowers them through stack memory operations
+- it still requires an acyclic CFG; loops remain unsupported there until loop
+  summaries / invariants exist
 - it schedules local `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`,
   `IMPL_LEFT`, `IMPL_RIGHT`, `BUGFOUND`, and `VERIFIED`
-- those witnesses currently exist only for that same local scalar acyclic
-  slice; summary-driven calls, loops, and memory-heavy rule queries still do
+- those witnesses currently exist only for that same local acyclic slice;
+  summary-driven calls, loops, pointer phis, and richer memory shapes still do
   not produce rule-check results today
 
 ## Active Architecture
@@ -208,18 +209,20 @@ The rule implementation in [src/analysis/rules.rs](/Users/mycroft/work/pl_projec
 The rules are now partially wired:
 
 - `driver.rs` computes scalar `β` / `θ` candidates for local acyclic
-  `Assign` / `Assume` procedures
+  `Assign` / `Assume` procedures and path-expands the current memory/havoc
+  slice into scalar rule queries
 - `driver.rs` schedules the local Figure 5/6/7 rules per assertion query
 
 Still unwired:
 
 - summary-driven call rules from Figures 8-10
-- memory-aware rule candidates
+- broader instruction-aware rule candidates beyond the current integer-array
+  memory and havoc slice
 - loop invariants / loop summaries
 
 ## Next Milestone
 
-1. Extend the rule-driven driver beyond the current acyclic scalar Figure 5/6/7 slice.
+1. Extend the rule-driven driver beyond the current acyclic scalar-plus-memory Figure 5/6/7 slice.
 2. Wire summary-driven call scheduling from Figures 8-10.
 3. Add loop summaries / invariants and retire the temporary bounded loop explorer.
 4. Extend default rule-check witnesses beyond the current local scalar query slice.

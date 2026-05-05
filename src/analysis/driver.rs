@@ -15,6 +15,10 @@
 //! candidates from normalized edge/node effects, and schedules
 //! `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`, `BUGFOUND`, and
 //! `VERIFIED`.
+//! For the current acyclic integer-array memory slice, it first rewrites
+//! `alloca` / `load` / `store` / `gep` and impure-call memory havoc into a
+//! path-expanded scalar query so those rules can run without a separate memory
+//! relation language.
 //! For false results, that slice also replays one feasible must-side witness
 //! path through the query CFG and attaches the resulting SMT model to the
 //! final violating state.
@@ -22,7 +26,8 @@
 //! It is still not the full paper scheduler:
 //!
 //! - the path explorer still owns the temporary `max_step` loop policy
-//! - the rule scheduler is currently limited to acyclic scalar/SSA procedures
+//! - the rule scheduler is currently limited to acyclic scalar-plus-memory
+//!   procedures in the current local rewriteable slice
 //! - interprocedural summary rules are implemented but not yet scheduled here
 //!
 //! The purpose is to keep one honest executable slice for the current broader
@@ -47,8 +52,10 @@ use crate::analysis::llvm_adapter::{
 };
 use crate::analysis::oracle::{Feasibility, Oracle, OracleError};
 use crate::analysis::rules::{self, ProcedureFrame, QueryJudgement, ReachabilityQuery, RuleError};
-use crate::analysis::state::NodeState;
-use crate::analysis::transfer::{apply_effects, AssignValue, TransferEffect, TransferError};
+use crate::analysis::state::{NodeState, PointerValue};
+use crate::analysis::transfer::{
+    apply_effects, AssignValue, CallMemoryEffect, TransferEffect, TransferError,
+};
 use crate::llvm_utils::program_graph::FunctionGraph;
 use log::{debug, log_enabled, Level};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -327,8 +334,10 @@ pub enum DriverError {
     UnknownNode { node: CfgNodeId },
     #[error("missing CFG edge {edge}")]
     MissingEdge { edge: usize },
+    #[error("CFG rewrite failed: {0}")]
+    Cfg(String),
     #[error(
-        "rule driver currently supports only acyclic scalar assign/assume procedures; unsupported effect: {effect}"
+        "rule driver currently supports only acyclic scalarized procedures; unsupported effect after rewrite: {effect}"
     )]
     UnsupportedRuleEffect { effect: String },
     #[error(
@@ -431,10 +440,143 @@ struct AssertionQueryProcedure {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RuleRewriteState {
+    pointers: BTreeMap<String, PointerValue>,
+    memory_regions: BTreeMap<String, Memory>,
+    memory_epoch: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct RuleSearchStats {
     rounds: usize,
     applications: usize,
     unknown_premises: usize,
+}
+
+impl RuleRewriteState {
+    fn lower_effects(
+        &mut self,
+        effects: &[TransferEffect],
+    ) -> Result<Vec<TransferEffect>, DriverError> {
+        let mut lowered = Vec::new();
+        for effect in effects {
+            match effect {
+                TransferEffect::Assign { .. } | TransferEffect::Assume(_) | TransferEffect::Nop => {
+                    lowered.push(effect.clone())
+                }
+                TransferEffect::Alloca { target, region } => {
+                    self.bind_alloca_pointer(target.clone(), region.clone());
+                }
+                TransferEffect::GetElementPtr {
+                    target,
+                    base,
+                    offset,
+                } => {
+                    self.bind_pointer_offset(target.clone(), base, offset.clone());
+                }
+                TransferEffect::Load { target, source } => {
+                    lowered.push(TransferEffect::Assign {
+                        target: target.clone(),
+                        value: AssignValue::Term(self.load_term(source)),
+                    });
+                }
+                TransferEffect::Store { target, value } => {
+                    self.store_to_pointer(target, value.clone());
+                }
+                TransferEffect::Call {
+                    callee: _,
+                    memory_effect,
+                } => {
+                    if *memory_effect == CallMemoryEffect::HavocMemory {
+                        // APPROX_HEAVY: rule-check currently models impure calls
+                        // by havocing all tracked integer-array regions and does
+                        // not yet derive summary facts for returned values.
+                        self.havoc_memory();
+                    }
+                }
+                TransferEffect::Obligation(_) => {
+                    return Err(DriverError::UnsupportedRuleEffect {
+                        effect: format!("{effect:?}"),
+                    });
+                }
+            }
+        }
+        Ok(lowered)
+    }
+
+    fn bind_alloca_pointer(&mut self, target: String, region: String) {
+        self.ensure_region(&region);
+        self.pointers
+            .insert(target, PointerValue::new(region, Term::int(0)));
+    }
+
+    fn bind_pointer_offset(&mut self, target: String, base: &str, offset: Term) {
+        let base_pointer = self.resolve_pointer(base);
+        let offset = if base_pointer.offset() == &Term::int(0) {
+            offset
+        } else {
+            Term::add(base_pointer.offset().clone(), offset)
+        };
+        self.pointers.insert(
+            target,
+            PointerValue::new(base_pointer.region().to_string(), offset),
+        );
+    }
+
+    fn load_term(&mut self, source: &str) -> Term {
+        let pointer = self.resolve_pointer(source);
+        let memory = self.current_memory(pointer.region()).clone();
+        Term::select(memory, pointer.offset().clone())
+    }
+
+    fn store_to_pointer(&mut self, target: &str, value: Term) {
+        let pointer = self.resolve_pointer(target);
+        let next_memory = Memory::store(
+            self.current_memory(pointer.region()).clone(),
+            pointer.offset().clone(),
+            value,
+        );
+        self.memory_regions
+            .insert(pointer.region().to_string(), next_memory);
+    }
+
+    fn havoc_memory(&mut self) {
+        self.memory_epoch += 1;
+        let regions = self.memory_regions.keys().cloned().collect::<Vec<_>>();
+        for region in regions {
+            self.memory_regions
+                .insert(region.clone(), Memory::var(self.memory_symbol(&region)));
+        }
+    }
+
+    fn resolve_pointer(&mut self, name: &str) -> PointerValue {
+        if let Some(pointer) = self.pointers.get(name) {
+            return pointer.clone();
+        }
+        let region = format!("{name}$region");
+        self.ensure_region(&region);
+        let pointer = PointerValue::new(region, Term::int(0));
+        self.pointers.insert(name.to_string(), pointer.clone());
+        pointer
+    }
+
+    fn ensure_region(&mut self, region: &str) {
+        if self.memory_regions.contains_key(region) {
+            return;
+        }
+        self.memory_regions
+            .insert(region.to_string(), Memory::var(self.memory_symbol(region)));
+    }
+
+    fn current_memory(&self, region: &str) -> &Memory {
+        self.memory_regions
+            .get(region)
+            .expect("memory region should exist before use")
+    }
+
+    fn memory_symbol(&self, region: &str) -> String {
+        format!("{region}$mem{}", self.memory_epoch)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1044,7 +1186,11 @@ pub fn analyze_adapted_procedure_rules(
     let assertion_sites = collect_assertion_sites(adapted);
     let mut assertions = Vec::new();
     for (node, site) in assertion_sites {
-        let query_procedure = build_assertion_query_procedure(adapted, node, &site)?;
+        let raw_query_procedure = build_assertion_query_procedure(adapted, node, &site)?;
+        if !cfg_is_acyclic(&raw_query_procedure.cfg) {
+            return Err(DriverError::CyclicRuleProcedure);
+        }
+        let query_procedure = rewrite_rule_query_procedure(&raw_query_procedure)?;
         ensure_rule_query_supported(&query_procedure)?;
         assertions.push(analyze_assertion_query(procedure, &site, &query_procedure)?);
     }
@@ -1245,6 +1391,119 @@ fn build_assertion_query_procedure(
         node_effects,
         edge_effects,
     })
+}
+
+/// Rewrites the currently supported acyclic memory/call slice into a
+/// path-expanded scalar query so the Figure 5/6/7 scheduler can stay in terms
+/// of `Assign` / `Assume` / `Gamma_e`.
+fn rewrite_rule_query_procedure(
+    query_procedure: &AssertionQueryProcedure,
+) -> Result<AssertionQueryProcedure, DriverError> {
+    let entry_label = query_procedure
+        .cfg
+        .node(query_procedure.cfg.entry())
+        .ok_or(DriverError::UnknownNode {
+            node: query_procedure.cfg.entry(),
+        })?
+        .label
+        .clone();
+    let mut cfg = Cfg::new(entry_label);
+    let mut node_effects = BTreeMap::<CfgNodeId, Vec<TransferEffect>>::new();
+    let mut edge_effects = BTreeMap::<CfgEdgeId, Vec<TransferEffect>>::new();
+    let expanded_entry = cfg.entry();
+
+    expand_rule_query_node(
+        query_procedure,
+        &mut cfg,
+        &mut node_effects,
+        &mut edge_effects,
+        query_procedure.cfg.entry(),
+        expanded_entry,
+        RuleRewriteState::default(),
+    )?;
+
+    cfg.ensure_single_exit()
+        .map_err(|error| DriverError::Cfg(error.to_string()))?;
+
+    Ok(AssertionQueryProcedure {
+        cfg,
+        node_effects,
+        edge_effects,
+    })
+}
+
+fn expand_rule_query_node(
+    query_procedure: &AssertionQueryProcedure,
+    expanded_cfg: &mut Cfg,
+    expanded_node_effects: &mut BTreeMap<CfgNodeId, Vec<TransferEffect>>,
+    expanded_edge_effects: &mut BTreeMap<CfgEdgeId, Vec<TransferEffect>>,
+    original_node: CfgNodeId,
+    expanded_node: CfgNodeId,
+    mut rewrite_state: RuleRewriteState,
+) -> Result<(), DriverError> {
+    if let Some(effects) = query_procedure.node_effects.get(&original_node) {
+        let lowered = rewrite_state.lower_effects(effects)?;
+        if !lowered.is_empty() {
+            expanded_node_effects.insert(expanded_node, lowered);
+        }
+    }
+
+    let outgoing = query_procedure
+        .cfg
+        .outgoing_edges(original_node)
+        .map_err(|_| DriverError::UnknownNode {
+            node: original_node,
+        })?;
+    if outgoing.is_empty() {
+        if query_procedure
+            .cfg
+            .concrete_exits()
+            .contains(&original_node)
+        {
+            expanded_cfg
+                .mark_exit(expanded_node)
+                .map_err(|error| DriverError::Cfg(error.to_string()))?;
+        }
+        return Ok(());
+    }
+
+    for edge_id in outgoing {
+        let edge = query_procedure
+            .cfg
+            .edge(edge_id)
+            .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+        let mut edge_state = rewrite_state.clone();
+        let lowered_edge_effects = query_procedure
+            .edge_effects
+            .get(&edge_id)
+            .map(|effects| edge_state.lower_effects(effects))
+            .transpose()?
+            .unwrap_or_default();
+        let target_label = query_procedure
+            .cfg
+            .node(edge.target)
+            .ok_or(DriverError::UnknownNode { node: edge.target })?
+            .label
+            .clone();
+        let expanded_target = expanded_cfg.add_node(target_label);
+        let expanded_edge = expanded_cfg
+            .add_edge(expanded_node, expanded_target, edge.relation.clone())
+            .map_err(|error| DriverError::Cfg(error.to_string()))?;
+        if !lowered_edge_effects.is_empty() {
+            expanded_edge_effects.insert(expanded_edge, lowered_edge_effects);
+        }
+        expand_rule_query_node(
+            query_procedure,
+            expanded_cfg,
+            expanded_node_effects,
+            expanded_edge_effects,
+            edge.target,
+            expanded_target,
+            edge_state,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn ensure_rule_query_supported(
@@ -1901,6 +2160,16 @@ mod tests {
         analyze_function_graph_simple_with_purity(graph, &pure, options).unwrap()
     }
 
+    fn analyze_named_rules(ir: &str, name: &str) -> RuleProcedureReport {
+        initialize_target();
+        let context = Context::new();
+        let module = context.parse_ir_str(ir, "driver_rule_test").unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        let pure = crate::analysis::llvm_adapter::infer_memory_pure_functions(&graphs);
+        let graph = graphs.iter().find(|graph| graph.name == name).unwrap();
+        analyze_function_graph_rules_with_purity(graph, &pure).unwrap()
+    }
+
     fn analyze_first_rules(ir: &str) -> RuleProcedureReport {
         initialize_target();
         let context = Context::new();
@@ -2227,6 +2496,30 @@ mod tests {
     }
 
     #[test]
+    fn rule_driver_supports_alloca_store_load_memory() {
+        let report = analyze_first_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @main() {
+                entry:
+                    %ptr = alloca i32
+                    store i32 7, ptr %ptr
+                    %value = load i32, ptr %ptr
+                    %ok = icmp eq i32 %value, 7
+                    call void @may_assert(i1 %ok)
+                    ret i32 %value
+                }
+            "#,
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::True);
+        assert!(report.assertions[0].witness.is_none());
+    }
+
+    #[test]
     fn rule_driver_finds_an_unsafe_branch_assertion() {
         let report = analyze_first_rules(
             r#"
@@ -2253,6 +2546,38 @@ mod tests {
         assert_eq!(report.assertions.len(), 2);
         assert_eq!(report.assertions[0].result, AssertionResult::False);
         assert!(report.assertions[0].rule_applications > 0);
+    }
+
+    #[test]
+    fn rule_driver_havocs_memory_for_impure_calls() {
+        let report = analyze_named_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @touch(ptr %p) {
+                entry:
+                    store i32 1, ptr %p
+                    ret void
+                }
+
+                define void @main() {
+                entry:
+                    %ptr = alloca i32
+                    store i32 7, ptr %ptr
+                    call void @touch(ptr %ptr)
+                    %value = load i32, ptr %ptr
+                    %ok = icmp eq i32 %value, 7
+                    call void @may_assert(i1 %ok)
+                    ret void
+                }
+            "#,
+            "main",
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::Yes);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::False);
+        assert!(report.assertions[0].witness.is_some());
     }
 
     #[test]
