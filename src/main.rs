@@ -6,6 +6,8 @@
 //!
 //! - `--simple-check` for the broader temporary bounded checker
 //! - `--rule-check` for the narrower local rule-driven scheduler
+//! - `--rule-witness` for on-demand counterexample replay/model generation on
+//!   top of `--rule-check`
 
 mod analysis;
 mod assertions;
@@ -37,6 +39,7 @@ fn main() {
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
         .arg(arg!(--"simple-check" "Run the current bounded single-procedure checker"))
         .arg(arg!(--"rule-check" "Run the current acyclic scalar rule-driven checker"))
+        .arg(arg!(--"rule-witness" "Generate an on-demand witness trace and solver model for false rule-check results"))
         .arg(arg!(--"trace-predicates" "Emit predicate traces for the simple checker as debug logs"))
         .arg(
             arg!(--"max-step" <MAX_STEP> "Temporary per-edge loop visit bound for the simple checker")
@@ -51,7 +54,8 @@ fn main() {
     let trace_predicates = matches.get_flag("trace-predicates");
     let max_step = *matches.get_one::<usize>("max-step").unwrap();
     let simple_check = matches.get_flag("simple-check") || trace_predicates;
-    let rule_check = matches.get_flag("rule-check");
+    let rule_witness = matches.get_flag("rule-witness");
+    let rule_check = matches.get_flag("rule-check") || rule_witness;
     init_logging(trace_predicates);
     initialize_target();
 
@@ -69,6 +73,9 @@ fn main() {
         analysis::driver::SimpleDriverOptions {
             max_step,
             trace_predicates,
+        },
+        analysis::driver::RuleDriverOptions {
+            generate_witnesses: rule_witness,
         },
     );
 }
@@ -90,6 +97,7 @@ fn handle(
     simple_check: bool,
     rule_check: bool,
     options: analysis::driver::SimpleDriverOptions,
+    rule_options: analysis::driver::RuleDriverOptions,
 ) {
     match generate_program_graph(&module) {
         Ok(graphs) => {
@@ -125,9 +133,10 @@ fn handle(
                     }
                 }
                 if rule_check {
-                    match analysis::driver::analyze_function_graph_rules_with_purity(
+                    match analysis::driver::analyze_function_graph_rules_with_purity_and_options(
                         graph,
                         &memory_pure_functions,
+                        rule_options.clone(),
                     ) {
                         Ok(report) => rule_summaries.push(RuleProcedureSummary::Checked(report)),
                         Err(error) => rule_summaries.push(RuleProcedureSummary::Unsupported {

@@ -24,6 +24,14 @@ pub enum Validity {
     Unknown,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeasibilityReport {
+    /// Satisfiability status of the queried formula.
+    pub feasibility: Feasibility,
+    /// Optional model rendered by the raw solver for feasible/unknown queries.
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Oracle;
 
@@ -39,12 +47,26 @@ impl Oracle {
     }
 
     pub fn feasibility(&self, formula: &Formula) -> Result<Feasibility, OracleError> {
+        Ok(self.feasibility_with_model(formula)?.feasibility)
+    }
+
+    pub fn feasibility_with_model(
+        &self,
+        formula: &Formula,
+    ) -> Result<FeasibilityReport, OracleError> {
         let mut scope = SmtScope::new();
         scope.assert_formula(formula)?;
-        Ok(match scope.check() {
-            SatResult::Sat => Feasibility::Feasible,
-            SatResult::Unsat => Feasibility::Infeasible,
-            SatResult::Unknown => Feasibility::Unknown,
+        let result = scope.check();
+        let model = matches!(result, SatResult::Sat | SatResult::Unknown)
+            .then(|| scope.model_string())
+            .flatten();
+        Ok(FeasibilityReport {
+            feasibility: match result {
+                SatResult::Sat => Feasibility::Feasible,
+                SatResult::Unsat => Feasibility::Infeasible,
+                SatResult::Unknown => Feasibility::Unknown,
+            },
+            model,
         })
     }
 
@@ -57,6 +79,13 @@ impl Oracle {
 
     pub fn state_feasibility(&self, state: &NodeState) -> Result<Feasibility, OracleError> {
         self.feasibility(&state.feasibility_formula())
+    }
+
+    pub fn state_feasibility_with_model(
+        &self,
+        state: &NodeState,
+    ) -> Result<FeasibilityReport, OracleError> {
+        self.feasibility_with_model(&state.feasibility_formula())
     }
 
     pub fn obligation_feasibility(&self, state: &NodeState) -> Result<Feasibility, OracleError> {
@@ -171,5 +200,18 @@ mod tests {
                 .unwrap(),
             Validity::Invalid
         );
+    }
+
+    #[test]
+    fn feasibility_with_model_returns_a_model_for_sat_queries() {
+        let oracle = Oracle::new();
+        let report = oracle
+            .feasibility_with_model(&Formula::eq(Term::var("x", Sort::Int), Term::int(11)))
+            .unwrap();
+
+        assert_eq!(report.feasibility, Feasibility::Feasible);
+        let model = report.model.expect("sat query should expose a model");
+        assert!(model.contains("x"));
+        assert!(model.contains("11"));
     }
 }

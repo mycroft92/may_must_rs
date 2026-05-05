@@ -34,6 +34,10 @@ impl SmtScope {
         self.solver.check()
     }
 
+    pub fn model_string(&self) -> Option<String> {
+        self.solver.get_model().map(|model| model.to_string())
+    }
+
     pub fn reset(&mut self) {
         self.solver.reset();
     }
@@ -306,5 +310,19 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(smt.check(), SatResult::Sat);
+    }
+
+    #[test]
+    fn sat_queries_can_render_a_model() {
+        let mut smt = SmtScope::new();
+        smt.assert_formula(&Formula::eq(Term::var("x", Sort::Int), Term::int(9)))
+            .unwrap();
+
+        assert_eq!(smt.check(), SatResult::Sat);
+        let model = smt
+            .model_string()
+            .expect("sat query should expose a solver model");
+        assert!(model.contains("x"));
+        assert!(model.contains("9"));
     }
 }

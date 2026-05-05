@@ -15,6 +15,9 @@
 //! candidates from normalized edge/node effects, and schedules
 //! `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`, `BUGFOUND`, and
 //! `VERIFIED`.
+//! When requested, that slice can also replay one feasible must-side witness
+//! path through the query CFG and attach the resulting SMT model to the final
+//! violating state.
 //!
 //! It is still not the full paper scheduler:
 //!
@@ -68,6 +71,12 @@ impl Default for SimpleDriverOptions {
             trace_predicates: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuleDriverOptions {
+    /// Generate one witness trace and final solver model for `Yes` results.
+    pub generate_witnesses: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -332,6 +341,10 @@ pub enum DriverError {
         "rule driver currently requires an acyclic CFG until loop summaries/invariants are implemented"
     )]
     CyclicRuleProcedure,
+    #[error(
+        "rule driver returned Yes for assertion {assertion_id} but could not replay a witness"
+    )]
+    MissingRuleWitness { assertion_id: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,6 +375,42 @@ impl fmt::Display for RuleProcedureReport {
                 "    unknown premises: {}",
                 assertion.unknown_premises
             ));
+            if let Some(witness) = &assertion.witness {
+                lines.push("    witness trace:".to_string());
+                for step in &witness.steps {
+                    lines.push(format!("      {}", step.heading()));
+                    match step {
+                        RuleWitnessStep::State {
+                            generated,
+                            path_summary,
+                            facts,
+                            feasibility,
+                            ..
+                        } => {
+                            lines.push(format!(
+                                "        generated: {}",
+                                format_generated(generated)
+                            ));
+                            lines.push(format!("        path summary: {path_summary}"));
+                            lines.push(format!("        facts: {facts}"));
+                            lines.push(format!("        feasibility: {:?}", feasibility));
+                        }
+                        RuleWitnessStep::Outcome {
+                            query,
+                            result,
+                            model,
+                            ..
+                        } => {
+                            lines.push(format!("        check: {query}"));
+                            lines.push(format!("        result: {:?}", result));
+                            if let Some(model) = model {
+                                lines.push("        model:".to_string());
+                                append_indented_block(&mut lines, model, 10);
+                            }
+                        }
+                    }
+                }
+            }
         }
         write!(f, "{}", lines.join("\n"))
     }
@@ -376,6 +425,8 @@ pub struct RuleAssertionReport {
     pub rule_rounds: usize,
     pub rule_applications: usize,
     pub unknown_premises: usize,
+    /// Optional on-demand witness for `Yes` results in the current local rule slice.
+    pub witness: Option<RuleWitnessTrace>,
 }
 
 #[derive(Clone, Debug)]
@@ -390,6 +441,72 @@ struct RuleSearchStats {
     rounds: usize,
     applications: usize,
     unknown_premises: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuleWitnessTrace {
+    /// Ordered symbolic states ending at the final violating query check.
+    steps: Vec<RuleWitnessStep>,
+}
+
+impl RuleWitnessTrace {
+    fn push_state(
+        &mut self,
+        location: impl Into<String>,
+        generated: Vec<Formula>,
+        state: &NodeState,
+        feasibility: Feasibility,
+    ) {
+        self.steps.push(RuleWitnessStep::State {
+            location: location.into(),
+            generated,
+            path_summary: state.path_summary().as_formula(),
+            facts: state.facts().collapse(),
+            feasibility,
+        });
+    }
+
+    fn push_outcome(
+        &mut self,
+        location: impl Into<String>,
+        query: Formula,
+        result: Feasibility,
+        model: Option<String>,
+    ) {
+        self.steps.push(RuleWitnessStep::Outcome {
+            location: location.into(),
+            query,
+            result,
+            model,
+        });
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuleWitnessStep {
+    State {
+        location: String,
+        generated: Vec<Formula>,
+        path_summary: Formula,
+        facts: Formula,
+        feasibility: Feasibility,
+    },
+    Outcome {
+        location: String,
+        query: Formula,
+        result: Feasibility,
+        model: Option<String>,
+    },
+}
+
+impl RuleWitnessStep {
+    fn heading(&self) -> &str {
+        match self {
+            RuleWitnessStep::State { location, .. } | RuleWitnessStep::Outcome { location, .. } => {
+                location
+            }
+        }
+    }
 }
 
 pub fn analyze_function_graph_simple(
@@ -915,7 +1032,11 @@ pub fn analyze_function_graph_rules(
     graph: &FunctionGraph,
 ) -> Result<RuleProcedureReport, DriverError> {
     let adapted = adapt_function_graph(graph)?;
-    analyze_adapted_procedure_rules(&graph.name, &adapted)
+    analyze_adapted_procedure_rules_with_options(
+        &graph.name,
+        &adapted,
+        RuleDriverOptions::default(),
+    )
 }
 
 pub fn analyze_function_graph_rules_with_purity(
@@ -923,19 +1044,53 @@ pub fn analyze_function_graph_rules_with_purity(
     memory_pure_functions: &BTreeSet<String>,
 ) -> Result<RuleProcedureReport, DriverError> {
     let adapted = adapt_function_graph_with_purity(graph, memory_pure_functions)?;
-    analyze_adapted_procedure_rules(&graph.name, &adapted)
+    analyze_adapted_procedure_rules_with_options(
+        &graph.name,
+        &adapted,
+        RuleDriverOptions::default(),
+    )
+}
+
+pub fn analyze_function_graph_rules_with_options(
+    graph: &FunctionGraph,
+    options: RuleDriverOptions,
+) -> Result<RuleProcedureReport, DriverError> {
+    let adapted = adapt_function_graph(graph)?;
+    analyze_adapted_procedure_rules_with_options(&graph.name, &adapted, options)
+}
+
+pub fn analyze_function_graph_rules_with_purity_and_options(
+    graph: &FunctionGraph,
+    memory_pure_functions: &BTreeSet<String>,
+    options: RuleDriverOptions,
+) -> Result<RuleProcedureReport, DriverError> {
+    let adapted = adapt_function_graph_with_purity(graph, memory_pure_functions)?;
+    analyze_adapted_procedure_rules_with_options(&graph.name, &adapted, options)
 }
 
 pub fn analyze_adapted_procedure_rules(
     procedure: &str,
     adapted: &AdaptedProcedure,
 ) -> Result<RuleProcedureReport, DriverError> {
+    analyze_adapted_procedure_rules_with_options(procedure, adapted, RuleDriverOptions::default())
+}
+
+pub fn analyze_adapted_procedure_rules_with_options(
+    procedure: &str,
+    adapted: &AdaptedProcedure,
+    options: RuleDriverOptions,
+) -> Result<RuleProcedureReport, DriverError> {
     let assertion_sites = collect_assertion_sites(adapted);
     let mut assertions = Vec::new();
     for (node, site) in assertion_sites {
         let query_procedure = build_assertion_query_procedure(adapted, node, &site)?;
         ensure_rule_query_supported(&query_procedure)?;
-        assertions.push(analyze_assertion_query(procedure, &site, &query_procedure)?);
+        assertions.push(analyze_assertion_query(
+            procedure,
+            &site,
+            &query_procedure,
+            &options,
+        )?);
     }
     Ok(RuleProcedureReport {
         procedure: procedure.to_string(),
@@ -948,6 +1103,7 @@ fn analyze_assertion_query(
     procedure: &str,
     site: &AdaptedAssertionSite,
     query_procedure: &AssertionQueryProcedure,
+    options: &RuleDriverOptions,
 ) -> Result<RuleAssertionReport, DriverError> {
     let oracle = Oracle::new();
     let query = ReachabilityQuery::new(procedure, Formula::True, Formula::True);
@@ -959,13 +1115,27 @@ fn analyze_assertion_query(
     loop {
         match rules::figure6::BUGFOUND(&frame, &oracle)? {
             QueryJudgement::Yes => {
-                return Ok(rule_assertion_report(site, QueryJudgement::Yes, stats));
+                return rule_assertion_report(
+                    site,
+                    QueryJudgement::Yes,
+                    stats,
+                    query_procedure,
+                    &oracle,
+                    options,
+                );
             }
             QueryJudgement::No | QueryJudgement::Unknown => {}
         }
         match rules::figure5::VERIFIED(&frame, &oracle)? {
             QueryJudgement::No => {
-                return Ok(rule_assertion_report(site, QueryJudgement::No, stats));
+                return rule_assertion_report(
+                    site,
+                    QueryJudgement::No,
+                    stats,
+                    query_procedure,
+                    &oracle,
+                    options,
+                );
             }
             QueryJudgement::Yes | QueryJudgement::Unknown => {}
         }
@@ -990,20 +1160,39 @@ fn analyze_assertion_query(
             }
         }
     };
-    Ok(rule_assertion_report(site, final_judgement, stats))
+    rule_assertion_report(
+        site,
+        final_judgement,
+        stats,
+        query_procedure,
+        &oracle,
+        options,
+    )
 }
 
 fn rule_assertion_report(
     site: &AdaptedAssertionSite,
     judgement: QueryJudgement,
     stats: RuleSearchStats,
-) -> RuleAssertionReport {
+    query_procedure: &AssertionQueryProcedure,
+    oracle: &Oracle,
+    options: &RuleDriverOptions,
+) -> Result<RuleAssertionReport, DriverError> {
     let result = match judgement {
         QueryJudgement::No => AssertionResult::True,
         QueryJudgement::Yes => AssertionResult::False,
         QueryJudgement::Unknown => AssertionResult::Unknown,
     };
-    RuleAssertionReport {
+    let witness = if options.generate_witnesses && judgement == QueryJudgement::Yes {
+        Some(generate_rule_witness(query_procedure, oracle)?.ok_or(
+            DriverError::MissingRuleWitness {
+                assertion_id: site.id,
+            },
+        )?)
+    } else {
+        None
+    };
+    Ok(RuleAssertionReport {
         id: site.id,
         location: site.location.clone(),
         result,
@@ -1011,7 +1200,8 @@ fn rule_assertion_report(
         rule_rounds: stats.rounds,
         rule_applications: stats.applications,
         unknown_premises: stats.unknown_premises,
-    }
+        witness,
+    })
 }
 
 fn aggregate_assertion_judgement(assertions: &[RuleAssertionReport]) -> QueryJudgement {
@@ -1139,6 +1329,110 @@ fn ensure_rule_query_supported(
         }
     }
     Ok(())
+}
+
+fn generate_rule_witness(
+    query_procedure: &AssertionQueryProcedure,
+    oracle: &Oracle,
+) -> Result<Option<RuleWitnessTrace>, DriverError> {
+    // APPROX_HEAVY: the current rule-driven witness is reconstructed by
+    // replaying the lowered query CFG after a `BUGFOUND` result rather than
+    // by storing first-class must-rule provenance during scheduling.
+    let entry = query_procedure.cfg.entry();
+    search_rule_witness_path(
+        query_procedure,
+        oracle,
+        entry,
+        NodeState::entry(),
+        RuleWitnessTrace::default(),
+    )
+}
+
+fn search_rule_witness_path(
+    query_procedure: &AssertionQueryProcedure,
+    oracle: &Oracle,
+    node: CfgNodeId,
+    mut state: NodeState,
+    mut trace: RuleWitnessTrace,
+) -> Result<Option<RuleWitnessTrace>, DriverError> {
+    let node_label = cfg_node_label(&query_procedure.cfg, node)?;
+    if let Some(effects) = query_procedure.node_effects.get(&node) {
+        apply_effects(&mut state, effects)?;
+    }
+
+    let node_generated = query_procedure
+        .node_effects
+        .get(&node)
+        .map(|effects| effect_predicates(effects))
+        .unwrap_or_default();
+    let node_feasibility = oracle.state_feasibility(&state)?;
+    trace.push_state(
+        format!("step {}: node {node_label}", trace.steps.len() + 1),
+        node_generated,
+        &state,
+        node_feasibility,
+    );
+    if node_feasibility != Feasibility::Feasible {
+        return Ok(None);
+    }
+
+    if query_procedure.cfg.exit() == Some(node) {
+        let query = state.feasibility_formula();
+        let report = oracle.state_feasibility_with_model(&state)?;
+        trace.push_outcome(
+            format!("step {}: violation query", trace.steps.len() + 1),
+            query,
+            report.feasibility,
+            report.model,
+        );
+        return Ok((report.feasibility == Feasibility::Feasible).then_some(trace));
+    }
+
+    let outgoing = query_procedure
+        .cfg
+        .outgoing_edges(node)
+        .map_err(|_| DriverError::UnknownNode { node })?;
+    for edge_id in outgoing {
+        let edge = query_procedure
+            .cfg
+            .edge(edge_id)
+            .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+        let mut next_state = state.clone();
+        next_state.path_summary_mut().refine(edge.relation.clone());
+        if let Some(effects) = query_procedure.edge_effects.get(&edge_id) {
+            apply_effects(&mut next_state, effects)?;
+        }
+
+        let target_label = cfg_node_label(&query_procedure.cfg, edge.target)?;
+        let generated = edge_predicates(
+            edge.relation.clone(),
+            query_procedure.edge_effects.get(&edge_id),
+        );
+        let edge_feasibility = oracle.state_feasibility(&next_state)?;
+        let mut next_trace = trace.clone();
+        next_trace.push_state(
+            format!(
+                "step {}: edge {} -> {}",
+                next_trace.steps.len() + 1,
+                node_label,
+                target_label
+            ),
+            generated,
+            &next_state,
+            edge_feasibility,
+        );
+        if edge_feasibility != Feasibility::Feasible {
+            continue;
+        }
+
+        if let Some(witness) =
+            search_rule_witness_path(query_procedure, oracle, edge.target, next_state, next_trace)?
+        {
+            return Ok(Some(witness));
+        }
+    }
+
+    Ok(None)
 }
 
 fn cfg_is_acyclic(cfg: &Cfg) -> bool {
@@ -1613,6 +1907,19 @@ fn join_formulas(formulas: &[Formula]) -> String {
         .join(", ")
 }
 
+fn append_indented_block(lines: &mut Vec<String>, block: &str, indent: usize) {
+    let prefix = " ".repeat(indent);
+    for line in block.lines() {
+        lines.push(format!("{prefix}{line}"));
+    }
+}
+
+fn cfg_node_label(cfg: &Cfg, node: CfgNodeId) -> Result<String, DriverError> {
+    cfg.node(node)
+        .map(|node| normalize_label(&node.label))
+        .ok_or(DriverError::UnknownNode { node })
+}
+
 fn normalize_label(label: &str) -> String {
     label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1649,12 +1956,19 @@ mod tests {
         analyze_function_graph_simple_with_purity(graph, &pure, options).unwrap()
     }
 
-    fn analyze_first_rules(ir: &str) -> RuleProcedureReport {
+    fn analyze_first_rules_with_options(
+        ir: &str,
+        options: RuleDriverOptions,
+    ) -> RuleProcedureReport {
         initialize_target();
         let context = Context::new();
         let module = context.parse_ir_str(ir, "driver_rule_test").unwrap();
         let graphs = generate_program_graph(&module).unwrap();
-        analyze_function_graph_rules(&graphs[0]).unwrap()
+        analyze_function_graph_rules_with_options(&graphs[0], options).unwrap()
+    }
+
+    fn analyze_first_rules(ir: &str) -> RuleProcedureReport {
+        analyze_first_rules_with_options(ir, RuleDriverOptions::default())
     }
 
     fn analyze_first_rules_err(ir: &str) -> DriverError {
@@ -2001,6 +2315,113 @@ mod tests {
         assert_eq!(report.assertions.len(), 2);
         assert_eq!(report.assertions[0].result, AssertionResult::False);
         assert!(report.assertions[0].rule_applications > 0);
+    }
+
+    #[test]
+    fn rule_driver_can_generate_a_witness_on_demand() {
+        let report = analyze_first_rules_with_options(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i32 %x) {
+                entry:
+                    %cond = icmp sgt i32 %x, 0
+                    br i1 %cond, label %then, label %else
+                then:
+                    %bad = icmp slt i32 %x, 0
+                    call void @may_assert(i1 %bad)
+                    br label %exit
+                else:
+                    call void @may_assert(i1 true)
+                    br label %exit
+                exit:
+                    ret void
+                }
+            "#,
+            RuleDriverOptions {
+                generate_witnesses: true,
+            },
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::Yes);
+        assert_eq!(report.assertions[0].result, AssertionResult::False);
+        let witness = report.assertions[0]
+            .witness
+            .as_ref()
+            .expect("false rule result should carry a witness when requested");
+        assert!(witness.steps.len() >= 2);
+        match witness.steps.last().unwrap() {
+            RuleWitnessStep::Outcome { model, result, .. } => {
+                assert_eq!(*result, Feasibility::Feasible);
+                assert!(model.is_some());
+            }
+            other => panic!("expected witness outcome step, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rule_driver_does_not_attach_witnesses_by_default() {
+        let report = analyze_first_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i32 %x) {
+                entry:
+                    %bad = icmp slt i32 %x, 0
+                    call void @may_assert(i1 %bad)
+                    ret void
+                }
+            "#,
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::Yes);
+        assert!(report.assertions[0].witness.is_none());
+    }
+
+    #[test]
+    fn safe_rule_results_do_not_attach_witnesses() {
+        let report = analyze_first_rules_with_options(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @main() {
+                entry:
+                    %x = add i32 2, 3
+                    %ok = icmp eq i32 %x, 5
+                    call void @may_assert(i1 %ok)
+                    ret i32 %x
+                }
+            "#,
+            RuleDriverOptions {
+                generate_witnesses: true,
+            },
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert!(report.assertions[0].witness.is_none());
+    }
+
+    #[test]
+    fn rule_report_display_renders_witness_trace() {
+        let report = analyze_first_rules_with_options(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i32 %x) {
+                entry:
+                    %bad = icmp slt i32 %x, 0
+                    call void @may_assert(i1 %bad)
+                    ret void
+                }
+            "#,
+            RuleDriverOptions {
+                generate_witnesses: true,
+            },
+        );
+
+        let rendered = report.to_string();
+        assert!(rendered.contains("witness trace:"));
+        assert!(rendered.contains("model:"));
     }
 
     #[test]

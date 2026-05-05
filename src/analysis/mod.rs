@@ -7,6 +7,7 @@
 //! - implemented but not wired: `formula`, `state`, `cfg`, `transfer`,
 //!   `llvm_adapter`, `oracle`, `summaries`;
 //! - implemented and CLI-active for local paper execution: `rules`, `driver`;
+//!   `driver` also supports optional on-demand rule witnesses via `oracle`;
 //! - planned: summary-driven call scheduling and loop invariants.
 //!
 //! The intention is to keep this tree LLVM-independent except for

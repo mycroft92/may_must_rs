@@ -2,7 +2,7 @@
 
 ## Phase
 
-Current phase: local paper rule driving plus a temporary bounded checker.
+Current phase: local paper rule driving with optional on-demand witnesses, plus a temporary bounded checker.
 
 Implemented:
 
@@ -13,6 +13,7 @@ Implemented:
 - named paper rules from Figures 5-10
 - temporary bounded intraprocedural driver with `max_step`
 - local Figure 5/6/7 rule-driven checker for acyclic scalar procedures
+- on-demand witness/model replay for false results in that local rule-driven slice
 - scalar `β` / `θ` generation from lowered `Assign` / `Assume` effects
 - LLVM adapter lowering through `transfer.rs`
 - paper oracle feasibility/implication queries
@@ -31,6 +32,6 @@ Not wired:
 ## Next Session Plan
 
 1. Extend `--rule-check` from the local acyclic scalar slice to summary-driven calls.
-2. Add memory-aware `Pre` / `Post` candidates so the rule driver can consume the current integer-array lowering.
-3. Replace the current conservative call-memory handling with Figure 8-10 summary reasoning.
-4. Replace the temporary `max_step` policy with loop summaries / invariants.
+2. Broaden rule-driver instruction handling beyond the current `Assign` / `Assume` subset.
+3. Add memory-aware `Pre` / `Post` candidates so the rule driver can consume the current integer-array lowering.
+4. Replace the current conservative call-memory handling with Figure 8-10 summary reasoning.

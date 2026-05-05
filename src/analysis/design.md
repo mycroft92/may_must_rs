@@ -12,6 +12,7 @@ paper-rule driver:
   - C fixture compilation under `tests/flow/`
   - `--simple-check` for the current bounded single-procedure checker
   - `--rule-check` for the current acyclic scalar rule-driven checker
+  - `--rule-witness` for on-demand witness/model replay on false rule results
   - temporary `max_step` loop bounding in `analysis::driver`
   - query-specific assertion lowering plus local Figure 5/6/7 scheduling in
     `analysis::driver`
@@ -52,7 +53,8 @@ raw solver layer               -> src/smt/solver.rs
 
 - `cfg.rs` stores only edge-local guards and relations (`Gamma_e`).
 - accumulated path predicates belong in `state.rs`.
-- `oracle.rs` is the solver boundary for feasibility and implication queries.
+- `oracle.rs` is the solver boundary for feasibility, implication, and
+  on-demand model queries.
 - `rules.rs` owns the named declarative rules and keeps their interfaces close
   to the paper.
 - `summaries.rs` stores summary facts, but summary scheduling still belongs in
@@ -66,6 +68,9 @@ raw solver layer               -> src/smt/solver.rs
 - the rule-driven slice rewrites each assertion into a synthetic violation-exit
   query and computes scalar `β` / `θ` candidates from normalized `Assign` /
   `Assume` effects plus `Gamma_e`.
+- when requested, that same rule-driven slice replays one feasible path
+  through the assertion query CFG and attaches the final SMT model for the
+  violating state.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
   most `max_step` times on one explored path; budget exhaustion yields
   `Unknown`.
@@ -129,6 +134,8 @@ representation choices are deliberately minimal:
   subset of those candidates
 - the current `driver.rs` still uses a separate bounded path explorer for loops,
   calls, and memory-heavy shapes
+- the current rule witnesses are postprocessed from the lowered query CFG
+  rather than reconstructed from explicit must-rule provenance
 - the current memory model is path-execution-oriented rather than a full paper
   memory abstraction
 

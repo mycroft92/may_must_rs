@@ -13,6 +13,7 @@ Implemented and CLI-active:
 - fixture compilation under `tests/flow/`
 - `--simple-check` for the current bounded single-procedure checker
 - `--rule-check` for the current acyclic scalar rule-driven checker
+- `--rule-witness` for on-demand rule-driven witness replay and solver models
 - integer-array memory modeling for `alloca` / `load` / `store` / `gep`
 - conservative call handling with memory-preserving vs memory-havocing callees
 
@@ -76,6 +77,12 @@ Run the current rule-driven checker:
 
 ```sh
 cargo run --bin main -- --rule-check --no-dot <bitcode-file>
+```
+
+Run the current rule-driven checker and print witnesses/models for false results:
+
+```sh
+cargo run --bin main -- --rule-check --rule-witness --no-dot <bitcode-file>
 ```
 
 That flag is CLI-active today, but it currently supports only acyclic
@@ -146,6 +153,10 @@ That checker is intentionally limited:
 With `--rule-check`, the CLI runs the current local Figure 5/6/7 scheduler
 over one assertion query at a time and prints one summary block per procedure.
 
+With `--rule-witness`, that same rule-driven slice replays one feasible path
+through the query-specific synthetic violation CFG for each false assertion and
+prints the final SMT model for that violating state.
+
 That rule-driven checker is intentionally narrower:
 
 - it rewrites each assertion into a query-specific synthetic violation exit and
@@ -157,6 +168,9 @@ That rule-driven checker is intentionally narrower:
   today because Clang lowers them through stack memory operations
 - it schedules local `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`,
   `IMPL_LEFT`, `IMPL_RIGHT`, `BUGFOUND`, and `VERIFIED`
+- on-demand witnesses currently exist only for that same local scalar acyclic
+  slice; summary-driven calls, loops, and memory-heavy rule queries still do
+  not produce rule witnesses today
 
 ## Active Architecture
 
@@ -217,4 +231,4 @@ Still unwired:
 1. Extend the rule-driven driver beyond the current acyclic scalar Figure 5/6/7 slice.
 2. Wire summary-driven call scheduling from Figures 8-10.
 3. Add loop summaries / invariants and retire the temporary bounded loop explorer.
-4. Add real solver model/evidence queries for rule-driven counterexamples.
+4. Extend on-demand rule witnesses beyond the current local scalar query slice.
