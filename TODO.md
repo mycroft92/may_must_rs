@@ -2,6 +2,7 @@
 
 ## Current Backlog
 
+- change the external loop-summary design: after lowering detects loops, send the loop body/instructions through an external interface, parse the returned summary, and attach it to the current procedure instead of sourcing loop summaries from the CLI layer
 - add an opt-in LLM candidate-generation layer for loop invariants and function summaries on top of the existing external-summary CLI seam
 - keep the default non-LLM route as the baseline/fallback for summary and invariant discovery
 - add oracle-backed verification/adoption flow for LLM-proposed loop invariants and function summaries
