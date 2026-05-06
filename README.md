@@ -98,6 +98,10 @@ cargo fmt
 
 ## Current CLI Behavior
 
+For a dedicated walkthrough of what happens after
+`llvm_utils::program_graph::generate_program_graph`, see
+[src/analysis/post_program_graph.md](/Users/mycroft/work/pl_projects/may_must/src/analysis/post_program_graph.md:1).
+
 The binary:
 
 - parses one `.bc` file

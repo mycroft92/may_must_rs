@@ -1,5 +1,9 @@
 # Analysis Flow
 
+For a narrative walkthrough that starts exactly after
+`program_graph::generate_program_graph`, see
+[post_program_graph.md](/Users/mycroft/work/pl_projects/may_must/src/analysis/post_program_graph.md:1).
+
 ## Implemented Flow
 
 ```text
