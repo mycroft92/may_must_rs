@@ -222,7 +222,7 @@ Still unwired:
 
 ## Next Milestone
 
-1. Extend the rule-driven driver beyond the current acyclic scalar-plus-memory Figure 5/6/7 slice.
-2. Wire summary-driven call scheduling from Figures 8-10.
-3. Add loop summaries / invariants and retire the temporary bounded loop explorer.
-4. Extend default rule-check witnesses beyond the current local scalar query slice.
+1. Add an opt-in LLM candidate-generation/provider layer for loop invariants and function summaries while keeping the default non-LLM route unchanged.
+2. Add oracle-backed verification/adoption flow for LLM-proposed candidates.
+3. Wire summary-driven call scheduling from Figures 8-10.
+4. Add loop summaries / invariants and retire the temporary bounded loop explorer.

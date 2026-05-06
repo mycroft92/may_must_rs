@@ -24,6 +24,7 @@ Implemented:
 
 Not wired:
 
+- opt-in LLM candidate provider/injection layer for function summaries and loop invariants
 - summary-driven call orchestration
 - richer instruction-aware effect-to-`Pre` / `Post` computation beyond the current integer-array memory and havoc slice
 - full loop-aware CLI rule execution
@@ -31,7 +32,7 @@ Not wired:
 
 ## Next Session Plan
 
-1. Extend `--rule-check` from the current local acyclic scalar-plus-memory slice to summary-driven calls.
-2. Broaden rule-driver instruction handling beyond the current integer-array memory and conservative havoc subset.
-3. Replace the current conservative call-memory handling with Figure 8-10 summary reasoning.
+1. Add an opt-in LLM candidate-generation switch for loop/function summary candidates while keeping the default non-LLM route unchanged.
+2. Add oracle-backed verification/adoption flow for LLM-proposed candidates.
+3. Extend `--rule-check` from the current local acyclic scalar-plus-memory slice to summary-driven calls.
 4. Replace the temporary `max_step` policy with loop summaries / invariants.
