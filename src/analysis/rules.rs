@@ -16,7 +16,9 @@
 //!
 //! `driver.rs` is responsible for choosing candidate `β` / `θ` formulas,
 //! projecting summaries to call interfaces, and scheduling these rules over
-//! lowered LLVM procedures.
+//! lowered LLVM procedures. Loop invariants are intentionally absent here until
+//! the driver can supply them as ordinary verified premises instead of baking
+//! loop policy into the rules themselves.
 //!
 //! The module therefore stays intentionally close to the paper text: rule
 //! functions expose paper-facing premises and mutate `ProcedureFrame`, but they

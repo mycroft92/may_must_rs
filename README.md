@@ -13,26 +13,24 @@ Implemented and CLI-active:
 - fixture compilation under `tests/flow/`
 - `--simple-check` for the current bounded single-procedure checker
 - `--rule-check` for the current acyclic summary-driven rule checker
+- paper formula / CFG / state / transfer / oracle / rules / summaries modules
+  through that rule-driven slice
 - integer-array memory modeling for `alloca` / `load` / `store` / `gep`
 - conservative call handling with memory-preserving vs memory-havocing callees
-- summary-driven calls over the current scalar-return interface
+- summary-driven calls over scalar/boolean actuals, one optional scalar
+  return, and visible memory ports on pointer arguments
 - module-level work-queue scheduling for Figures 5-10
-- provider/repository boundary for discovered summaries
+- provider/repository boundary for discovered summaries and future loop
+  invariants
 - alpha-renaming and call-site substitution for summary instantiation
+- SCC-based loop extraction plus acyclic summary-structure condensation
 
 Implemented but not wired:
 
 - assertion-to-formula translation
-- paper formula vocabulary
-- paper state carriers (`Pi_n`, `Omega_n`)
-- paper CFG (`P`, `n`, `e`, `Gamma_e`)
-- SMT oracle feasibility and implication queries over paper formulas/states
-- named paper rules from Figures 5-10
-- paper summary tables for `¬may ⇒ P` and `must ⇒ P`
-- normalized transfer effects
-- LLVM adapter lowering into `Cfg + node_effects + edge_effects`
 - opt-in external summary/invariant candidate providers
-- loop invariants in `analysis::driver`
+- loop invariant verification/adoption in `analysis::driver`
+- loop summaries in `analysis::driver`
 
 Planned:
 
@@ -84,10 +82,12 @@ cargo run --bin main -- --rule-check --no-dot <bitcode-file>
 ```
 
 That flag is CLI-active today. It currently supports acyclic procedures with
-branching, scalar-return summary-driven calls, and the current integer-array
-memory slice (`alloca` / `load` / `store` / `gep`) with conservative impure-call
-memory havoc. Loops, pointer phis, richer projection/elimination, and broader
-memory interfaces are still outside that rule slice.
+branching, summary-driven calls over scalar/boolean actuals plus visible
+integer-array memory ports, and the current integer-array memory slice
+(`alloca` / `load` / `store` / `gep`) with conservative impure-call memory
+havoc when no stronger summary exists. Loops, pointer phis, richer
+projection/elimination, and verified loop invariants are still outside that
+rule slice.
 
 Run unit tests:
 
@@ -164,15 +164,16 @@ That rule-driven checker is intentionally narrower:
   discovered `must` / `¬may` summaries, and reuses them across supported call
   sites through a provider/repository boundary
 - it alpha-renames callee interface variables, substitutes actual arguments and
-  return targets at the caller site, and maps caller queries back to callee
-  interfaces before enqueueing subqueries
+  return targets plus visible memory ports at the caller site, and maps caller
+  queries back to callee interfaces before enqueueing subqueries
 - for false results, it replays one feasible path through that synthetic
   violation CFG and prints the final SMT model for the violating state
-- it still requires an acyclic CFG; loops remain unsupported there until loop
-  summaries / invariants exist
+- it still requires an acyclic summary structure; loops are extracted and kept
+  as explicit regions, but remain unsupported there until loop summaries /
+  invariants exist
 - it schedules the currently supported Figure 5/6/7 local rules plus the
-  Figure 8/9/10 summary/call rules for the scalar-return interprocedural slice
-- those witnesses currently exist only for that same acyclic scalar-return
+  Figure 8/9/10 summary/call rules for the current interprocedural slice
+- those witnesses currently exist only for that same acyclic interprocedural
   slice; loops, pointer phis, and richer memory shapes still do not produce
   rule-check results today
 
@@ -196,6 +197,8 @@ src/smt/solver.rs               -> raw Z3 lowering
 Key boundaries:
 
 - `cfg.rs` stores only edge-local guards/relations.
+- `cfg.rs` also extracts loop SCCs and the acyclic condensation order used for
+  future loop-summary scheduling.
 - accumulated path predicates and current per-region memory arrays belong in
   `state.rs`.
 - `oracle.rs` is the only paper module that answers solver-backed feasibility
@@ -203,7 +206,8 @@ Key boundaries:
 - `rules.rs` keeps the rule names and premises close to the paper instead of
   hiding them behind a generic engine.
 - `summaries.rs` now also exposes the provider/repository boundary used by the
-  interprocedural driver.
+  interprocedural driver for both function summaries and future loop
+  invariants.
 - `transfer.rs` interprets normalized effects produced by `llvm_adapter.rs`.
 - `llvm_adapter.rs` lowers one procedure into `cfg + node_effects + edge_effects`.
 - local memory is modeled as integer arrays, and impure calls havoc those
@@ -228,7 +232,7 @@ The rules are now scheduled for the current interprocedural slice:
 - `driver.rs` schedules the currently supported Figure 5-10 rules per
   assertion query
 - `driver.rs` also schedules the Figure 8/9/10 call and summary rules over the
-  current scalar-return interface, with module-level summary reuse
+  current visible-memory call interface, with module-level summary reuse
 
 Still unwired:
 
@@ -239,7 +243,7 @@ Still unwired:
 
 ## Next Milestone
 
-1. Add an opt-in LLM candidate-generation/provider layer for loop invariants and function summaries while keeping the default non-LLM route unchanged.
-2. Add oracle-backed verification/adoption flow for LLM-proposed candidates.
-3. Broaden the current summary-driven call slice to richer interfaces, memory effects, and projections.
-4. Add loop summaries / invariants and retire the temporary bounded loop explorer.
+1. Add oracle-backed loop invariant verification/adoption over the new loop regions and summary structure.
+2. Broaden the current summary-driven call slice to richer interfaces, memory effects, and projections.
+3. Add an opt-in LLM candidate-generation/provider layer for loop invariants and function summaries while keeping the default non-LLM route unchanged.
+4. Add loop summaries / invariants to `--rule-check` and retire the temporary bounded loop explorer.

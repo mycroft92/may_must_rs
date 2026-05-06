@@ -6,7 +6,8 @@
 //! need to thread multiple error types through the frontend / graph-building
 //! pipeline. The deeper paper analysis layers use narrower local error types
 //! and are converted only when the CLI/frontend boundary needs one umbrella
-//! result.
+//! result. Summary, loop, and solver-local errors intentionally stay in their
+//! own modules until they cross that outer boundary.
 
 use crate::llvm_utils::llvm_wrap::Instruction;
 use thiserror::Error;

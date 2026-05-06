@@ -10,11 +10,11 @@
 //! - call-side memory havoc or preservation
 //!
 //! Calls preserve their interface data here so the rule driver can later build
-//! interprocedural queries and instantiate summaries. The bounded executor
-//! still treats scalar returns conservatively unless a richer summary path is
-//! available.
+//! interprocedural queries and instantiate summaries, including visible memory
+//! ports on pointer arguments. The bounded executor still treats scalar returns
+//! conservatively unless a richer summary path is available.
 
-use crate::analysis::formula::{Formula, Sort, Term, Var};
+use crate::analysis::formula::{Formula, Memory, Sort, Term, Var};
 use crate::analysis::state::NodeState;
 use thiserror::Error;
 
@@ -30,7 +30,62 @@ pub enum CallMemoryEffect {
 pub enum CallArgument {
     Term(Term),
     Predicate(Formula),
-    Pointer(String),
+    Pointer(PointerArgument),
+}
+
+/// Pointer actual passed at one call site.
+///
+/// Before rewrite, `memory_before` / `memory_after` are absent and `region`
+/// still names the raw pointer SSA value. The rule-query rewrite resolves that
+/// pointer to a canonical region plus offset and snapshots the pre/post memory
+/// expressions seen around the call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PointerArgument {
+    region: String,
+    offset: Term,
+    memory_before: Option<Memory>,
+    memory_after: Option<Memory>,
+}
+
+impl PointerArgument {
+    pub fn raw(region: impl Into<String>) -> Self {
+        Self {
+            region: region.into(),
+            offset: Term::int(0),
+            memory_before: None,
+            memory_after: None,
+        }
+    }
+
+    pub fn resolved(
+        region: impl Into<String>,
+        offset: Term,
+        memory_before: Memory,
+        memory_after: Memory,
+    ) -> Self {
+        Self {
+            region: region.into(),
+            offset,
+            memory_before: Some(memory_before),
+            memory_after: Some(memory_after),
+        }
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub fn offset(&self) -> &Term {
+        &self.offset
+    }
+
+    pub fn memory_before(&self) -> Option<&Memory> {
+        self.memory_before.as_ref()
+    }
+
+    pub fn memory_after(&self) -> Option<&Memory> {
+        self.memory_after.as_ref()
+    }
 }
 
 /// One normalized local effect interpreted by `apply_effect`.
@@ -382,7 +437,7 @@ mod tests {
             &mut state,
             &TransferEffect::Call {
                 callee: "touch".to_string(),
-                arguments: vec![CallArgument::Pointer("%ptr".to_string())],
+                arguments: vec![CallArgument::Pointer(PointerArgument::raw("%ptr"))],
                 return_target: None,
                 memory_effect: CallMemoryEffect::HavocMemory,
             },

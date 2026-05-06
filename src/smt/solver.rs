@@ -5,6 +5,7 @@
 //!
 //! - variable and array caches live here;
 //! - model rendering lives here;
+//! - integer-array memory equalities are lowered here;
 //! - paper-level decisions about when to ask SAT/validity questions do not.
 //!
 //! That policy split keeps `analysis::oracle` in charge of the proof/search
@@ -89,6 +90,7 @@ impl SmtScope {
                     right: Sort::Int,
                 }),
             },
+            Formula::MemoryEq(lhs, rhs) => Ok(self.lower_memory(lhs)?.eq(&self.lower_memory(rhs)?)),
             Formula::Lt(lhs, rhs) => {
                 compare_terms(self.lower_term(lhs)?, self.lower_term(rhs)?, Comparison::Lt)
             }

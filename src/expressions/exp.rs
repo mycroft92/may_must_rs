@@ -11,7 +11,7 @@
 //! assertions, while `parse_file` expects the full form. The parser is built in
 //! three stages: lexical token tree, Pratt expression parser, then assertion
 //! parser. Keeping this separate from LLVM lets tests exercise assertion
-//! syntax without needing bitcode.
+//! syntax without needing bitcode or the interprocedural summary machinery.
 
 use crate::errors::{ProgError, Result};
 use ariadne::{sources, Color, Label, Report, ReportKind};

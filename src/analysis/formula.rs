@@ -11,6 +11,7 @@
 //! - free-variable discovery
 //! - alpha renaming with fresh names
 //! - interface substitution from callee summaries into caller formulas
+//! - explicit integer-array memory equalities used by memory-aware summaries
 //!
 //! The intent is to keep all variable-space manipulation explicit and solver
 //! independent. `oracle.rs` answers satisfiability and implication questions,
@@ -146,6 +147,12 @@ impl Memory {
             }
         }
     }
+
+    pub fn free_symbol_names(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        collect_memory_variables(self, &mut names);
+        names
+    }
 }
 
 impl fmt::Display for Memory {
@@ -267,6 +274,7 @@ pub enum Formula {
     Or(Vec<Formula>),
     Implies(Box<Formula>, Box<Formula>),
     Eq(Term, Term),
+    MemoryEq(Memory, Memory),
     Lt(Term, Term),
     Le(Term, Term),
     Gt(Term, Term),
@@ -345,6 +353,10 @@ impl Formula {
         Self::Eq(lhs, rhs)
     }
 
+    pub fn memory_eq(lhs: Memory, rhs: Memory) -> Self {
+        Self::MemoryEq(lhs, rhs)
+    }
+
     pub fn lt(lhs: Term, rhs: Term) -> Self {
         Self::Lt(lhs, rhs)
     }
@@ -387,6 +399,10 @@ impl Formula {
                 let rhs_sort = rhs.sort()?;
                 unify_numeric_sorts(lhs_sort, rhs_sort).map(|_| ())
             }
+            Formula::MemoryEq(lhs, rhs) => {
+                lhs.validate()?;
+                rhs.validate()
+            }
             Formula::Lt(lhs, rhs)
             | Formula::Le(lhs, rhs)
             | Formula::Gt(lhs, rhs)
@@ -398,8 +414,8 @@ impl Formula {
         }
     }
 
-    /// Returns the scalar variable names that occur syntactically in this
-    /// formula.
+    /// Returns the symbol names that occur syntactically in this formula,
+    /// including scalar variables and memory variables.
     pub fn free_variable_names(&self) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
         collect_formula_variables(self, &mut names);
@@ -418,14 +434,21 @@ impl Formula {
         rename_formula(self, mapping)
     }
 
+    /// Alpha-renames memory variables using an explicit string mapping.
+    pub fn alpha_rename_memory(&self, mapping: &BTreeMap<String, String>) -> Self {
+        rename_formula_memory(self, mapping)
+    }
+
     /// Simultaneously substitutes scalar integer/real variables by terms and
-    /// scalar Boolean variables by predicates.
+    /// scalar Boolean variables by predicates, while also substituting memory
+    /// variables by memory expressions.
     pub fn substitute_interface(
         &self,
         term_subst: &BTreeMap<String, Term>,
         bool_subst: &BTreeMap<String, Formula>,
+        memory_subst: &BTreeMap<String, Memory>,
     ) -> Self {
-        substitute_formula(self, term_subst, bool_subst)
+        substitute_formula(self, term_subst, bool_subst, memory_subst)
     }
 }
 
@@ -440,6 +463,7 @@ impl fmt::Display for Formula {
             Formula::Or(items) => write_joined(f, items, " || "),
             Formula::Implies(lhs, rhs) => write!(f, "({lhs} => {rhs})"),
             Formula::Eq(lhs, rhs) => write!(f, "({lhs} == {rhs})"),
+            Formula::MemoryEq(lhs, rhs) => write!(f, "({lhs} == {rhs})"),
             Formula::Lt(lhs, rhs) => write!(f, "({lhs} < {rhs})"),
             Formula::Le(lhs, rhs) => write!(f, "({lhs} <= {rhs})"),
             Formula::Gt(lhs, rhs) => write!(f, "({lhs} > {rhs})"),
@@ -523,6 +547,12 @@ impl FreshNameGenerator {
         self.next += 1;
         fresh
     }
+
+    pub fn freshened_name(&mut self, base: &str, stem: &str) -> String {
+        let fresh = format!("{stem}${base}${}", self.next);
+        self.next += 1;
+        fresh
+    }
 }
 
 fn collect_formula_variables(formula: &Formula, names: &mut BTreeSet<String>) {
@@ -549,6 +579,10 @@ fn collect_formula_variables(formula: &Formula, names: &mut BTreeSet<String>) {
             collect_term_variables(lhs, names);
             collect_term_variables(rhs, names);
         }
+        Formula::MemoryEq(lhs, rhs) => {
+            collect_memory_variables(lhs, names);
+            collect_memory_variables(rhs, names);
+        }
     }
 }
 
@@ -572,7 +606,9 @@ fn collect_term_variables(term: &Term, names: &mut BTreeSet<String>) {
 
 fn collect_memory_variables(memory: &Memory, names: &mut BTreeSet<String>) {
     match memory {
-        Memory::Var(_) => {}
+        Memory::Var(name) => {
+            names.insert(name.clone());
+        }
         Memory::Store(inner, index, value) => {
             collect_memory_variables(inner, names);
             collect_term_variables(index, names);
@@ -608,10 +644,62 @@ fn rename_formula(formula: &Formula, mapping: &BTreeMap<String, Var>) -> Formula
             Formula::implies(rename_formula(lhs, mapping), rename_formula(rhs, mapping))
         }
         Formula::Eq(lhs, rhs) => Formula::eq(rename_term(lhs, mapping), rename_term(rhs, mapping)),
+        Formula::MemoryEq(lhs, rhs) => {
+            Formula::memory_eq(rename_memory(lhs, mapping), rename_memory(rhs, mapping))
+        }
         Formula::Lt(lhs, rhs) => Formula::lt(rename_term(lhs, mapping), rename_term(rhs, mapping)),
         Formula::Le(lhs, rhs) => Formula::le(rename_term(lhs, mapping), rename_term(rhs, mapping)),
         Formula::Gt(lhs, rhs) => Formula::gt(rename_term(lhs, mapping), rename_term(rhs, mapping)),
         Formula::Ge(lhs, rhs) => Formula::ge(rename_term(lhs, mapping), rename_term(rhs, mapping)),
+    }
+}
+
+fn rename_formula_memory(formula: &Formula, mapping: &BTreeMap<String, String>) -> Formula {
+    match formula {
+        Formula::True => Formula::True,
+        Formula::False => Formula::False,
+        Formula::Var(var) => Formula::Var(var.clone()),
+        Formula::Not(inner) => Formula::not(rename_formula_memory(inner, mapping)),
+        Formula::And(items) => Formula::and_all(
+            items
+                .iter()
+                .map(|item| rename_formula_memory(item, mapping))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Or(items) => Formula::or_all(
+            items
+                .iter()
+                .map(|item| rename_formula_memory(item, mapping))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Implies(lhs, rhs) => Formula::implies(
+            rename_formula_memory(lhs, mapping),
+            rename_formula_memory(rhs, mapping),
+        ),
+        Formula::Eq(lhs, rhs) => Formula::eq(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(
+            rename_memory_by_name(lhs, mapping),
+            rename_memory_by_name(rhs, mapping),
+        ),
+        Formula::Lt(lhs, rhs) => Formula::lt(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Formula::Le(lhs, rhs) => Formula::le(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Formula::Gt(lhs, rhs) => Formula::gt(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Formula::Ge(lhs, rhs) => Formula::ge(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
     }
 }
 
@@ -653,10 +741,53 @@ fn rename_memory(memory: &Memory, mapping: &BTreeMap<String, Var>) -> Memory {
     }
 }
 
+fn rename_term_memory(term: &Term, mapping: &BTreeMap<String, String>) -> Term {
+    match term {
+        Term::Var(var) => Term::Var(var.clone()),
+        Term::Int(value) => Term::int(*value),
+        Term::Real(value) => Term::Real(value.clone()),
+        Term::Select(memory, index) => Term::select(
+            rename_memory_by_name(memory, mapping),
+            rename_term_memory(index, mapping),
+        ),
+        Term::Add(lhs, rhs) => Term::add(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Term::Sub(lhs, rhs) => Term::sub(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Term::Mul(lhs, rhs) => Term::mul(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Term::Div(lhs, rhs) => Term::div(
+            rename_term_memory(lhs, mapping),
+            rename_term_memory(rhs, mapping),
+        ),
+        Term::Neg(inner) => Term::neg(rename_term_memory(inner, mapping)),
+    }
+}
+
+fn rename_memory_by_name(memory: &Memory, mapping: &BTreeMap<String, String>) -> Memory {
+    match memory {
+        Memory::Var(name) => {
+            Memory::var(mapping.get(name).cloned().unwrap_or_else(|| name.clone()))
+        }
+        Memory::Store(inner, index, value) => Memory::store(
+            rename_memory_by_name(inner, mapping),
+            rename_term_memory(index, mapping),
+            rename_term_memory(value, mapping),
+        ),
+    }
+}
+
 fn substitute_formula(
     formula: &Formula,
     term_subst: &BTreeMap<String, Term>,
     bool_subst: &BTreeMap<String, Formula>,
+    memory_subst: &BTreeMap<String, Memory>,
 ) -> Formula {
     match formula {
         Formula::True => Formula::True,
@@ -665,42 +796,51 @@ fn substitute_formula(
             .get(var.name())
             .cloned()
             .unwrap_or_else(|| Formula::Var(var.clone())),
-        Formula::Not(inner) => Formula::not(substitute_formula(inner, term_subst, bool_subst)),
+        Formula::Not(inner) => Formula::not(substitute_formula(
+            inner,
+            term_subst,
+            bool_subst,
+            memory_subst,
+        )),
         Formula::And(items) => Formula::and_all(
             items
                 .iter()
-                .map(|item| substitute_formula(item, term_subst, bool_subst))
+                .map(|item| substitute_formula(item, term_subst, bool_subst, memory_subst))
                 .collect::<Vec<_>>(),
         ),
         Formula::Or(items) => Formula::or_all(
             items
                 .iter()
-                .map(|item| substitute_formula(item, term_subst, bool_subst))
+                .map(|item| substitute_formula(item, term_subst, bool_subst, memory_subst))
                 .collect::<Vec<_>>(),
         ),
         Formula::Implies(lhs, rhs) => Formula::implies(
-            substitute_formula(lhs, term_subst, bool_subst),
-            substitute_formula(rhs, term_subst, bool_subst),
+            substitute_formula(lhs, term_subst, bool_subst, memory_subst),
+            substitute_formula(rhs, term_subst, bool_subst, memory_subst),
         ),
         Formula::Eq(lhs, rhs) => Formula::eq(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
+        ),
+        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(
+            substitute_memory(lhs, term_subst, bool_subst, memory_subst),
+            substitute_memory(rhs, term_subst, bool_subst, memory_subst),
         ),
         Formula::Lt(lhs, rhs) => Formula::lt(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
         Formula::Le(lhs, rhs) => Formula::le(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
         Formula::Gt(lhs, rhs) => Formula::gt(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
         Formula::Ge(lhs, rhs) => Formula::ge(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
     }
 }
@@ -709,6 +849,7 @@ fn substitute_term(
     term: &Term,
     term_subst: &BTreeMap<String, Term>,
     bool_subst: &BTreeMap<String, Formula>,
+    memory_subst: &BTreeMap<String, Memory>,
 ) -> Term {
     match term {
         Term::Var(var) => term_subst
@@ -718,26 +859,26 @@ fn substitute_term(
         Term::Int(value) => Term::int(*value),
         Term::Real(value) => Term::Real(value.clone()),
         Term::Select(memory, index) => Term::select(
-            substitute_memory(memory, term_subst, bool_subst),
-            substitute_term(index, term_subst, bool_subst),
+            substitute_memory(memory, term_subst, bool_subst, memory_subst),
+            substitute_term(index, term_subst, bool_subst, memory_subst),
         ),
         Term::Add(lhs, rhs) => Term::add(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
         Term::Sub(lhs, rhs) => Term::sub(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
         Term::Mul(lhs, rhs) => Term::mul(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
         Term::Div(lhs, rhs) => Term::div(
-            substitute_term(lhs, term_subst, bool_subst),
-            substitute_term(rhs, term_subst, bool_subst),
+            substitute_term(lhs, term_subst, bool_subst, memory_subst),
+            substitute_term(rhs, term_subst, bool_subst, memory_subst),
         ),
-        Term::Neg(inner) => Term::neg(substitute_term(inner, term_subst, bool_subst)),
+        Term::Neg(inner) => Term::neg(substitute_term(inner, term_subst, bool_subst, memory_subst)),
     }
 }
 
@@ -745,19 +886,20 @@ fn substitute_memory(
     memory: &Memory,
     term_subst: &BTreeMap<String, Term>,
     bool_subst: &BTreeMap<String, Formula>,
+    memory_subst: &BTreeMap<String, Memory>,
 ) -> Memory {
     match memory {
-        Memory::Var(name) => {
+        Memory::Var(name) => memory_subst.get(name).cloned().unwrap_or_else(|| {
             if let Some(Term::Var(var)) = term_subst.get(name) {
                 Memory::var(var.name())
             } else {
                 Memory::var(name.clone())
             }
-        }
+        }),
         Memory::Store(inner, index, value) => Memory::store(
-            substitute_memory(inner, term_subst, bool_subst),
-            substitute_term(index, term_subst, bool_subst),
-            substitute_term(value, term_subst, bool_subst),
+            substitute_memory(inner, term_subst, bool_subst, memory_subst),
+            substitute_term(index, term_subst, bool_subst, memory_subst),
+            substitute_term(value, term_subst, bool_subst, memory_subst),
         ),
     }
 }

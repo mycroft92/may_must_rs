@@ -10,15 +10,20 @@
 //!
 //! - formal parameter names
 //! - a distinguished scalar return slot
+//! - visible caller-owned memory ports
 //! - call arguments and optional scalar return targets
 //!
 //! The driver relies on this interface metadata when it creates callee queries,
 //! alpha-renames summary variables, and substitutes caller-side actuals back
-//! into discovered summaries.
+//! into discovered summaries. The adapter also records CFG loop regions and
+//! the acyclic condensation structure those loops induce, but it does not
+//! invent invariants for them.
 
-use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId};
+use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId, LoopRegion, SummaryStructure};
 use crate::analysis::formula::{Formula, Sort, Term, Var};
-use crate::analysis::transfer::{AssignValue, CallArgument, CallMemoryEffect, TransferEffect};
+use crate::analysis::transfer::{
+    AssignValue, CallArgument, CallMemoryEffect, PointerArgument, TransferEffect,
+};
 use crate::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TypeKind};
 use crate::llvm_utils::program_graph::{AssertSite, FunctionGraph};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -29,6 +34,22 @@ use thiserror::Error;
 pub struct ProcedureInterface {
     pub parameters: Vec<String>,
     pub return_value: Option<Var>,
+    /// Pointer-shaped interface roots that remain visible across summaries.
+    pub visible_memory_roots: Vec<String>,
+}
+
+impl ProcedureInterface {
+    pub fn input_memory_port(root: &str) -> String {
+        format!("{root}$mem_in")
+    }
+
+    pub fn output_memory_port(root: &str) -> String {
+        format!("{root}$mem_out")
+    }
+
+    pub fn offset_var(root: &str) -> Var {
+        Var::int(format!("{root}$offset"))
+    }
 }
 
 /// One lowered procedure ready for the paper CFG/transfer pipeline.
@@ -36,6 +57,10 @@ pub struct ProcedureInterface {
 pub struct AdaptedProcedure {
     pub name: String,
     pub interface: ProcedureInterface,
+    /// Concrete loop SCCs recovered from the lowered CFG.
+    pub loops: Vec<LoopRegion>,
+    /// Acyclic condensation graph used for future loop-summary scheduling.
+    pub summary_structure: SummaryStructure,
     pub cfg: Cfg,
     pub node_effects: BTreeMap<CfgNodeId, Vec<TransferEffect>>,
     pub edge_effects: BTreeMap<CfgEdgeId, Vec<TransferEffect>>,
@@ -92,6 +117,7 @@ pub fn adapt_function_graph_with_purity(
     let mut cfg = Cfg::new(start.print());
     let mut instruction_nodes = HashMap::<Instruction, CfgNodeId>::new();
     let allocation_regions = allocation_regions(graph);
+    let visible_memory_roots = visible_memory_roots(graph);
     let return_value = infer_return_value(graph)?;
     instruction_nodes.insert(start, cfg.entry());
 
@@ -139,13 +165,18 @@ pub fn adapt_function_graph_with_purity(
 
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
+    let loops = cfg.extract_loops();
+    let summary_structure = cfg.summary_structure();
 
     Ok(AdaptedProcedure {
         name: graph.name.clone(),
         interface: ProcedureInterface {
             parameters: graph.params.clone(),
             return_value,
+            visible_memory_roots,
         },
+        loops,
+        summary_structure,
         cfg,
         node_effects,
         edge_effects,
@@ -371,7 +402,9 @@ fn lower_call_arguments(instruction: Instruction) -> Result<Vec<CallArgument>, A
     let mut arguments = Vec::new();
     for argument in instruction.get_call_args() {
         if is_pointer_value(argument) {
-            arguments.push(CallArgument::Pointer(pointer_name(argument)?));
+            arguments.push(CallArgument::Pointer(PointerArgument::raw(pointer_name(
+                argument,
+            )?)));
             continue;
         }
         let sort = sort_for_value(argument)?;
@@ -405,6 +438,66 @@ fn allocation_regions(graph: &FunctionGraph) -> HashMap<Instruction, String> {
         }
     }
     regions
+}
+
+fn visible_memory_roots(graph: &FunctionGraph) -> Vec<String> {
+    let local_pointer_defs = defined_pointer_names(graph);
+    let mut visible = BTreeSet::new();
+    for instruction in &graph.vertices {
+        match instruction.get_opcode() {
+            InstructionOpcode::Load => {
+                if let Some(pointer) = instruction.get_operand(0) {
+                    if let Ok(name) = pointer_name(pointer) {
+                        if !local_pointer_defs.contains(&name) {
+                            visible.insert(name);
+                        }
+                    }
+                }
+            }
+            InstructionOpcode::Store => {
+                if let Some(pointer) = instruction.get_operand(1) {
+                    if let Ok(name) = pointer_name(pointer) {
+                        if !local_pointer_defs.contains(&name) {
+                            visible.insert(name);
+                        }
+                    }
+                }
+            }
+            InstructionOpcode::GetElementPtr => {
+                if let Some(base) = instruction.get_operand(0) {
+                    if let Ok(name) = pointer_name(base) {
+                        if !local_pointer_defs.contains(&name) {
+                            visible.insert(name);
+                        }
+                    }
+                }
+            }
+            InstructionOpcode::PHI => {
+                for (_, incoming) in instruction.get_phi_incomings() {
+                    if is_pointer_value(incoming) {
+                        if let Ok(name) = pointer_name(incoming) {
+                            if !local_pointer_defs.contains(&name) {
+                                visible.insert(name);
+                            }
+                        }
+                    }
+                }
+            }
+            InstructionOpcode::Call => {
+                for argument in instruction.get_call_args() {
+                    if is_pointer_value(argument) {
+                        if let Ok(name) = pointer_name(argument) {
+                            if !local_pointer_defs.contains(&name) {
+                                visible.insert(name);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    visible.into_iter().collect()
 }
 
 fn preserves_memory(graph: &FunctionGraph, memory_pure_functions: &BTreeSet<String>) -> bool {
@@ -466,6 +559,16 @@ fn infer_local_pointer_names(graph: &FunctionGraph) -> BTreeSet<String> {
             return locals;
         }
     }
+}
+
+fn defined_pointer_names(graph: &FunctionGraph) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for instruction in &graph.vertices {
+        if is_pointer_value(*instruction) {
+            names.insert(instruction.display_name());
+        }
+    }
+    names
 }
 
 fn is_local_pointer_value(value: Instruction, locals: &BTreeSet<String>) -> bool {
@@ -982,5 +1085,28 @@ mod tests {
             "#,
         );
         assert!(matches!(error, AdapterError::UnsupportedValue { .. }));
+    }
+
+    #[test]
+    fn adapted_procedure_records_visible_memory_roots_and_loop_structure() {
+        let adapted = adapt_first(
+            r#"
+                define void @main(ptr %p, i1 %keep_looping) {
+                entry:
+                    br label %loop
+                loop:
+                    %v = load i32, ptr %p
+                    br i1 %keep_looping, label %loop, label %exit
+                exit:
+                    ret void
+                }
+            "#,
+        );
+        assert_eq!(
+            adapted.interface.visible_memory_roots,
+            vec!["%p".to_string()]
+        );
+        assert_eq!(adapted.loops.len(), 1);
+        assert!(adapted.summary_structure.has_loops());
     }
 }

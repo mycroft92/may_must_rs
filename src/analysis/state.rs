@@ -12,7 +12,8 @@
 //!
 //! These carriers are deliberately operational rather than declarative. The
 //! paper-rule frame itself lives in `rules.rs`; `state.rs` supports the bounded
-//! executor, transfer interpretation, and witness replay.
+//! executor, transfer interpretation, and witness replay. Loop regions and
+//! invariants themselves are structural/provider concerns owned elsewhere.
 
 use crate::analysis::cfg::{CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::{Formula, Memory, Term, Var};

@@ -16,7 +16,7 @@
 //! These wrappers are not a complete type-safe LLVM binding. They are a local
 //! boundary for the subset of LLVM IR the analyzer currently needs. No paper
 //! reasoning should be implemented here; this file exists only to query LLVM
-//! safely enough for the raw graph builder.
+//! safely enough for the raw graph builder and later loop/call lowering.
 
 use llvm_sys::bit_reader::*;
 use llvm_sys::core::*;

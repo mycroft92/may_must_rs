@@ -16,7 +16,7 @@ LLVM bitcode
 ```text
 Vec<FunctionGraph>
   -> llvm_adapter::adapt_function_graph_with_purity
-     -> AdaptedProcedure { cfg, node_effects, edge_effects, interface, assertions }
+     -> AdaptedProcedure { cfg, summary_structure, loops, node_effects, edge_effects, interface, assertions }
   -> driver::RuleModuleEngine
      -> build_base_rule_procedure per function
      -> build_assertion_query_procedure per assertion
@@ -35,6 +35,7 @@ Vec<FunctionGraph>
 - satisfiability and implication queries live only in `oracle.rs`
 - named declarative rules live in `rules.rs`
 - summary facts live in `summaries.rs`
+- loop regions and the acyclic condensation order live in `cfg.rs`
 - `transfer.rs` interprets only normalized effects:
   - `Assign`
   - `Alloca`
@@ -75,14 +76,14 @@ Today the remaining caller/driver work is:
 - broader candidate `β` formulas beyond the current rewritten memory/havoc slice
 - broader candidate `θ` formulas beyond the current rewritten memory/havoc slice
 - richer summary projection/elimination beyond the current syntactic interface slice
-- loop-aware summary scheduling
+- loop invariant verification and loop-aware summary scheduling
 
 The current driver already computes the scalar acyclic `Assign` / `Assume`
 subset of `β` / `θ`, rewrites the current integer-array memory plus
 impure-call-havoc slice into that scalar form, alpha-renames and substitutes
-summary interfaces at call sites, and maps supported call queries back to
-callee interfaces. The remaining pieces belong to the broader future driver
-work.
+summary interfaces at call sites, maps supported call queries back to callee
+interfaces, and now keeps loop SCCs as explicit summary regions. The remaining
+pieces belong to the broader future driver work.
 
 ## Conservative Checks
 
@@ -109,7 +110,7 @@ driver:
     `unknown` outcomes
 - rule-driven slice:
   - it analyzes one module at a time so summaries can be shared across calls
-  - it currently requires an acyclic CFG
+  - it currently requires an acyclic summary structure
   - it builds one query-specific synthetic violation exit per assertion
   - it also builds one base summary-capable rule procedure per analyzed
     function
@@ -121,7 +122,10 @@ driver:
   - it schedules the currently supported Figure 5-10 rules, including summary
     reuse, subquery enqueueing, and discovered summary recording
   - it instantiates summaries at call sites through alpha-renamed interface
-    substitution over actual arguments and scalar return targets
+    substitution over actual arguments, scalar return targets, and visible
+    memory ports
+  - it already extracts loop regions and the condensation DAG that future
+    invariant generation will consume
   - it also replays one feasible violating path through that query CFG and
     prints the final SMT model
 
@@ -131,7 +135,7 @@ interfaces still remain for the future driver.
 
 ## Next Wiring Steps
 
-1. Add the opt-in candidate-provider path for future LLM or imported summaries/invariants.
+1. Add oracle-backed verification/adoption for loop invariant candidates over the extracted loop regions.
 2. Connect lowered memory/call effects to richer `β` / `θ` generation and projection.
-3. Replace temporary `max_step` handling with loop summaries / invariants.
-4. Extend rule-driven witnesses to richer summary, memory, and loop-aware queries.
+3. Add the opt-in candidate-provider path for future LLM or imported summaries/invariants.
+4. Replace temporary `max_step` handling with loop summaries / invariants.

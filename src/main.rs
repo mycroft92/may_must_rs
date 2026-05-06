@@ -6,6 +6,11 @@
 //! - `--simple-check` for the broader bounded single-procedure executor
 //! - `--rule-check` for the paper-shaped rule driver with module-level summary
 //!   reuse across supported calls
+//!
+//! The CLI remains intentionally honest about phase boundaries: loop regions
+//! are extracted and reported into the rule pipeline, but verified loop
+//! invariants are not active yet, so cyclic procedures still return
+//! `Unknown`/unsupported on the rule-driven path.
 
 mod analysis;
 mod assertions;

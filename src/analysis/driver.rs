@@ -20,7 +20,7 @@
 //!   `gep` plus conservative impure-call memory havoc) into scalar formulas;
 //! - schedules the currently supported Figure 5-10 rules;
 //! - uses Figures 8/9/10 to create, cache, instantiate, and reuse summaries
-//!   across supported scalar-return calls;
+//!   across supported calls with scalar returns plus visible memory ports;
 //! - alpha-renames summary variables before instantiating them at a call site;
 //! - replays one feasible must-side witness path plus the final SMT model for
 //!   false results.
@@ -28,9 +28,10 @@
 //! It is still not the full paper scheduler:
 //!
 //! - the path explorer still owns the temporary `max_step` loop policy
-//! - the rule scheduler is still limited to acyclic procedures
-//! - interprocedural summaries currently cover the scalar-return interface
-//!   slice, not general memory summaries
+//! - the rule scheduler still rejects procedures whose summary structure
+//!   contains loop regions
+//! - interprocedural summaries currently cover the scalar-return plus visible
+//!   integer-array memory interface slice, not full heap summaries
 //! - pointer phis, loop invariants, and richer projection/elimination remain
 //!   future work
 //!
@@ -48,7 +49,7 @@
 //! trace showing the explored state formulas that led to the failing
 //! obligation.
 
-use crate::analysis::cfg::{Cfg, CfgEdge, CfgEdgeId, CfgNodeId};
+use crate::analysis::cfg::{Cfg, CfgEdge, CfgEdgeId, CfgNodeId, LoopRegion, SummaryStructure};
 use crate::analysis::formula::{Formula, FreshNameGenerator, Memory, Sort, Term, Var};
 use crate::analysis::llvm_adapter::{
     adapt_function_graph, adapt_function_graph_with_purity, AdaptedAssertionSite, AdaptedProcedure,
@@ -59,7 +60,8 @@ use crate::analysis::rules::{self, ProcedureFrame, QueryJudgement, ReachabilityQ
 use crate::analysis::state::{NodeState, PointerValue};
 use crate::analysis::summaries::{MustSummary, NotMaySummary, SummaryProvider, SummaryRepository};
 use crate::analysis::transfer::{
-    apply_effects, AssignValue, CallArgument, CallMemoryEffect, TransferEffect, TransferError,
+    apply_effects, AssignValue, CallArgument, CallMemoryEffect, PointerArgument, TransferEffect,
+    TransferError,
 };
 use crate::llvm_utils::program_graph::FunctionGraph;
 use log::{debug, log_enabled, Level};
@@ -442,13 +444,18 @@ struct AssertionQueryProcedure {
     procedure: String,
     interface: ProcedureInterface,
     summary_capable: bool,
+    /// Concrete loop SCCs present in this lowered query procedure.
+    loops: Vec<LoopRegion>,
+    /// Acyclic condensation view that future invariant scheduling will use.
+    summary_structure: SummaryStructure,
     cfg: Cfg,
     node_effects: BTreeMap<CfgNodeId, Vec<TransferEffect>>,
     edge_effects: BTreeMap<CfgEdgeId, Vec<TransferEffect>>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RuleRewriteState {
+    visible_memory_roots: BTreeSet<String>,
     pointers: BTreeMap<String, PointerValue>,
     memory_regions: BTreeMap<String, Memory>,
     memory_epoch: usize,
@@ -462,6 +469,34 @@ struct RuleSearchStats {
 }
 
 impl RuleRewriteState {
+    fn from_interface(interface: &ProcedureInterface) -> Self {
+        let visible_memory_roots = interface
+            .visible_memory_roots
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut state = Self {
+            visible_memory_roots,
+            pointers: BTreeMap::new(),
+            memory_regions: BTreeMap::new(),
+            memory_epoch: 0,
+        };
+        for root in &interface.visible_memory_roots {
+            state.memory_regions.insert(
+                root.clone(),
+                Memory::var(ProcedureInterface::input_memory_port(root)),
+            );
+            state.pointers.insert(
+                root.clone(),
+                PointerValue::new(
+                    root.clone(),
+                    Term::Var(ProcedureInterface::offset_var(root)),
+                ),
+            );
+        }
+        state
+    }
+
     fn lower_effects(
         &mut self,
         effects: &[TransferEffect],
@@ -497,20 +532,26 @@ impl RuleRewriteState {
                     return_target,
                     memory_effect,
                 } => {
+                    let rewritten_arguments = arguments
+                        .iter()
+                        .map(|argument| self.rewrite_call_argument(argument, *memory_effect))
+                        .collect::<Vec<_>>();
                     if *memory_effect == CallMemoryEffect::HavocMemory {
                         // APPROX_HEAVY: until interprocedural memory summaries
                         // exist, impure calls still havoc the tracked
                         // integer-array regions before later loads are lowered.
                         self.havoc_memory();
                     }
-                    if return_target.is_some() {
-                        lowered.push(TransferEffect::Call {
-                            callee: callee.clone(),
-                            arguments: arguments.clone(),
-                            return_target: return_target.clone(),
-                            memory_effect: *memory_effect,
-                        });
-                    }
+                    let finalized_arguments = rewritten_arguments
+                        .into_iter()
+                        .map(|argument| self.finalize_call_argument(argument))
+                        .collect::<Vec<_>>();
+                    lowered.push(TransferEffect::Call {
+                        callee: callee.clone(),
+                        arguments: finalized_arguments,
+                        return_target: return_target.clone(),
+                        memory_effect: *memory_effect,
+                    });
                 }
                 TransferEffect::Obligation(_) => {
                     return Err(DriverError::UnsupportedRuleEffect {
@@ -562,14 +603,27 @@ impl RuleRewriteState {
         self.memory_epoch += 1;
         let regions = self.memory_regions.keys().cloned().collect::<Vec<_>>();
         for region in regions {
+            let symbol = if self.visible_memory_roots.contains(&region) {
+                ProcedureInterface::output_memory_port(&region)
+            } else {
+                self.memory_symbol(&region)
+            };
             self.memory_regions
-                .insert(region.clone(), Memory::var(self.memory_symbol(&region)));
+                .insert(region.clone(), Memory::var(symbol));
         }
     }
 
     fn resolve_pointer(&mut self, name: &str) -> PointerValue {
         if let Some(pointer) = self.pointers.get(name) {
             return pointer.clone();
+        }
+        if self.visible_memory_roots.contains(name) {
+            let pointer = PointerValue::new(
+                name.to_string(),
+                Term::Var(ProcedureInterface::offset_var(name)),
+            );
+            self.pointers.insert(name.to_string(), pointer.clone());
+            return pointer;
         }
         let region = format!("{name}$region");
         self.ensure_region(&region);
@@ -580,6 +634,13 @@ impl RuleRewriteState {
 
     fn ensure_region(&mut self, region: &str) {
         if self.memory_regions.contains_key(region) {
+            return;
+        }
+        if self.visible_memory_roots.contains(region) {
+            self.memory_regions.insert(
+                region.to_string(),
+                Memory::var(ProcedureInterface::input_memory_port(region)),
+            );
             return;
         }
         self.memory_regions
@@ -594,6 +655,68 @@ impl RuleRewriteState {
 
     fn memory_symbol(&self, region: &str) -> String {
         format!("{region}$mem{}", self.memory_epoch)
+    }
+
+    fn rewrite_call_argument(
+        &mut self,
+        argument: &CallArgument,
+        memory_effect: CallMemoryEffect,
+    ) -> CallArgument {
+        match argument {
+            CallArgument::Term(term) => CallArgument::Term(term.clone()),
+            CallArgument::Predicate(predicate) => CallArgument::Predicate(predicate.clone()),
+            CallArgument::Pointer(pointer) => {
+                let resolved = self.resolve_pointer(pointer.region());
+                let offset = if pointer.offset() == &Term::int(0) {
+                    resolved.offset().clone()
+                } else {
+                    Term::add(resolved.offset().clone(), pointer.offset().clone())
+                };
+                let before = self.current_memory(resolved.region()).clone();
+                let after = if memory_effect == CallMemoryEffect::HavocMemory {
+                    if self.visible_memory_roots.contains(resolved.region()) {
+                        Memory::var(ProcedureInterface::output_memory_port(resolved.region()))
+                    } else {
+                        Memory::var(self.memory_symbol(resolved.region()))
+                    }
+                } else {
+                    before.clone()
+                };
+                CallArgument::Pointer(PointerArgument::resolved(
+                    resolved.region().to_string(),
+                    offset,
+                    before,
+                    after,
+                ))
+            }
+        }
+    }
+
+    fn finalize_call_argument(&self, argument: CallArgument) -> CallArgument {
+        match argument {
+            CallArgument::Pointer(pointer) => CallArgument::Pointer(PointerArgument::resolved(
+                pointer.region().to_string(),
+                pointer.offset().clone(),
+                pointer
+                    .memory_before()
+                    .expect("prepared pointer arguments should record pre-call memory")
+                    .clone(),
+                self.current_memory(pointer.region()).clone(),
+            )),
+            other => other,
+        }
+    }
+
+    fn materialize_visible_memory_effects(&mut self) -> Vec<TransferEffect> {
+        let mut effects = Vec::new();
+        for root in self.visible_memory_roots.clone() {
+            self.ensure_region(&root);
+            effects.push(TransferEffect::Assume(Formula::memory_eq(
+                Memory::var(ProcedureInterface::output_memory_port(&root)),
+                self.current_memory(&root).clone(),
+            )));
+        }
+        effects
     }
 }
 
@@ -1315,7 +1438,7 @@ impl RuleModuleEngine {
         let mut assertions = Vec::new();
         for (node, site) in assertion_sites {
             let raw_query_procedure = build_assertion_query_procedure(&adapted, node, &site)?;
-            if !cfg_is_acyclic(&raw_query_procedure.cfg) {
+            if raw_query_procedure.summary_structure.has_loops() {
                 return Err(DriverError::CyclicRuleProcedure);
             }
             let query_procedure = rewrite_rule_query_procedure(&raw_query_procedure)?;
@@ -1363,7 +1486,7 @@ impl RuleModuleEngine {
             });
         }
         ensure_rule_query_supported(query_procedure)?;
-        if !cfg_is_acyclic(&query_procedure.cfg) {
+        if query_procedure.summary_structure.has_loops() {
             return Err(DriverError::CyclicRuleProcedure);
         }
 
@@ -1798,6 +1921,8 @@ fn build_assertion_query_procedure(
         procedure: adapted.name.clone(),
         interface: adapted.interface.clone(),
         summary_capable: false,
+        loops: cfg.extract_loops(),
+        summary_structure: cfg.summary_structure(),
         cfg,
         node_effects,
         edge_effects,
@@ -1860,11 +1985,13 @@ fn build_base_rule_procedure(
         procedure: adapted.name.clone(),
         interface: adapted.interface.clone(),
         summary_capable: true,
+        loops: cfg.extract_loops(),
+        summary_structure: cfg.summary_structure(),
         cfg,
         node_effects,
         edge_effects,
     };
-    if !cfg_is_acyclic(&raw.cfg) {
+    if raw.summary_structure.has_loops() {
         return Ok(raw);
     }
     rewrite_rule_query_procedure(&raw)
@@ -1896,7 +2023,7 @@ fn rewrite_rule_query_procedure(
         &mut edge_effects,
         query_procedure.cfg.entry(),
         expanded_entry,
-        RuleRewriteState::default(),
+        RuleRewriteState::from_interface(&query_procedure.interface),
     )?;
 
     cfg.ensure_single_exit()
@@ -1906,6 +2033,8 @@ fn rewrite_rule_query_procedure(
         procedure: query_procedure.procedure.clone(),
         interface: query_procedure.interface.clone(),
         summary_capable: query_procedure.summary_capable,
+        loops: cfg.extract_loops(),
+        summary_structure: cfg.summary_structure(),
         cfg,
         node_effects,
         edge_effects,
@@ -1921,11 +2050,21 @@ fn expand_rule_query_node(
     expanded_node: CfgNodeId,
     mut rewrite_state: RuleRewriteState,
 ) -> Result<(), DriverError> {
-    if let Some(effects) = query_procedure.node_effects.get(&original_node) {
-        let lowered = rewrite_state.lower_effects(effects)?;
-        if !lowered.is_empty() {
-            expanded_node_effects.insert(expanded_node, lowered);
-        }
+    let mut lowered = query_procedure
+        .node_effects
+        .get(&original_node)
+        .map(|effects| rewrite_state.lower_effects(effects))
+        .transpose()?
+        .unwrap_or_default();
+    if query_procedure
+        .cfg
+        .concrete_exits()
+        .contains(&original_node)
+    {
+        lowered.extend(rewrite_state.materialize_visible_memory_effects());
+    }
+    if !lowered.is_empty() {
+        expanded_node_effects.insert(expanded_node, lowered);
     }
 
     let outgoing = query_procedure
@@ -1992,7 +2131,7 @@ fn ensure_rule_query_supported(
     // APPROX_HEAVY: until loop summaries/invariants exist, the rule-driven
     // slice rejects cyclic CFGs and leaves loop handling to the temporary
     // bounded explorer.
-    if !cfg_is_acyclic(&query_procedure.cfg) {
+    if query_procedure.summary_structure.has_loops() {
         return Err(DriverError::CyclicRuleProcedure);
     }
     for effects in query_procedure
@@ -2067,11 +2206,13 @@ fn instantiate_must_summary_at_call(
             &summary.precondition,
             call,
             callee_interface,
+            false,
         )?,
         postcondition: instantiate_formula_at_callsite(
             &summary.postcondition,
             call,
             callee_interface,
+            true,
         )?,
     })
 }
@@ -2086,11 +2227,13 @@ fn instantiate_notmay_summary_at_call(
             &summary.precondition,
             call,
             callee_interface,
+            false,
         )?,
         postcondition: instantiate_formula_at_callsite(
             &summary.postcondition,
             call,
             callee_interface,
+            true,
         )?,
     })
 }
@@ -2099,12 +2242,14 @@ fn instantiate_formula_at_callsite(
     formula: &Formula,
     call: &CallSiteEffect,
     callee_interface: &ProcedureInterface,
+    include_post_state: bool,
 ) -> Option<Formula> {
     let mut fresh = FreshNameGenerator::new();
     let mut alpha_map = BTreeMap::<String, Var>::new();
+    let mut memory_alpha = BTreeMap::<String, String>::new();
     let mut term_subst = BTreeMap::<String, Term>::new();
     let mut bool_subst = BTreeMap::<String, Formula>::new();
-    let mut unresolved = BTreeSet::<String>::new();
+    let mut memory_subst = BTreeMap::<String, Memory>::new();
 
     for (formal_name, argument) in callee_interface.parameters.iter().zip(&call.arguments) {
         let formal = fresh_formal_var(&mut fresh, "call", formal_name, argument)?;
@@ -2116,41 +2261,62 @@ fn instantiate_formula_at_callsite(
             CallArgument::Predicate(predicate) => {
                 bool_subst.insert(formal.name().to_string(), predicate.clone());
             }
-            CallArgument::Pointer(_) => {
-                unresolved.insert(formal.name().to_string());
+            CallArgument::Pointer(pointer) => {
+                let fresh_offset =
+                    fresh.freshened_var(&ProcedureInterface::offset_var(formal_name), "call");
+                alpha_map.insert(
+                    ProcedureInterface::offset_var(formal_name)
+                        .name()
+                        .to_string(),
+                    fresh_offset.clone(),
+                );
+                term_subst.insert(fresh_offset.name().to_string(), pointer.offset().clone());
+
+                let input_name = ProcedureInterface::input_memory_port(formal_name);
+                let fresh_input = fresh.freshened_name(&input_name, "call");
+                memory_alpha.insert(input_name.clone(), fresh_input.clone());
+                memory_subst.insert(fresh_input, pointer.memory_before()?.clone());
+
+                let output_name = ProcedureInterface::output_memory_port(formal_name);
+                let fresh_output = fresh.freshened_name(&output_name, "call");
+                memory_alpha.insert(output_name.clone(), fresh_output.clone());
+                let output_memory = if include_post_state {
+                    pointer.memory_after()?.clone()
+                } else {
+                    pointer.memory_before()?.clone()
+                };
+                memory_subst.insert(fresh_output, output_memory);
             }
         }
     }
 
-    if let (Some(return_target), Some(return_value)) =
-        (&call.return_target, &callee_interface.return_value)
-    {
-        let fresh_return = fresh.freshened_var(return_value, "call");
-        alpha_map.insert(return_value.name().to_string(), fresh_return.clone());
-        match return_target.sort() {
-            Sort::Bool => {
-                bool_subst.insert(
-                    fresh_return.name().to_string(),
-                    Formula::Var(return_target.clone()),
-                );
-            }
-            Sort::Int | Sort::Real => {
-                term_subst.insert(
-                    fresh_return.name().to_string(),
-                    Term::Var(return_target.clone()),
-                );
+    if include_post_state {
+        if let (Some(return_target), Some(return_value)) =
+            (&call.return_target, &callee_interface.return_value)
+        {
+            let fresh_return = fresh.freshened_var(return_value, "call");
+            alpha_map.insert(return_value.name().to_string(), fresh_return.clone());
+            match return_target.sort() {
+                Sort::Bool => {
+                    bool_subst.insert(
+                        fresh_return.name().to_string(),
+                        Formula::Var(return_target.clone()),
+                    );
+                }
+                Sort::Int | Sort::Real => {
+                    term_subst.insert(
+                        fresh_return.name().to_string(),
+                        Term::Var(return_target.clone()),
+                    );
+                }
             }
         }
     }
 
-    let alpha_renamed = formula.alpha_rename(&alpha_map);
-    let instantiated = alpha_renamed.substitute_interface(&term_subst, &bool_subst);
-    let free = instantiated.free_variable_names();
-    if free.iter().any(|name| unresolved.contains(name)) {
-        None
-    } else {
-        Some(instantiated)
-    }
+    let alpha_renamed = formula
+        .alpha_rename(&alpha_map)
+        .alpha_rename_memory(&memory_alpha);
+    Some(alpha_renamed.substitute_interface(&term_subst, &bool_subst, &memory_subst))
 }
 
 fn fresh_formal_var(
@@ -2201,6 +2367,7 @@ fn project_query_formula_to_callee(
     let projected = project_formula_to_visible(formula, &visible);
     let mut term_subst = BTreeMap::<String, Term>::new();
     let mut bool_subst = BTreeMap::<String, Formula>::new();
+    let mut memory_subst = BTreeMap::<String, Memory>::new();
     let mut extra_bindings = Vec::<Formula>::new();
 
     for (formal_name, argument) in callee_interface.parameters.iter().zip(&call.arguments) {
@@ -2226,7 +2393,36 @@ fn project_query_formula_to_callee(
                     _ => return None,
                 }
             }
-            CallArgument::Pointer(_) => {}
+            CallArgument::Pointer(pointer) => {
+                let formal_offset = Term::Var(ProcedureInterface::offset_var(formal_name));
+                match pointer.offset() {
+                    Term::Var(var) => {
+                        term_subst.insert(var.name().to_string(), formal_offset);
+                    }
+                    other => extra_bindings.push(Formula::eq(formal_offset, other.clone())),
+                }
+
+                let formal_input = Memory::var(ProcedureInterface::input_memory_port(formal_name));
+                match pointer.memory_before()? {
+                    Memory::Var(name) => {
+                        memory_subst.insert(name.clone(), formal_input);
+                    }
+                    other => extra_bindings.push(Formula::memory_eq(formal_input, other.clone())),
+                }
+
+                if include_return {
+                    let formal_output =
+                        Memory::var(ProcedureInterface::output_memory_port(formal_name));
+                    match pointer.memory_after()? {
+                        Memory::Var(name) => {
+                            memory_subst.insert(name.clone(), formal_output);
+                        }
+                        other => {
+                            extra_bindings.push(Formula::memory_eq(formal_output, other.clone()))
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2251,14 +2447,13 @@ fn project_query_formula_to_callee(
         }
     }
 
-    let transformed = projected.substitute_interface(&term_subst, &bool_subst);
+    let transformed = projected.substitute_interface(&term_subst, &bool_subst, &memory_subst);
     let result = Formula::and_all(
         std::iter::once(transformed)
             .chain(extra_bindings)
             .collect::<Vec<_>>(),
     );
-    let callee_visible = callee_visible_names(callee_interface);
-    result.mentions_only(&callee_visible).then_some(result)
+    Some(result)
 }
 
 fn caller_visible_names(call: &CallSiteEffect, include_return: bool) -> BTreeSet<String> {
@@ -2271,7 +2466,23 @@ fn caller_visible_names(call: &CallSiteEffect, include_return: bool) -> BTreeSet
             CallArgument::Predicate(predicate) => {
                 visible.extend(predicate.free_variable_names());
             }
-            CallArgument::Pointer(_) => {}
+            CallArgument::Pointer(pointer) => {
+                visible.extend(term_variable_names(pointer.offset()));
+                visible.extend(
+                    pointer
+                        .memory_before()
+                        .map(Memory::free_symbol_names)
+                        .unwrap_or_default(),
+                );
+                if include_return {
+                    visible.extend(
+                        pointer
+                            .memory_after()
+                            .map(Memory::free_symbol_names)
+                            .unwrap_or_default(),
+                    );
+                }
+            }
         }
     }
     if include_return {
@@ -2290,6 +2501,11 @@ fn callee_visible_names(interface: &ProcedureInterface) -> BTreeSet<String> {
         .collect::<BTreeSet<_>>();
     if let Some(return_value) = &interface.return_value {
         visible.insert(return_value.name().to_string());
+    }
+    for root in &interface.visible_memory_roots {
+        visible.insert(ProcedureInterface::input_memory_port(root));
+        visible.insert(ProcedureInterface::output_memory_port(root));
+        visible.insert(ProcedureInterface::offset_var(root).name().to_string());
     }
     visible
 }
@@ -2506,44 +2722,6 @@ fn search_rule_witness_path(
     }
 
     Ok(None)
-}
-
-fn cfg_is_acyclic(cfg: &Cfg) -> bool {
-    let mut indegree = cfg
-        .nodes()
-        .keys()
-        .copied()
-        .map(|node| (node, 0usize))
-        .collect::<BTreeMap<_, _>>();
-    for edge in cfg.edges().values() {
-        *indegree.entry(edge.target).or_default() += 1;
-    }
-    let mut queue = indegree
-        .iter()
-        .filter_map(|(node, degree)| (*degree == 0).then_some(*node))
-        .collect::<VecDeque<_>>();
-    let mut visited = 0usize;
-    let mut remaining = indegree;
-    while let Some(node) = queue.pop_front() {
-        visited += 1;
-        for edge in cfg
-            .outgoing_edges(node)
-            .expect("acyclicity check only visits known nodes")
-        {
-            let target = cfg
-                .edge(edge)
-                .expect("known edge id should exist during acyclicity check")
-                .target;
-            let degree = remaining
-                .get_mut(&target)
-                .expect("target node should exist during acyclicity check");
-            *degree -= 1;
-            if *degree == 0 {
-                queue.push_back(target);
-            }
-        }
-    }
-    visited == cfg.nodes().len()
 }
 
 fn apply_must_post_round(
@@ -2829,6 +3007,10 @@ fn substitute_term_assignment(formula: &Formula, target: &Var, replacement: &Ter
             substitute_term(lhs, target, replacement),
             substitute_term(rhs, target, replacement),
         ),
+        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(
+            substitute_memory(lhs, target, replacement),
+            substitute_memory(rhs, target, replacement),
+        ),
         Formula::Lt(lhs, rhs) => Formula::lt(
             substitute_term(lhs, target, replacement),
             substitute_term(rhs, target, replacement),
@@ -2877,6 +3059,7 @@ fn substitute_bool_assignment(formula: &Formula, target: &Var, replacement: &For
             substitute_bool_assignment(rhs, target, replacement),
         ),
         Formula::Eq(lhs, rhs) => Formula::eq(lhs.clone(), rhs.clone()),
+        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(lhs.clone(), rhs.clone()),
         Formula::Lt(lhs, rhs) => Formula::lt(lhs.clone(), rhs.clone()),
         Formula::Le(lhs, rhs) => Formula::le(lhs.clone(), rhs.clone()),
         Formula::Gt(lhs, rhs) => Formula::gt(lhs.clone(), rhs.clone()),

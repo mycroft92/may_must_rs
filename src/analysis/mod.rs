@@ -8,8 +8,10 @@
 //!   them;
 //! - reusable core representations: `formula`, `state`, `cfg`, `transfer`,
 //!   `llvm_adapter`, `summaries`;
-//! - still planned: loop summaries/invariants, richer call/memory summaries,
-//!   and opt-in external candidate providers.
+//! - newly wired structural hooks: visible memory summary ports, SCC-based loop
+//!   regions, and a provider seam for future loop invariants;
+//! - still planned: verified loop summaries/invariants, richer call/memory
+//!   summaries, and opt-in external candidate providers.
 //!
 //! The intention is to keep this tree LLVM-independent except for
 //! `llvm_adapter`, which lowers one `FunctionGraph` into the paper-shaped CFG

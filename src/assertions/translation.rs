@@ -3,7 +3,8 @@
 //! Parser-specific sort inference intentionally lives here instead of inside
 //! `analysis::formula`. That keeps user-facing syntax recovery separate from
 //! the paper vocabulary and lets tests exercise translation without any LLVM
-//! dependency.
+//! dependency. The output is the same formula vocabulary later reused by the
+//! rule driver, summaries, and oracle.
 
 use crate::analysis::formula::{Formula, Rational, Sort, Term};
 use crate::assertions::exp::{Assertion, Expr, Op, Statement};

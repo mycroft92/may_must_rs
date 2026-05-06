@@ -1,15 +1,17 @@
-//! Procedure-summary carriers for the paper's `¬may ⇒ P` and `must ⇒ P`
-//! relations.
+//! Procedure-summary carriers for the paper's `¬may ⇒ P`, `must ⇒ P`, and the
+//! repo's future loop-invariant boundary.
 //!
-//! This module stores summary facts but does not decide when they are created
-//! or consumed. Those decisions belong in `rules.rs` and `driver.rs`.
+//! This module stores summary facts and loop-candidate facts but does not
+//! decide when they are created, verified, or consumed. Those decisions belong
+//! in `rules.rs` and `driver.rs`.
 //!
 //! The current file now has two layers:
 //!
 //! - `SummaryTables`, the paper-facing raw relations used directly by the
 //!   named summary rules
 //! - `SummaryRepository` plus `SummaryProvider`, the driver-facing boundary for
-//!   discovered summaries and future external candidate sources
+//!   discovered summaries, loop invariants, and future external candidate
+//!   sources
 //!
 //! The important design point is that the driver consumes a provider, not a
 //! concrete table implementation. That keeps later imported or generated
@@ -34,6 +36,13 @@ pub struct MustSummary {
     pub postcondition: Formula,
 }
 
+/// One candidate loop invariant attached to a concrete loop region.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoopInvariantSummary {
+    pub loop_id: usize,
+    pub invariant: Formula,
+}
+
 /// Repository of summary facts keyed by procedure name.
 ///
 /// Both summary relations are stored as small deduplicated vectors because the
@@ -43,6 +52,7 @@ pub struct MustSummary {
 pub struct SummaryTables {
     notmay: BTreeMap<ProcedureName, Vec<NotMaySummary>>,
     must: BTreeMap<ProcedureName, Vec<MustSummary>>,
+    loop_invariants: BTreeMap<ProcedureName, Vec<LoopInvariantSummary>>,
 }
 
 impl SummaryTables {
@@ -61,6 +71,11 @@ impl SummaryTables {
         self.must.entry(procedure.into()).or_default();
     }
 
+    /// Ensures storage exists for one procedure's loop invariants.
+    pub fn init_loop_invariants(&mut self, procedure: impl Into<ProcedureName>) {
+        self.loop_invariants.entry(procedure.into()).or_default();
+    }
+
     /// Returns all recorded `¬may ⇒ P` summaries for one procedure.
     pub fn notmay(&self, procedure: &str) -> &[NotMaySummary] {
         self.notmay.get(procedure).map(Vec::as_slice).unwrap_or(&[])
@@ -69,6 +84,14 @@ impl SummaryTables {
     /// Returns all recorded `must ⇒ P` summaries for one procedure.
     pub fn must(&self, procedure: &str) -> &[MustSummary] {
         self.must.get(procedure).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Returns all recorded loop invariants for one procedure.
+    pub fn loop_invariants(&self, procedure: &str) -> &[LoopInvariantSummary] {
+        self.loop_invariants
+            .get(procedure)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Adds one `¬may ⇒ P` summary if it is not already present.
@@ -82,6 +105,18 @@ impl SummaryTables {
     /// Adds one `must ⇒ P` summary if it is not already present.
     pub fn add_must(&mut self, procedure: impl Into<ProcedureName>, summary: MustSummary) {
         let entries = self.must.entry(procedure.into()).or_default();
+        if !entries.contains(&summary) {
+            entries.push(summary);
+        }
+    }
+
+    /// Adds one loop invariant if it is not already present.
+    pub fn add_loop_invariant(
+        &mut self,
+        procedure: impl Into<ProcedureName>,
+        summary: LoopInvariantSummary,
+    ) {
+        let entries = self.loop_invariants.entry(procedure.into()).or_default();
         if !entries.contains(&summary) {
             entries.push(summary);
         }
@@ -113,10 +148,27 @@ pub struct ProvidedMustSummary {
     pub provenance: SummaryProvenance,
 }
 
+/// Loop invariant candidate paired with its provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvidedLoopInvariantSummary {
+    pub summary: LoopInvariantSummary,
+    pub provenance: SummaryProvenance,
+}
+
 /// Read-only summary source used by the interprocedural driver.
 pub trait SummaryProvider {
     fn notmay_candidates(&self, procedure: &str) -> Vec<ProvidedNotMaySummary>;
     fn must_candidates(&self, procedure: &str) -> Vec<ProvidedMustSummary>;
+
+    /// Loop candidates are optional today because the rule driver still
+    /// rejects cyclic summary structures until invariant verification is wired.
+    fn loop_invariant_candidates(
+        &self,
+        _procedure: &str,
+        _loop_id: usize,
+    ) -> Vec<ProvidedLoopInvariantSummary> {
+        Vec::new()
+    }
 }
 
 /// Mutable discovered-summary repository used by the current non-LLM route.
@@ -146,7 +198,8 @@ impl SummaryRepository {
     pub fn init_procedure(&mut self, procedure: impl Into<ProcedureName> + Clone) {
         let procedure = procedure.into();
         self.tables.init_notmay(procedure.clone());
-        self.tables.init_must(procedure);
+        self.tables.init_must(procedure.clone());
+        self.tables.init_loop_invariants(procedure);
     }
 
     pub fn record_notmay_discovered(
@@ -163,6 +216,14 @@ impl SummaryRepository {
         summary: MustSummary,
     ) {
         self.tables.add_must(procedure, summary);
+    }
+
+    pub fn record_loop_invariant_discovered(
+        &mut self,
+        procedure: impl Into<ProcedureName>,
+        summary: LoopInvariantSummary,
+    ) {
+        self.tables.add_loop_invariant(procedure, summary);
     }
 }
 
@@ -190,6 +251,23 @@ impl SummaryProvider for SummaryRepository {
             })
             .collect()
     }
+
+    fn loop_invariant_candidates(
+        &self,
+        procedure: &str,
+        loop_id: usize,
+    ) -> Vec<ProvidedLoopInvariantSummary> {
+        self.tables
+            .loop_invariants(procedure)
+            .iter()
+            .filter(|summary| summary.loop_id == loop_id)
+            .cloned()
+            .map(|summary| ProvidedLoopInvariantSummary {
+                summary,
+                provenance: SummaryProvenance::Discovered,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +280,7 @@ mod tests {
         let mut tables = SummaryTables::new();
         tables.init_notmay("callee");
         tables.init_must("callee");
+        tables.init_loop_invariants("callee");
 
         let notmay = NotMaySummary {
             precondition: Formula::True,
@@ -214,14 +293,21 @@ mod tests {
                 Term::int(1),
             ),
         };
+        let invariant = LoopInvariantSummary {
+            loop_id: 0,
+            invariant: Formula::bool_var("inv"),
+        };
 
         tables.add_notmay("callee", notmay.clone());
         tables.add_notmay("callee", notmay);
         tables.add_must("callee", must.clone());
         tables.add_must("callee", must);
+        tables.add_loop_invariant("callee", invariant.clone());
+        tables.add_loop_invariant("callee", invariant);
 
         assert_eq!(tables.notmay("callee").len(), 1);
         assert_eq!(tables.must("callee").len(), 1);
+        assert_eq!(tables.loop_invariants("callee").len(), 1);
     }
 
     #[test]
@@ -245,13 +331,23 @@ mod tests {
                 ),
             },
         );
+        repository.record_loop_invariant_discovered(
+            "callee",
+            LoopInvariantSummary {
+                loop_id: 3,
+                invariant: Formula::bool_var("inv"),
+            },
+        );
 
         let notmay = repository.notmay_candidates("callee");
         let must = repository.must_candidates("callee");
+        let loops = repository.loop_invariant_candidates("callee", 3);
 
         assert_eq!(notmay.len(), 1);
         assert_eq!(must.len(), 1);
+        assert_eq!(loops.len(), 1);
         assert_eq!(notmay[0].provenance, SummaryProvenance::Discovered);
         assert_eq!(must[0].provenance, SummaryProvenance::Discovered);
+        assert_eq!(loops[0].provenance, SummaryProvenance::Discovered);
     }
 }

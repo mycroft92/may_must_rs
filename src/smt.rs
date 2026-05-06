@@ -6,6 +6,6 @@
 //! lowering of `analysis::formula` values, while solver policy stays in
 //! `analysis::oracle`. That separation mirrors the overall repo design:
 //! representation and search stay in `analysis`, raw backend mechanics stay in
-//! `smt`.
+//! `smt`, and no call/loop policy leaks into this layer.
 
 pub mod solver;

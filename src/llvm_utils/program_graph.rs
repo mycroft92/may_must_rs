@@ -8,7 +8,8 @@
 //! `AGENTS.md` treats this file as the fixed foundation for the later paper
 //! lowering. The analysis stack may be reconstructed around it, but this raw
 //! graph construction remains the source of truth for visible LLVM control and
-//! data-flow structure.
+//! data-flow structure, including the loops and call sites that later become
+//! summary/invariant boundaries.
 
 use crate::errors::*;
 use crate::llvm_utils::llvm_wrap::*;

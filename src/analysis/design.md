@@ -18,15 +18,11 @@ interprocedural paper-rule driver:
   - integer-array memory modeling and conservative call-memory havoc
   - rule-query rewriting for the current acyclic memory/call-havoc slice
   - summary provider/repository boundary and module-level summary reuse
+  - visible memory ports in procedure/call summaries
+  - SCC-based loop extraction and acyclic summary-structure condensation
 - implemented but not wired:
-  - assertion-to-formula translation
-  - paper formula language
-  - paper state carriers
-  - paper CFG with synthetic single-exit normalization
-  - SMT oracle feasibility/implication queries
-  - named paper rules from Figures 5-10
-  - paper summary tables
   - broader instruction-aware rule candidate generation
+  - loop invariant verification/adoption
 - planned:
   - richer external candidate providers
   - loop summaries/invariants
@@ -61,7 +57,7 @@ raw solver layer               -> src/smt/solver.rs
   scheduling belongs in `driver.rs`.
 - `driver.rs` now contains two executable slices:
   - the broader temporary bounded path explorer
-  - the narrower local rule scheduler for acyclic scalar-plus-memory procedures
+  - the narrower local rule scheduler for acyclic visible-memory procedures
 - that bounded driver now produces an explicit per-assertion result and, for
   failing assertions, a symbolic evidence trace built from the explored
   state/edge formulas.
@@ -73,9 +69,12 @@ raw solver layer               -> src/smt/solver.rs
   and impure-call havoc into a path-expanded scalar query.
 - that same rule-driven slice also builds one reusable base procedure per
   function, records discovered `must` / `¬may` summaries, and instantiates
-  them at supported call sites through alpha-renamed interface substitution.
+  them at supported call sites through alpha-renamed interface substitution
+  over scalar arguments, returns, and visible memory ports.
 - that same rule-driven slice replays one feasible path through the assertion
   query CFG and attaches the final SMT model for the violating state.
+- `cfg.rs` also exposes loop regions and an acyclic summary structure so loop
+  invariants can later slot into the driver without re-deriving CFG structure.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
   most `max_step` times on one explored path; budget exhaustion yields
   `Unknown`.
@@ -85,6 +84,7 @@ raw solver layer               -> src/smt/solver.rs
   inspect raw LLVM instructions.
 - `llvm_adapter.rs` lowers one procedure into:
   - `Cfg`
+  - `SummaryStructure`
   - `node_effects`
   - `edge_effects`
 - the current memory model is intentionally narrow: integer arrays only,
@@ -117,14 +117,16 @@ The main carrier used by the rule layer is `ProcedureFrame`, which stores:
 - `Ω_n` as one accumulated formula per node
 - `N_e` as blocked `(ϕ1, ϕ2)` region pairs per edge
 
-`summaries.rs` stores the two paper summary relations:
+`summaries.rs` stores the current reusable summary/invariant carriers:
 
 - `NotMaySummary` for `¬may ⇒ P`
 - `MustSummary` for `must ⇒ P`
+- `LoopInvariantSummary` for future loop-header facts
 
 Those tables are intentionally simple keyed vectors at the current milestone.
 `SummaryRepository` is the current non-LLM source, and the `SummaryProvider`
-trait is the stable seam for future imported or generated candidates.
+trait is the stable seam for future imported or generated function summaries
+and loop invariants.
 
 ## Current Simplifications
 
