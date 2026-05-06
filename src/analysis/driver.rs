@@ -49,11 +49,16 @@
 //! trace showing the explored state formulas that led to the failing
 //! obligation.
 
-use crate::analysis::cfg::{Cfg, CfgEdge, CfgEdgeId, CfgNodeId, LoopRegion, SummaryStructure};
+use crate::analysis::cfg::{Cfg, CfgEdge, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::{Formula, FreshNameGenerator, Memory, Sort, Term, Var};
 use crate::analysis::llvm_adapter::{
     adapt_function_graph, adapt_function_graph_with_purity, AdaptedAssertionSite, AdaptedProcedure,
     AdapterError, ProcedureInterface,
+};
+use crate::analysis::loops::{
+    extract_loops, summary_structure, FixedPointKind, FunctionSummaryRequest,
+    FunctionSummaryResponse, KnasterTarskiLoopSummaryGenerator, LoopAnalysisError, LoopRegion,
+    LoopSummaryRequest, LoopSummaryResponse, SummaryGenerator, SummaryInterface, SummaryStructure,
 };
 use crate::analysis::oracle::{Feasibility, Oracle, OracleError};
 use crate::analysis::rules::{self, ProcedureFrame, QueryJudgement, ReachabilityQuery, RuleError};
@@ -67,6 +72,7 @@ use crate::llvm_utils::program_graph::FunctionGraph;
 use log::{debug, log_enabled, Level};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 use thiserror::Error;
 
 pub const TRACE_TARGET: &str = "analysis_trace";
@@ -329,6 +335,8 @@ impl PathContext {
 pub enum DriverError {
     #[error(transparent)]
     Adapter(#[from] AdapterError),
+    #[error(transparent)]
+    LoopAnalysis(#[from] LoopAnalysisError),
     #[error(transparent)]
     Oracle(#[from] OracleError),
     #[error(transparent)]
@@ -1328,6 +1336,16 @@ pub fn analyze_function_graphs_rules_with_purity(
     engine.analyze_all()
 }
 
+pub fn analyze_function_graphs_rules_with_purity_and_external_summaries(
+    graphs: &[FunctionGraph],
+    memory_pure_functions: &BTreeSet<String>,
+    summary_generator: Arc<dyn SummaryGenerator>,
+) -> Result<Vec<RuleProcedureReport>, DriverError> {
+    let mut engine = RuleModuleEngine::new(graphs, memory_pure_functions)?;
+    engine.attach_summary_generator(summary_generator)?;
+    engine.analyze_all()
+}
+
 pub fn analyze_function_graphs_rules_with_purity_best_effort(
     graphs: &[FunctionGraph],
     memory_pure_functions: &BTreeSet<String>,
@@ -1349,6 +1367,16 @@ pub fn analyze_adapted_procedure_rules(
     engine.analyze_procedure(procedure)
 }
 
+pub fn analyze_adapted_procedure_rules_with_external_summaries(
+    procedure: &str,
+    adapted: &AdaptedProcedure,
+    summary_generator: Arc<dyn SummaryGenerator>,
+) -> Result<RuleProcedureReport, DriverError> {
+    let mut engine = RuleModuleEngine::from_adapted(vec![adapted.clone()])?;
+    engine.attach_summary_generator(summary_generator)?;
+    engine.analyze_procedure(procedure)
+}
+
 #[derive(Clone, Debug)]
 struct PreparedRuleProcedure {
     adapted: AdaptedProcedure,
@@ -1366,11 +1394,25 @@ struct QueryAnalysisOutcome {
     stats: RuleSearchStats,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedLoopSummaryResponse {
+    invariant: LoopSummaryResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedFunctionSummaryResponse {
+    response: FunctionSummaryResponse,
+}
+
 struct RuleModuleEngine {
     procedures: BTreeMap<String, PreparedRuleProcedure>,
     order: Vec<String>,
     oracle: Oracle,
     summaries: SummaryRepository,
+    loop_summary_generator: KnasterTarskiLoopSummaryGenerator,
+    summary_generator: Option<Arc<dyn SummaryGenerator>>,
+    external_loop_summaries: BTreeMap<(String, usize), CachedLoopSummaryResponse>,
+    external_function_summaries: BTreeMap<String, CachedFunctionSummaryResponse>,
     active_queries: Vec<ReachabilityQuery>,
     completed_queries: Vec<(ReachabilityQuery, QueryJudgement)>,
     pending_queries: VecDeque<PendingRuleQuery>,
@@ -1411,10 +1453,86 @@ impl RuleModuleEngine {
             order,
             oracle: Oracle::new(),
             summaries,
+            loop_summary_generator: KnasterTarskiLoopSummaryGenerator::default(),
+            summary_generator: None,
+            external_loop_summaries: BTreeMap::new(),
+            external_function_summaries: BTreeMap::new(),
             active_queries: Vec::new(),
             completed_queries: Vec::new(),
             pending_queries: VecDeque::new(),
         })
+    }
+
+    fn attach_summary_generator(
+        &mut self,
+        summary_generator: Arc<dyn SummaryGenerator>,
+    ) -> Result<(), DriverError> {
+        self.summary_generator = Some(summary_generator);
+        let procedures = self
+            .procedures
+            .values()
+            .map(|prepared| prepared.adapted.clone())
+            .collect::<Vec<_>>();
+        for adapted in &procedures {
+            self.seed_external_summary_placeholders(adapted)?;
+        }
+        Ok(())
+    }
+
+    fn seed_external_summary_placeholders(
+        &mut self,
+        adapted: &AdaptedProcedure,
+    ) -> Result<(), DriverError> {
+        let Some(summary_generator) = &self.summary_generator else {
+            return Ok(());
+        };
+
+        let function_request = build_function_summary_request(adapted);
+        let function_response =
+            summary_generator.generate_function_summary(&self.oracle, &function_request)?;
+        for summary in &function_response.must_summaries {
+            self.summaries
+                .record_must_discovered(adapted.name.clone(), summary.clone());
+        }
+        for summary in &function_response.notmay_summaries {
+            self.summaries
+                .record_notmay_discovered(adapted.name.clone(), summary.clone());
+        }
+        self.external_function_summaries.insert(
+            adapted.name.clone(),
+            CachedFunctionSummaryResponse {
+                response: function_response,
+            },
+        );
+
+        for loop_request in build_loop_summary_requests(adapted) {
+            let response = summary_generator.generate_loop_summary(&self.oracle, &loop_request)?;
+            // APPROX_HEAVY: until the loop transformer is wired to actual
+            // transfer semantics, the driver uses the Knaster-Tarski engine
+            // only as a structural stabilization point for proposed
+            // summaries.
+            let stabilized = self.loop_summary_generator.generate(
+                &self.oracle,
+                &loop_request,
+                FixedPointKind::Greatest,
+                |_request, _current| response.clone(),
+            )?;
+            self.summaries.record_loop_invariant_discovered(
+                adapted.name.clone(),
+                crate::analysis::summaries::LoopInvariantSummary {
+                    loop_id: loop_request.loop_region.id,
+                    invariant: stabilized.invariant.predicate.clone(),
+                },
+            );
+            self.external_loop_summaries.insert(
+                (adapted.name.clone(), loop_request.loop_region.id),
+                CachedLoopSummaryResponse {
+                    invariant: stabilized,
+                },
+            );
+        }
+
+        Ok(())
     }
 
     fn analyze_all(&mut self) -> Result<Vec<RuleProcedureReport>, DriverError> {
@@ -1921,8 +2039,8 @@ fn build_assertion_query_procedure(
         procedure: adapted.name.clone(),
         interface: adapted.interface.clone(),
         summary_capable: false,
-        loops: cfg.extract_loops(),
-        summary_structure: cfg.summary_structure(),
+        loops: extract_loops(&cfg),
+        summary_structure: summary_structure(&cfg),
         cfg,
         node_effects,
         edge_effects,
@@ -1985,8 +2103,8 @@ fn build_base_rule_procedure(
         procedure: adapted.name.clone(),
         interface: adapted.interface.clone(),
         summary_capable: true,
-        loops: cfg.extract_loops(),
-        summary_structure: cfg.summary_structure(),
+        loops: extract_loops(&cfg),
+        summary_structure: summary_structure(&cfg),
         cfg,
         node_effects,
         edge_effects,
@@ -1995,6 +2113,37 @@ fn build_base_rule_procedure(
         return Ok(raw);
     }
     rewrite_rule_query_procedure(&raw)
+}
+
+fn build_function_summary_request(adapted: &AdaptedProcedure) -> FunctionSummaryRequest {
+    FunctionSummaryRequest {
+        procedure: adapted.name.clone(),
+        interface: build_summary_interface(&adapted.interface),
+        loops: adapted.loops.clone(),
+        summary_structure: adapted.summary_structure.clone(),
+    }
+}
+
+fn build_loop_summary_requests(adapted: &AdaptedProcedure) -> Vec<LoopSummaryRequest> {
+    adapted
+        .loops
+        .iter()
+        .cloned()
+        .map(|loop_region| LoopSummaryRequest {
+            procedure: adapted.name.clone(),
+            interface: build_summary_interface(&adapted.interface),
+            loop_region,
+            summary_structure: adapted.summary_structure.clone(),
+        })
+        .collect()
+}
+
+fn build_summary_interface(interface: &ProcedureInterface) -> SummaryInterface {
+    SummaryInterface {
+        parameters: interface.parameters.clone(),
+        return_value: interface.return_value.clone(),
+        visible_memory_roots: interface.visible_memory_roots.clone(),
+    }
 }
 
 /// Rewrites the currently supported acyclic memory/call slice into a
@@ -2033,8 +2182,8 @@ fn rewrite_rule_query_procedure(
         procedure: query_procedure.procedure.clone(),
         interface: query_procedure.interface.clone(),
         summary_capable: query_procedure.summary_capable,
-        loops: cfg.extract_loops(),
-        summary_structure: cfg.summary_structure(),
+        loops: extract_loops(&cfg),
+        summary_structure: summary_structure(&cfg),
         cfg,
         node_effects,
         edge_effects,
@@ -3847,5 +3996,43 @@ mod tests {
         );
 
         assert_eq!(error, DriverError::CyclicRuleProcedure);
+    }
+
+    #[test]
+    fn driver_can_attach_a_summary_generator_and_cache_loop_candidates() {
+        initialize_target();
+        let context = Context::new();
+        let module = context
+            .parse_ir_str(
+                r#"
+                declare void @may_assert(i1)
+
+                define void @main(i1 %keep_looping) {
+                entry:
+                    br label %loop
+                loop:
+                    call void @may_assert(i1 true)
+                    br i1 %keep_looping, label %loop, label %exit
+                exit:
+                    ret void
+                }
+            "#,
+                "driver_rule_test",
+            )
+            .unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        let pure = crate::analysis::llvm_adapter::infer_memory_pure_functions(&graphs);
+        let adapted = adapt_function_graph_with_purity(&graphs[0], &pure).unwrap();
+        let mut engine = RuleModuleEngine::from_adapted(vec![adapted]).unwrap();
+        engine
+            .attach_summary_generator(Arc::new(KnasterTarskiLoopSummaryGenerator::default()))
+            .unwrap();
+
+        assert_eq!(engine.external_loop_summaries.len(), 1);
+        assert_eq!(engine.external_function_summaries.len(), 1);
+        assert_eq!(
+            engine.summaries.loop_invariant_candidates("main", 0).len(),
+            1
+        );
     }
 }

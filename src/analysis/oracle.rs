@@ -6,9 +6,9 @@
 //!
 //! The driver uses it both for ordinary premise checks and for on-demand model
 //! generation during witness replay. Formula alpha-renaming and interface
-//! substitution stay in `formula.rs`; loop detection stays in `cfg.rs`; the
-//! oracle consumes the already-renamed formulas and answers only semantic
-//! questions about them.
+//! substitution stay in `formula.rs`; loop extraction and candidate-generation
+//! plumbing stay in `loops.rs`; the oracle consumes the already-renamed
+//! formulas and answers only semantic questions about them.
 
 use crate::analysis::formula::{Formula, FormulaError};
 use crate::analysis::state::{NodeState, PathSummary};

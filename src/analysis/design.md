@@ -18,6 +18,8 @@ interprocedural paper-rule driver:
   - integer-array memory modeling and conservative call-memory havoc
   - rule-query rewriting for the current acyclic memory/call-havoc slice
   - summary provider/repository boundary and module-level summary reuse
+  - trait-based summary generation for loops/functions, including a Tokio/JSON
+    adapter for external modules
   - visible memory ports in procedure/call summaries
   - SCC-based loop extraction and acyclic summary-structure condensation
 - implemented but not wired:
@@ -35,6 +37,7 @@ assertion frontend parsing     -> src/expressions/exp.rs
 assertion frontend translation -> src/assertions/translation.rs
 formula vocabulary             -> src/analysis/formula.rs
 paper CFG (P, n, e, Gamma_e)   -> src/analysis/cfg.rs
+loop regions / summary sites   -> src/analysis/loops.rs
 paper state (Pi_n, Omega_n)    -> src/analysis/state.rs
 oracle SAT/implication         -> src/analysis/oracle.rs
 named paper rules             -> src/analysis/rules.rs
@@ -53,8 +56,9 @@ raw solver layer               -> src/smt/solver.rs
   on-demand model queries.
 - `rules.rs` owns the named declarative rules and keeps their interfaces close
   to the paper.
-- `summaries.rs` stores summary facts and the provider boundary, while summary
-  scheduling belongs in `driver.rs`.
+- `summaries.rs` stores accepted summary facts and repository/provider reads.
+- `loops.rs` stores loop regions, the condensation DAG, and the trait-based
+  generation boundary for internal or external summary producers.
 - `driver.rs` now contains two executable slices:
   - the broader temporary bounded path explorer
   - the narrower local rule scheduler for acyclic visible-memory procedures
@@ -73,7 +77,7 @@ raw solver layer               -> src/smt/solver.rs
   over scalar arguments, returns, and visible memory ports.
 - that same rule-driven slice replays one feasible path through the assertion
   query CFG and attaches the final SMT model for the violating state.
-- `cfg.rs` also exposes loop regions and an acyclic summary structure so loop
+- `loops.rs` exposes loop regions and an acyclic summary structure so loop
   invariants can later slot into the driver without re-deriving CFG structure.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
   most `max_step` times on one explored path; budget exhaustion yields
@@ -124,9 +128,10 @@ The main carrier used by the rule layer is `ProcedureFrame`, which stores:
 - `LoopInvariantSummary` for future loop-header facts
 
 Those tables are intentionally simple keyed vectors at the current milestone.
-`SummaryRepository` is the current non-LLM source, and the `SummaryProvider`
-trait is the stable seam for future imported or generated function summaries
-and loop invariants.
+`SummaryRepository` is the current accepted-summary store, `SummaryProvider`
+is the read seam for already adopted summaries, and `loops::SummaryGenerator`
+is the generation seam for internal algorithms or external JSON-backed
+producers.
 
 ## Current Simplifications
 

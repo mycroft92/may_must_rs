@@ -28,6 +28,7 @@ For active paper-shaped work, start with:
 src/analysis/rules.rs
 src/analysis/state.rs
 src/analysis/cfg.rs
+src/analysis/loops.rs
 src/analysis/oracle.rs
 src/analysis/llvm_adapter.rs
 src/analysis/transfer.rs
@@ -51,6 +52,7 @@ assertion frontend lowering             -> src/assertions/translation.rs
 named SMASH rules                       -> src/analysis/rules.rs
 Pi_n / Omega_n / N_e and path summaries -> src/analysis/state.rs
 P / n / e / Gamma_e                     -> src/analysis/cfg.rs
+loop regions / summary generators       -> src/analysis/loops.rs
 predicate vocabulary                    -> src/analysis/formula.rs
 set/sat/evidence queries                -> src/analysis/oracle.rs
 LLVM decoding and lowering              -> src/analysis/llvm_adapter.rs
@@ -60,9 +62,11 @@ summary orchestration                   -> src/analysis/driver.rs
 ```
 
 Keep the core paper modules (`cfg`, `formula`, `state`, `rules`, `summaries`,
-`driver`, `oracle`) free of LLVM and Z3 details. LLVM specifics should stay in
-`llvm_utils` and `llvm_adapter.rs`. `transfer.rs` should consume a normalized
-effect/instruction layer produced by `llvm_adapter.rs`, not raw
+`driver`, `oracle`, `loops`) free of LLVM and Z3 details except where a module
+is explicitly the boundary for them. LLVM specifics should stay in `llvm_utils`
+and `llvm_adapter.rs`. Raw solver details should stay in `smt/solver.rs` and
+`oracle.rs`. `transfer.rs` should consume a normalized effect/instruction layer
+produced by `llvm_adapter.rs`, not raw
 `llvm_wrap::Instruction` handles.
 
 `llvm_adapter.rs` should lower one procedure into the paper `cfg` plus
@@ -95,14 +99,16 @@ When we replace bounded loop handling with loop invariants:
 
 - `llvm_adapter.rs` should identify the relevant loop structure in the lowered
   CFG, such as headers, latches, backedges, or SCC-based loop regions.
+- `loops.rs` should own loop extraction, structural summary sequencing, and
+  the boundary for internal or external loop/function summary generation.
 - `transfer.rs` should encode one-iteration semantic steps, not invent
   invariants.
 - `state.rs` should store candidate/header facts and the accumulated path
   summaries those candidates summarize.
 - `oracle.rs` should check initiation, inductiveness, and evidence queries for
   invariant candidates.
-- `summaries.rs` should be the home of loop invariant extraction/refinement and
-  reusable loop summaries.
+- `summaries.rs` should store accepted loop invariants and reusable summaries,
+  not generate them.
 - `driver.rs` should orchestrate when invariant generation/checking runs and
   when a loop summary is accepted into the analysis.
 
@@ -123,25 +129,30 @@ Do not generate summaries for `may_assert` call edges. If possible do not even g
 Current reproduced branch milestone is earlier than the later driver/summaries
 plan above:
 
-- CLI-active code stops at LLVM graph generation and DOT dumping.
-- CLI can additionally run `--simple-check`, which executes the current
-  acyclic single-procedure checker.
-- `src/analysis/formula.rs`, `state.rs`, `cfg.rs`, `transfer.rs`, and
-  `llvm_adapter.rs` are implemented but not wired into a rule/driver layer yet.
-- `src/analysis/oracle.rs` now owns solver-backed feasibility and implication
-  queries over paper formulas and state summaries.
-- `src/analysis/rules.rs` now implements the named rules from Figures 5-10,
-  grouped by figure so duplicated rule names remain literal.
-- `src/analysis/summaries.rs` now stores `¬may ⇒ P` and `must ⇒ P` summary
-  facts, but no driver consumes them yet.
-- `src/analysis/driver.rs` is currently a temporary acyclic path explorer for
-  simple single-procedure code; it is not the full paper scheduler.
-- `transfer.rs` currently uses one normalized
-  `TransferEffect::Assign { target, value }` effect plus `Assume`,
-  `Obligation`, `Call`, and `Nop`.
+- CLI-active code exposes:
+  - raw LLVM graph generation and DOT dumping
+  - `--simple-check` for the broader bounded executor
+  - `--rule-check` for the current acyclic interprocedural Figure 5-10 slice
+- `src/analysis/rules.rs` is implemented and scheduled by `driver.rs`.
+- `src/analysis/summaries.rs` stores accepted `¬may ⇒ P`, `must ⇒ P`, and
+  loop-invariant facts consumed by the driver.
+- `src/analysis/loops.rs` owns loop extraction, condensation ordering, and the
+  trait-based summary-generator seam, including a Tokio/JSON adapter for
+  external modules.
+- `src/analysis/driver.rs` now supports module-level work queues, summary reuse
+  across supported calls, and default witnesses for false rule-check results.
+- cyclic procedures remain unsupported on the rule-driven path until loop
+  summary verification is wired.
 - the curated fixture corpus lives under `tests/flow/`.
-- `make -C tests smoke` currently compiles that corpus and runs the graph CLI
-  over the resulting bitcode files.
+- `make -C tests smoke` compiles that corpus and runs the CLI over the
+  resulting bitcode files.
+
+Important organization rule:
+
+- when a new concept is logically independent, split it into a new focused
+  module instead of flattening more code into an existing file
+- only keep code together when the coupling is real and the separation would
+  be artificial
 
 
 When adding a new active analysis concept:

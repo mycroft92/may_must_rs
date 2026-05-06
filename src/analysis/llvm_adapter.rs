@@ -15,12 +15,13 @@
 //!
 //! The driver relies on this interface metadata when it creates callee queries,
 //! alpha-renames summary variables, and substitutes caller-side actuals back
-//! into discovered summaries. The adapter also records CFG loop regions and
-//! the acyclic condensation structure those loops induce, but it does not
-//! invent invariants for them.
+//! into discovered summaries. The adapter also records loop regions and the
+//! acyclic condensation structure those loops induce, but it does not invent
+//! invariants for them.
 
-use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId, LoopRegion, SummaryStructure};
+use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::{Formula, Sort, Term, Var};
+use crate::analysis::loops::{extract_loops, summary_structure, LoopRegion, SummaryStructure};
 use crate::analysis::transfer::{
     AssignValue, CallArgument, CallMemoryEffect, PointerArgument, TransferEffect,
 };
@@ -165,8 +166,8 @@ pub fn adapt_function_graph_with_purity(
 
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-    let loops = cfg.extract_loops();
-    let summary_structure = cfg.summary_structure();
+    let loops = extract_loops(&cfg);
+    let summary_structure = summary_structure(&cfg);
 
     Ok(AdaptedProcedure {
         name: graph.name.clone(),

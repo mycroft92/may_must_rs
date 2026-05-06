@@ -1,43 +1,44 @@
-//! Procedure-summary carriers for the paper's `¬may ⇒ P`, `must ⇒ P`, and the
-//! repo's future loop-invariant boundary.
+//! Procedure-summary carriers for the paper's `¬may ⇒ P`, `must ⇒ P`, and
+//! verified or candidate loop invariants.
 //!
-//! This module stores summary facts and loop-candidate facts but does not
-//! decide when they are created, verified, or consumed. Those decisions belong
-//! in `rules.rs` and `driver.rs`.
+//! This module stores summary facts and their local provenance. It does not
+//! decide when summaries are generated, verified, or scheduled. Those choices
+//! belong in `rules.rs`, `driver.rs`, and `loops.rs`.
 //!
-//! The current file now has two layers:
+//! The file has two layers:
 //!
-//! - `SummaryTables`, the paper-facing raw relations used directly by the
-//!   named summary rules
-//! - `SummaryRepository` plus `SummaryProvider`, the driver-facing boundary for
-//!   discovered summaries, loop invariants, and future external candidate
-//!   sources
+//! - `SummaryTables`, the paper-facing raw relations consumed by the named
+//!   summary rules
+//! - `SummaryRepository` plus `SummaryProvider`, the driver-facing read path
+//!   for already discovered or accepted summaries
 //!
-//! The important design point is that the driver consumes a provider, not a
-//! concrete table implementation. That keeps later imported or generated
-//! candidates separate from the paper-facing summary relations themselves.
+//! The generation boundary for new loop/function summaries is intentionally
+//! separate and lives in `loops.rs` as `SummaryGenerator`. That split lets the
+//! driver combine local discovered facts with external JSON-backed candidate
+//! sources without mixing storage concerns into the rule layer.
 
 use crate::analysis::formula::Formula;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub type ProcedureName = String;
 
 /// One `¬may ⇒ P` summary fact for a procedure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NotMaySummary {
     pub precondition: Formula,
     pub postcondition: Formula,
 }
 
 /// One `must ⇒ P` summary fact for a procedure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MustSummary {
     pub precondition: Formula,
     pub postcondition: Formula,
 }
 
 /// One candidate loop invariant attached to a concrete loop region.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LoopInvariantSummary {
     pub loop_id: usize,
     pub invariant: Formula,
@@ -126,7 +127,7 @@ impl SummaryTables {
 /// Provenance of one summary made visible to the driver.
 ///
 /// The current implementation only produces discovered summaries, but the
-/// provider boundary is intentionally separate from summary creation so later
+/// provider boundary is intentionally separate from generation so later
 /// sessions can inject file-backed or LLM-backed candidates without changing
 /// the rule scheduler.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,7 +156,8 @@ pub struct ProvidedLoopInvariantSummary {
     pub provenance: SummaryProvenance,
 }
 
-/// Read-only summary source used by the interprocedural driver.
+/// Read-only summary source used by the interprocedural driver after summaries
+/// have been accepted into the repository.
 pub trait SummaryProvider {
     fn notmay_candidates(&self, procedure: &str) -> Vec<ProvidedNotMaySummary>;
     fn must_candidates(&self, procedure: &str) -> Vec<ProvidedMustSummary>;
@@ -174,9 +176,8 @@ pub trait SummaryProvider {
 /// Mutable discovered-summary repository used by the current non-LLM route.
 ///
 /// The repository owns the raw paper summary relations and also exposes them
-/// through `SummaryProvider`, which gives the driver a stable boundary between
-/// "where summaries come from" and "how rules use them".
-/// Current non-LLM discovered-summary store plus provider façade.
+/// through `SummaryProvider`, which gives the driver a stable read boundary
+/// between "accepted summaries" and "rule scheduling".
 #[derive(Clone, Debug, Default)]
 pub struct SummaryRepository {
     tables: SummaryTables,

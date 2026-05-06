@@ -13,6 +13,9 @@ thiserror = "2.0.16"
 dot = "0.1.4"
 chumsky = {features = ["pratt"], version = "0.11"}
 ariadne = "0.5.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync"] }
 z3 = "0"
 z3-sys = "0"
 

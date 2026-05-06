@@ -20,17 +20,18 @@ Implemented and CLI-active:
 - summary-driven calls over scalar/boolean actuals, one optional scalar
   return, and visible memory ports on pointer arguments
 - module-level work-queue scheduling for Figures 5-10
-- provider/repository boundary for discovered summaries and future loop
-  invariants
+- repository/provider boundary for accepted summaries and loop invariants
+- trait-based summary-generator boundary for internal algorithms or external
+  JSON-backed modules
 - alpha-renaming and call-site substitution for summary instantiation
 - SCC-based loop extraction plus acyclic summary-structure condensation
 
 Implemented but not wired:
 
 - assertion-to-formula translation
-- opt-in external summary/invariant candidate providers
 - loop invariant verification/adoption in `analysis::driver`
 - loop summaries in `analysis::driver`
+- CLI wiring for opt-in external summary/invariant candidate generators
 
 Planned:
 
@@ -185,6 +186,7 @@ src/assertions/translation.rs   -> parser AST -> paper formula
 src/analysis/formula.rs         -> predicate vocabulary
 src/analysis/state.rs           -> Pi_n / Omega_n / tracked facts
 src/analysis/cfg.rs             -> P / n / e / Gamma_e
+src/analysis/loops.rs           -> loop regions, summary structure, summary generators
 src/analysis/oracle.rs          -> SMT feasibility / implication boundary
 src/analysis/rules.rs           -> named rules from Figures 5-10
 src/analysis/summaries.rs       -> `¬may ⇒ P` / `must ⇒ P` tables
@@ -197,17 +199,17 @@ src/smt/solver.rs               -> raw Z3 lowering
 Key boundaries:
 
 - `cfg.rs` stores only edge-local guards/relations.
-- `cfg.rs` also extracts loop SCCs and the acyclic condensation order used for
-  future loop-summary scheduling.
+- `loops.rs` extracts loop SCCs, builds the acyclic condensation order, and
+  hosts the trait-based loop/function summary generator seam.
 - accumulated path predicates and current per-region memory arrays belong in
   `state.rs`.
 - `oracle.rs` is the only paper module that answers solver-backed feasibility
   and implication queries.
 - `rules.rs` keeps the rule names and premises close to the paper instead of
   hiding them behind a generic engine.
-- `summaries.rs` now also exposes the provider/repository boundary used by the
-  interprocedural driver for both function summaries and future loop
-  invariants.
+- `summaries.rs` stores accepted/discovered summary facts, while `loops.rs`
+  owns the trait-based generation boundary for internal or external summary
+  producers.
 - `transfer.rs` interprets normalized effects produced by `llvm_adapter.rs`.
 - `llvm_adapter.rs` lowers one procedure into `cfg + node_effects + edge_effects`.
 - local memory is modeled as integer arrays, and impure calls havoc those
@@ -240,10 +242,12 @@ Still unwired:
   memory and havoc slice
 - loop invariants / loop summaries
 - external file-backed or LLM-backed candidate providers
+- trait-backed generators already exist in `loops.rs`; the remaining work is
+  CLI wiring and verification/adoption policy around them
 
 ## Next Milestone
 
 1. Add oracle-backed loop invariant verification/adoption over the new loop regions and summary structure.
 2. Broaden the current summary-driven call slice to richer interfaces, memory effects, and projections.
-3. Add an opt-in LLM candidate-generation/provider layer for loop invariants and function summaries while keeping the default non-LLM route unchanged.
+3. Wire the trait-based external generator seam into an opt-in CLI path for loop/function summary candidates while keeping the default non-LLM route unchanged.
 4. Add loop summaries / invariants to `--rule-check` and retire the temporary bounded loop explorer.

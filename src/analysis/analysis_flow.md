@@ -21,6 +21,7 @@ Vec<FunctionGraph>
      -> build_base_rule_procedure per function
      -> build_assertion_query_procedure per assertion
      -> rewrite_rule_query_procedure for the current memory/call-havoc slice
+     -> optional loops::SummaryGenerator seeding for loop/function candidates
      -> rules::{figure5..figure10}
      -> summaries::{SummaryRepository, SummaryProvider}
      -> oracle::Oracle feasibility / implication / model queries
@@ -35,7 +36,8 @@ Vec<FunctionGraph>
 - satisfiability and implication queries live only in `oracle.rs`
 - named declarative rules live in `rules.rs`
 - summary facts live in `summaries.rs`
-- loop regions and the acyclic condensation order live in `cfg.rs`
+- loop regions, condensation order, and generator-facing loop/function request
+  types live in `loops.rs`
 - `transfer.rs` interprets only normalized effects:
   - `Assign`
   - `Alloca`
@@ -126,6 +128,8 @@ driver:
     memory ports
   - it already extracts loop regions and the condensation DAG that future
     invariant generation will consume
+  - it can already talk to a trait-based external or internal summary
+    generator, with a Tokio/JSON adapter available in `loops.rs`
   - it also replays one feasible violating path through that query CFG and
     prints the final SMT model
 
@@ -137,5 +141,6 @@ interfaces still remain for the future driver.
 
 1. Add oracle-backed verification/adoption for loop invariant candidates over the extracted loop regions.
 2. Connect lowered memory/call effects to richer `β` / `θ` generation and projection.
-3. Add the opt-in candidate-provider path for future LLM or imported summaries/invariants.
+3. Wire the existing trait-based generator seam into an opt-in CLI path for
+   future LLM or imported summaries/invariants.
 4. Replace temporary `max_step` handling with loop summaries / invariants.

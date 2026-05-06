@@ -17,11 +17,12 @@
 //! independent. `oracle.rs` answers satisfiability and implication questions,
 //! but it should not decide how formulas are renamed or instantiated.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize)]
 pub enum Sort {
     Bool,
     Int,
@@ -38,7 +39,7 @@ impl fmt::Display for Sort {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 pub struct Var {
     name: String,
     sort: Sort,
@@ -79,7 +80,7 @@ impl fmt::Display for Var {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 pub struct Rational {
     num: i64,
     den: i64,
@@ -121,7 +122,7 @@ impl fmt::Display for Rational {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 pub enum Memory {
     Var(String),
     Store(Box<Memory>, Box<Term>, Box<Term>),
@@ -166,7 +167,7 @@ impl fmt::Display for Memory {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 pub enum Term {
     Var(Var),
     Int(i64),
@@ -264,7 +265,7 @@ impl fmt::Display for Term {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 pub enum Formula {
     True,
     False,
