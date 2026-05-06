@@ -4,17 +4,38 @@
 //! `cfg.rs` owns only nodes, edges, and edge-local guards. This adapter is the
 //! LLVM-specific place that turns instruction opcodes into `transfer.rs`
 //! effects.
+//!
+//! It is also where the current procedure interface is recovered for
+//! interprocedural reasoning:
+//!
+//! - formal parameter names
+//! - a distinguished scalar return slot
+//! - call arguments and optional scalar return targets
+//!
+//! The driver relies on this interface metadata when it creates callee queries,
+//! alpha-renames summary variables, and substitutes caller-side actuals back
+//! into discovered summaries.
 
 use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::{Formula, Sort, Term, Var};
-use crate::analysis::transfer::{AssignValue, CallMemoryEffect, TransferEffect};
+use crate::analysis::transfer::{AssignValue, CallArgument, CallMemoryEffect, TransferEffect};
 use crate::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TypeKind};
 use crate::llvm_utils::program_graph::{AssertSite, FunctionGraph};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
+/// Scalar interface recovered for one lowered procedure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcedureInterface {
+    pub parameters: Vec<String>,
+    pub return_value: Option<Var>,
+}
+
+/// One lowered procedure ready for the paper CFG/transfer pipeline.
 #[derive(Clone, Debug)]
 pub struct AdaptedProcedure {
+    pub name: String,
+    pub interface: ProcedureInterface,
     pub cfg: Cfg,
     pub node_effects: BTreeMap<CfgNodeId, Vec<TransferEffect>>,
     pub edge_effects: BTreeMap<CfgEdgeId, Vec<TransferEffect>>,
@@ -29,6 +50,7 @@ impl AdaptedProcedure {
     }
 }
 
+/// Assertion obligation attached to one lowered CFG node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdaptedAssertionSite {
     /// Stable 1-based identifier in the source graph assertion order.
@@ -39,6 +61,7 @@ pub struct AdaptedAssertionSite {
     pub obligation: Formula,
 }
 
+/// Adapter failures for the currently supported LLVM subset.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum AdapterError {
     #[error("function graph has no visible start node")]
@@ -69,6 +92,7 @@ pub fn adapt_function_graph_with_purity(
     let mut cfg = Cfg::new(start.print());
     let mut instruction_nodes = HashMap::<Instruction, CfgNodeId>::new();
     let allocation_regions = allocation_regions(graph);
+    let return_value = infer_return_value(graph)?;
     instruction_nodes.insert(start, cfg.entry());
 
     for instruction in &graph.vertices {
@@ -117,6 +141,11 @@ pub fn adapt_function_graph_with_purity(
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
 
     Ok(AdaptedProcedure {
+        name: graph.name.clone(),
+        interface: ProcedureInterface {
+            parameters: graph.params.clone(),
+            return_value,
+        },
         cfg,
         node_effects,
         edge_effects,
@@ -267,7 +296,8 @@ fn lower_node_effects(
             })?)?,
             offset: lower_gep_offset(instruction)?,
         }),
-        InstructionOpcode::PHI | InstructionOpcode::Br | InstructionOpcode::Ret => None,
+        InstructionOpcode::PHI | InstructionOpcode::Br => None,
+        InstructionOpcode::Ret => lower_return_effect(instruction)?,
         InstructionOpcode::Call => {
             let callee = instruction.get_called_function().ok_or_else(|| {
                 AdapterError::UnsupportedInstruction {
@@ -279,6 +309,8 @@ fn lower_node_effects(
             } else {
                 Some(TransferEffect::Call {
                     callee: callee.clone(),
+                    arguments: lower_call_arguments(instruction)?,
+                    return_target: lower_call_return_target(instruction)?,
                     memory_effect: if memory_pure_functions.contains(&callee) {
                         CallMemoryEffect::PreservesMemory
                     } else {
@@ -306,6 +338,61 @@ fn lower_node_effects(
     };
 
     Ok(effect.into_iter().collect())
+}
+
+fn infer_return_value(graph: &FunctionGraph) -> Result<Option<Var>, AdapterError> {
+    let mut return_sort = None;
+    for instruction in &graph.end {
+        let Some(value) = instruction.get_operand(0) else {
+            continue;
+        };
+        let sort = sort_for_value(value)?;
+        if return_sort.is_none() {
+            return_sort = Some(sort);
+        }
+    }
+    Ok(return_sort.map(return_var))
+}
+
+fn lower_return_effect(instruction: Instruction) -> Result<Option<TransferEffect>, AdapterError> {
+    let Some(value) = instruction.get_operand(0) else {
+        return Ok(None);
+    };
+    let sort = sort_for_value(value)?;
+    let target = return_var(sort);
+    let value = match sort {
+        Sort::Bool => AssignValue::Predicate(lower_bool_value(value)?),
+        Sort::Int | Sort::Real => AssignValue::Term(lower_numeric_value(value)?),
+    };
+    Ok(Some(TransferEffect::Assign { target, value }))
+}
+
+fn lower_call_arguments(instruction: Instruction) -> Result<Vec<CallArgument>, AdapterError> {
+    let mut arguments = Vec::new();
+    for argument in instruction.get_call_args() {
+        if is_pointer_value(argument) {
+            arguments.push(CallArgument::Pointer(pointer_name(argument)?));
+            continue;
+        }
+        let sort = sort_for_value(argument)?;
+        let lowered = match sort {
+            Sort::Bool => CallArgument::Predicate(lower_bool_value(argument)?),
+            Sort::Int | Sort::Real => CallArgument::Term(lower_numeric_value(argument)?),
+        };
+        arguments.push(lowered);
+    }
+    Ok(arguments)
+}
+
+fn lower_call_return_target(instruction: Instruction) -> Result<Option<Var>, AdapterError> {
+    let Some(ty) = instruction.get_type() else {
+        return Ok(None);
+    };
+    match ty.kind() {
+        TypeKind::Void => Ok(None),
+        TypeKind::Pointer => Ok(None),
+        _ => Ok(Some(assigned_var(instruction)?)),
+    }
 }
 
 fn allocation_regions(graph: &FunctionGraph) -> HashMap<Instruction, String> {
@@ -576,6 +663,14 @@ fn pointer_name(value: Instruction) -> Result<String, AdapterError> {
     }
 }
 
+fn return_var(sort: Sort) -> Var {
+    match sort {
+        Sort::Bool => Var::bool("__return"),
+        Sort::Int => Var::int("__return"),
+        Sort::Real => Var::real("__return"),
+    }
+}
+
 fn is_pointer_value(value: Instruction) -> bool {
     value
         .get_type()
@@ -757,6 +852,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(effects.contains(&TransferEffect::Call {
             callee: "helper".to_string(),
+            arguments: Vec::new(),
+            return_target: None,
             memory_effect: CallMemoryEffect::HavocMemory,
         }));
     }

@@ -3,7 +3,7 @@ Experimental LLVM may/must analysis work. MIT Licensed.
 ## Current Status
 
 The repository now has two executable driver slices: a broader temporary
-bounded checker and a narrower paper-shaped local rule driver.
+bounded checker and a narrower paper-shaped interprocedural rule driver.
 
 Implemented and CLI-active:
 
@@ -12,9 +12,13 @@ Implemented and CLI-active:
 - DOT graph dumping
 - fixture compilation under `tests/flow/`
 - `--simple-check` for the current bounded single-procedure checker
-- `--rule-check` for the current acyclic rule-driven checker
+- `--rule-check` for the current acyclic summary-driven rule checker
 - integer-array memory modeling for `alloca` / `load` / `store` / `gep`
 - conservative call handling with memory-preserving vs memory-havocing callees
+- summary-driven calls over the current scalar-return interface
+- module-level work-queue scheduling for Figures 5-10
+- provider/repository boundary for discovered summaries
+- alpha-renaming and call-site substitution for summary instantiation
 
 Implemented but not wired:
 
@@ -27,12 +31,13 @@ Implemented but not wired:
 - paper summary tables for `¬may ⇒ P` and `must ⇒ P`
 - normalized transfer effects
 - LLVM adapter lowering into `Cfg + node_effects + edge_effects`
-- summary-driven calls and loop invariants in `analysis::driver`
+- opt-in external summary/invariant candidate providers
+- loop invariants in `analysis::driver`
 
 Planned:
 
-- summary-rule scheduling for calls
 - loop summaries and invariants
+- external summary loading for missing/external procedures
 
 ## How To Run
 
@@ -79,9 +84,10 @@ cargo run --bin main -- --rule-check --no-dot <bitcode-file>
 ```
 
 That flag is CLI-active today. It currently supports acyclic procedures with
-scalar effects plus the current integer-array memory slice (`alloca` / `load` /
-`store` / `gep`) and conservative impure-call memory havoc. Loops, pointer
-phis, and richer interprocedural reasoning are still outside that rule slice.
+branching, scalar-return summary-driven calls, and the current integer-array
+memory slice (`alloca` / `load` / `store` / `gep`) with conservative impure-call
+memory havoc. Loops, pointer phis, richer projection/elimination, and broader
+memory interfaces are still outside that rule slice.
 
 Run unit tests:
 
@@ -121,8 +127,8 @@ Those per-procedure summaries include:
 
 If an assertion is reported `false`, the summary also prints a symbolic
 evidence trace showing the node/edge formulas and the failing obligation query
-that made the negated assertion feasible. This is not yet a solver model; real
-model/evidence queries still belong to the future rule-driven driver work.
+that made the negated assertion feasible. This remains a driver-collected
+symbolic trace rather than a reconstructed paper-rule witness.
 
 With `--trace-predicates`, the checker emits debug logs on the dedicated
 `analysis_trace` target for generated formulas after each ordinary node/edge
@@ -144,7 +150,7 @@ That checker is intentionally limited:
   directly by the `analysis::driver` unit tests today
 - it explores paths directly instead of scheduling the full paper rule engine
 
-With `--rule-check`, the CLI runs the current local Figure 5/6/7 scheduler
+With `--rule-check`, the CLI runs the current acyclic Figure 5-10 scheduler
 over one assertion query at a time and prints one summary block per procedure.
 
 That rule-driven checker is intentionally narrower:
@@ -154,15 +160,21 @@ That rule-driven checker is intentionally narrower:
   `Gamma_e`
 - it rewrites the current acyclic integer-array memory/call-havoc slice into a
   path-expanded scalar query before running the paper rules
+- it builds one reusable base rule procedure per analyzed function, records
+  discovered `must` / `¬may` summaries, and reuses them across supported call
+  sites through a provider/repository boundary
+- it alpha-renames callee interface variables, substitutes actual arguments and
+  return targets at the caller site, and maps caller queries back to callee
+  interfaces before enqueueing subqueries
 - for false results, it replays one feasible path through that synthetic
   violation CFG and prints the final SMT model for the violating state
 - it still requires an acyclic CFG; loops remain unsupported there until loop
   summaries / invariants exist
-- it schedules local `INIT_PI_NE`, `INIT_OMEGA`, `MUST_POST`, `NOTMAY_PRE`,
-  `IMPL_LEFT`, `IMPL_RIGHT`, `BUGFOUND`, and `VERIFIED`
-- those witnesses currently exist only for that same local acyclic slice;
-  summary-driven calls, loops, pointer phis, and richer memory shapes still do
-  not produce rule-check results today
+- it schedules the currently supported Figure 5/6/7 local rules plus the
+  Figure 8/9/10 summary/call rules for the scalar-return interprocedural slice
+- those witnesses currently exist only for that same acyclic scalar-return
+  slice; loops, pointer phis, and richer memory shapes still do not produce
+  rule-check results today
 
 ## Active Architecture
 
@@ -175,7 +187,7 @@ src/analysis/cfg.rs             -> P / n / e / Gamma_e
 src/analysis/oracle.rs          -> SMT feasibility / implication boundary
 src/analysis/rules.rs           -> named rules from Figures 5-10
 src/analysis/summaries.rs       -> `¬may ⇒ P` / `must ⇒ P` tables
-src/analysis/driver.rs          -> bounded explorer + local rule-driven scheduler
+src/analysis/driver.rs          -> bounded explorer + interprocedural rule scheduler
 src/analysis/transfer.rs        -> normalized local effects
 src/analysis/llvm_adapter.rs    -> FunctionGraph -> cfg + node/edge effects
 src/smt/solver.rs               -> raw Z3 lowering
@@ -190,6 +202,8 @@ Key boundaries:
   and implication queries.
 - `rules.rs` keeps the rule names and premises close to the paper instead of
   hiding them behind a generic engine.
+- `summaries.rs` now also exposes the provider/repository boundary used by the
+  interprocedural driver.
 - `transfer.rs` interprets normalized effects produced by `llvm_adapter.rs`.
 - `llvm_adapter.rs` lowers one procedure into `cfg + node_effects + edge_effects`.
 - local memory is modeled as integer arrays, and impure calls havoc those
@@ -206,23 +220,26 @@ The rule implementation in [src/analysis/rules.rs](/Users/mycroft/work/pl_projec
 - `figure5` through `figure10` expose the named rule entry points directly
 - `SummaryTables` in [src/analysis/summaries.rs](/Users/mycroft/work/pl_projects/may_must/src/analysis/summaries.rs:1) stores `¬may ⇒ P` and `must ⇒ P` facts
 
-The rules are now partially wired:
+The rules are now scheduled for the current interprocedural slice:
 
-- `driver.rs` computes scalar `β` / `θ` candidates for local acyclic
+- `driver.rs` computes scalar `β` / `θ` candidates for the current acyclic
   `Assign` / `Assume` procedures and path-expands the current memory/havoc
   slice into scalar rule queries
-- `driver.rs` schedules the local Figure 5/6/7 rules per assertion query
+- `driver.rs` schedules the currently supported Figure 5-10 rules per
+  assertion query
+- `driver.rs` also schedules the Figure 8/9/10 call and summary rules over the
+  current scalar-return interface, with module-level summary reuse
 
 Still unwired:
 
-- summary-driven call rules from Figures 8-10
 - broader instruction-aware rule candidates beyond the current integer-array
   memory and havoc slice
 - loop invariants / loop summaries
+- external file-backed or LLM-backed candidate providers
 
 ## Next Milestone
 
 1. Add an opt-in LLM candidate-generation/provider layer for loop invariants and function summaries while keeping the default non-LLM route unchanged.
 2. Add oracle-backed verification/adoption flow for LLM-proposed candidates.
-3. Wire summary-driven call scheduling from Figures 8-10.
+3. Broaden the current summary-driven call slice to richer interfaces, memory effects, and projections.
 4. Add loop summaries / invariants and retire the temporary bounded loop explorer.

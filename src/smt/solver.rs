@@ -1,14 +1,21 @@
 //! Minimal SMT wrapper for the reconstructed milestone.
 //!
 //! This module owns the raw Z3 interaction needed to lower `analysis::formula`
-//! values into solver constraints. It is intentionally small: no paper-level
-//! oracle policy lives here yet.
+//! values into solver constraints. It is intentionally small:
+//!
+//! - variable and array caches live here;
+//! - model rendering lives here;
+//! - paper-level decisions about when to ask SAT/validity questions do not.
+//!
+//! That policy split keeps `analysis::oracle` in charge of the proof/search
+//! logic while `solver.rs` stays a mechanical lowering layer.
 
 use crate::analysis::formula::{Formula, FormulaError, Memory, Rational, Sort, Term};
 use std::collections::BTreeMap;
 use z3::ast::{Array, Bool, Int, Real};
 use z3::{SatResult, Solver, Sort as Z3Sort};
 
+/// One reusable Z3 scope plus cached variable declarations for the paper terms.
 #[derive(Debug, Default)]
 pub struct SmtScope {
     solver: Solver,

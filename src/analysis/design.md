@@ -2,8 +2,8 @@
 
 ## Current Phase
 
-The active codebase now has both a temporary bounded explorer and a local
-paper-rule driver:
+The active codebase now has both a temporary bounded explorer and an
+interprocedural paper-rule driver:
 
 - implemented and CLI-active:
   - LLVM bitcode parsing
@@ -13,10 +13,11 @@ paper-rule driver:
   - `--simple-check` for the current bounded single-procedure checker
   - `--rule-check` for the current acyclic rule-driven checker
   - temporary `max_step` loop bounding in `analysis::driver`
-  - query-specific assertion lowering plus local Figure 5/6/7 scheduling in
+  - query-specific assertion lowering plus Figure 5-10 scheduling in
     `analysis::driver`
   - integer-array memory modeling and conservative call-memory havoc
   - rule-query rewriting for the current acyclic memory/call-havoc slice
+  - summary provider/repository boundary and module-level summary reuse
 - implemented but not wired:
   - assertion-to-formula translation
   - paper formula language
@@ -25,10 +26,9 @@ paper-rule driver:
   - SMT oracle feasibility/implication queries
   - named paper rules from Figures 5-10
   - paper summary tables
-  - summary-driven call scheduling
   - broader instruction-aware rule candidate generation
 - planned:
-  - full driver orchestration over the summary rules
+  - richer external candidate providers
   - loop summaries/invariants
 
 ## Module Mapping
@@ -57,8 +57,8 @@ raw solver layer               -> src/smt/solver.rs
   on-demand model queries.
 - `rules.rs` owns the named declarative rules and keeps their interfaces close
   to the paper.
-- `summaries.rs` stores summary facts, but summary scheduling still belongs in
-  the future driver.
+- `summaries.rs` stores summary facts and the provider boundary, while summary
+  scheduling belongs in `driver.rs`.
 - `driver.rs` now contains two executable slices:
   - the broader temporary bounded path explorer
   - the narrower local rule scheduler for acyclic scalar-plus-memory procedures
@@ -71,6 +71,9 @@ raw solver layer               -> src/smt/solver.rs
 - before scheduling the rules, the rule-driven slice now rewrites the current
   acyclic integer-array memory effects (`alloca` / `load` / `store` / `gep`)
   and impure-call havoc into a path-expanded scalar query.
+- that same rule-driven slice also builds one reusable base procedure per
+  function, records discovered `must` / `¬may` summaries, and instantiates
+  them at supported call sites through alpha-renamed interface substitution.
 - that same rule-driven slice replays one feasible path through the assertion
   query CFG and attaches the final SMT model for the violating state.
 - the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
@@ -120,7 +123,8 @@ The main carrier used by the rule layer is `ProcedureFrame`, which stores:
 - `MustSummary` for `must ⇒ P`
 
 Those tables are intentionally simple keyed vectors at the current milestone.
-Rule scheduling and summary selection still belong in the future driver.
+`SummaryRepository` is the current non-LLM source, and the `SummaryProvider`
+trait is the stable seam for future imported or generated candidates.
 
 ## Current Simplifications
 
@@ -134,12 +138,14 @@ representation choices are deliberately minimal:
 - `β`, `θ`, and local-variable projection remain explicit rule inputs in
   `rules.rs`; the current `driver.rs` now computes only the scalar acyclic
   subset of those candidates
-- the current `driver.rs` still uses a separate bounded path explorer for loops,
-  calls, and memory-heavy shapes
+- the current `driver.rs` still uses a separate bounded path explorer for loops
+  and for code outside the current interprocedural rule slice
 - the current rule witnesses are postprocessed from the lowered query CFG
   rather than reconstructed from explicit must-rule provenance
 - the current memory-aware rule rewrite is still path-expansion-oriented rather
   than a full paper summary abstraction
+- summary projection currently relies on syntactic hidden-assignment
+  elimination rather than a complete quantifier-elimination strategy
 
 The main conservative check is the abstract path search used by `VERIFIED` and
 `CREATE_NOTMAYSUMMARY`:

@@ -1,13 +1,24 @@
-//! Paper-state carriers for path summaries `Pi_n`, obligations `Omega_n`, and
-//! tracked local facts `N_e`.
+//! Analysis-owned state carriers layered on top of the paper CFG.
 //!
-//! This module stores analysis-owned facts keyed by CFG node/edge identifiers.
-//! It does not perform solver reasoning or transfer semantics by itself.
+//! This module does not store the rule frame itself; `rules.rs` owns `Π_n`,
+//! `Ω_n`, and `N_e`. What lives here are the executable-state pieces used by
+//! the bounded checker and by witness replay:
+//!
+//! - accumulated path predicates
+//! - asserted local facts
+//! - pending obligations
+//! - the current integer-array memory model and pointer bindings
+//! - temporary visit counters for bounded exploration
+//!
+//! These carriers are deliberately operational rather than declarative. The
+//! paper-rule frame itself lives in `rules.rs`; `state.rs` supports the bounded
+//! executor, transfer interpretation, and witness replay.
 
 use crate::analysis::cfg::{CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::{Formula, Memory, Term, Var};
 use std::collections::BTreeMap;
 
+/// Accumulated path predicate for one symbolic frontier state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathSummary {
     predicate: Formula,
@@ -108,6 +119,7 @@ impl PointerValue {
     }
 }
 
+/// Symbolic state carried by the bounded executor and witness replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeState {
     path_summary: PathSummary,

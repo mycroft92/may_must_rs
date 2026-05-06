@@ -1,7 +1,18 @@
 //! LLVM-independent control-flow graph for paper procedures `P`, nodes `n`,
 //! edges `e`, and edge-local relations `Gamma_e`.
 //!
-//! Accumulated path predicates do not live here. They belong in `state.rs`.
+//! This module intentionally stays structural:
+//!
+//! - nodes and edges identify the paper graph shape;
+//! - each edge carries only its local guard/relation `Gamma_e`;
+//! - entry/exit normalization, including the synthetic single-exit node, lives
+//!   here;
+//! - accumulated path predicates, must regions, blocked pairs, and summaries do
+//!   not live here.
+//!
+//! That separation keeps the paper objects easy to audit: `cfg.rs` says what
+//! can happen next, while `state.rs` and `rules.rs` say what is known about the
+//! executions that actually reach those points.
 
 use crate::analysis::formula::Formula;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,6 +24,7 @@ pub struct CfgNodeId(pub usize);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CfgEdgeId(pub usize);
 
+/// Paper-level classification of one CFG node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CfgNodeKind {
     Entry,
@@ -21,6 +33,7 @@ pub enum CfgNodeKind {
     SyntheticExit,
 }
 
+/// One paper CFG node with a stable identifier and human-readable label.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CfgNode {
     pub id: CfgNodeId,
@@ -28,6 +41,7 @@ pub struct CfgNode {
     pub kind: CfgNodeKind,
 }
 
+/// One directed CFG edge plus its local relation `Gamma_e`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CfgEdge {
     pub id: CfgEdgeId,
@@ -47,6 +61,7 @@ impl CfgEdge {
     }
 }
 
+/// LLVM-independent CFG with optional synthetic single-exit normalization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cfg {
     nodes: BTreeMap<CfgNodeId, CfgNode>,

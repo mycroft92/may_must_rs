@@ -3,6 +3,11 @@
 //! This module owns satisfiability and implication checks for the paper-level
 //! objects built in `formula.rs` and `state.rs`. It is the only analysis
 //! module that should talk to the raw solver layer.
+//!
+//! The driver uses it both for ordinary premise checks and for on-demand model
+//! generation during witness replay. Formula alpha-renaming and interface
+//! substitution stay in `formula.rs`; the oracle consumes the already-renamed
+//! formulas.
 
 use crate::analysis::formula::{Formula, FormulaError};
 use crate::analysis::state::{NodeState, PathSummary};
@@ -10,6 +15,7 @@ use crate::smt::solver::SmtScope;
 use thiserror::Error;
 use z3::SatResult;
 
+/// Three-way answer for feasibility checks over paper formulas/states.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Feasibility {
     Feasible,
@@ -17,6 +23,7 @@ pub enum Feasibility {
     Unknown,
 }
 
+/// Three-way answer for implication checks over paper formulas/states.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Validity {
     Valid,

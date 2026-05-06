@@ -2,7 +2,7 @@
 
 ## Phase
 
-Current phase: local paper rule driving with default witnesses, plus a temporary bounded checker.
+Current phase: interprocedural paper rule driving with default witnesses, plus a temporary bounded checker.
 
 Implemented:
 
@@ -12,9 +12,11 @@ Implemented:
 - paper summary tables
 - named paper rules from Figures 5-10
 - temporary bounded intraprocedural driver with `max_step`
-- local Figure 5/6/7 rule-driven checker for acyclic procedures, including the current integer-array memory and impure-call-havoc slice
-- on-demand witness/model replay for false results in that local rule-driven slice
+- Figure 5-10 rule-driven checker for acyclic procedures, including the current scalar-return call slice plus integer-array memory and impure-call-havoc rewriting
+- default witness/model replay for false results in that rule-driven slice
 - scalar `β` / `θ` generation from lowered `Assign` / `Assume` effects
+- summary provider/repository boundary plus module-level summary work queue
+- call-site alpha-renaming and interface substitution for summary instantiation
 - LLVM adapter lowering through `transfer.rs`
 - paper oracle feasibility/implication queries
 - synthetic single-exit normalization for multi-exit procedures
@@ -25,14 +27,14 @@ Implemented:
 Not wired:
 
 - opt-in LLM candidate provider/injection layer for function summaries and loop invariants
-- summary-driven call orchestration
 - richer instruction-aware effect-to-`Pre` / `Post` computation beyond the current integer-array memory and havoc slice
 - full loop-aware CLI rule execution
 - loop summaries / invariant generation
+- external trusted summary loading
 
 ## Next Session Plan
 
 1. Add an opt-in LLM candidate-generation switch for loop/function summary candidates while keeping the default non-LLM route unchanged.
 2. Add oracle-backed verification/adoption flow for LLM-proposed candidates.
-3. Extend `--rule-check` from the current local acyclic scalar-plus-memory slice to summary-driven calls.
+3. Broaden `--rule-check` from the current scalar-return summary slice to richer interfaces, projections, and memory-aware summaries.
 4. Replace the temporary `max_step` policy with loop summaries / invariants.

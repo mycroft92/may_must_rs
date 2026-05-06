@@ -2,18 +2,38 @@
 //! `llvm_adapter.rs`.
 //!
 //! Ordinary branch guards belong on CFG edges as `Gamma_e`; this module only
-//! interprets assignment, assumption, obligation, and call effects.
+//! interprets normalized local effects:
+//!
+//! - scalar assignments
+//! - integer-array memory operations
+//! - trusted assumptions / obligations
+//! - call-side memory havoc or preservation
+//!
+//! Calls preserve their interface data here so the rule driver can later build
+//! interprocedural queries and instantiate summaries. The bounded executor
+//! still treats scalar returns conservatively unless a richer summary path is
+//! available.
 
 use crate::analysis::formula::{Formula, Sort, Term, Var};
 use crate::analysis::state::NodeState;
 use thiserror::Error;
 
+/// How one call affects the tracked integer-array memory state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallMemoryEffect {
     PreservesMemory,
     HavocMemory,
 }
 
+/// Normalized call-site argument passed to the rule driver or bounded executor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CallArgument {
+    Term(Term),
+    Predicate(Formula),
+    Pointer(String),
+}
+
+/// One normalized local effect interpreted by `apply_effect`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransferEffect {
     Assign {
@@ -42,6 +62,8 @@ pub enum TransferEffect {
     Nop,
     Call {
         callee: String,
+        arguments: Vec<CallArgument>,
+        return_target: Option<Var>,
         memory_effect: CallMemoryEffect,
     },
 }
@@ -121,6 +143,8 @@ pub fn apply_effect(state: &mut NodeState, effect: &TransferEffect) -> Result<()
         TransferEffect::Nop => Ok(()),
         TransferEffect::Call {
             callee: _,
+            arguments: _,
+            return_target: _,
             memory_effect,
         } => {
             if *memory_effect == CallMemoryEffect::HavocMemory {
@@ -358,6 +382,8 @@ mod tests {
             &mut state,
             &TransferEffect::Call {
                 callee: "touch".to_string(),
+                arguments: vec![CallArgument::Pointer("%ptr".to_string())],
+                return_target: None,
                 memory_effect: CallMemoryEffect::HavocMemory,
             },
         )

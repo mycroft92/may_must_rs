@@ -1,7 +1,9 @@
 //! Translation from the assertion frontend AST into the paper formula language.
 //!
 //! Parser-specific sort inference intentionally lives here instead of inside
-//! `analysis::formula`.
+//! `analysis::formula`. That keeps user-facing syntax recovery separate from
+//! the paper vocabulary and lets tests exercise translation without any LLVM
+//! dependency.
 
 use crate::analysis::formula::{Formula, Rational, Sort, Term};
 use crate::assertions::exp::{Assertion, Expr, Op, Statement};

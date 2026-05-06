@@ -8,23 +8,23 @@ LLVM bitcode
   -> program_graph::generate_program_graph
   -> optional DOT dump
   -> optional driver::analyze_function_graph_simple
-  -> optional driver::analyze_function_graph_rules
+  -> optional driver::analyze_function_graphs_rules_with_purity_best_effort
 ```
 
-## Implemented But Not Wired
+## Implemented Rule Flow
 
 ```text
-FunctionGraph
-  -> llvm_adapter::adapt_function_graph
-     -> cfg::Cfg
-     -> node_effects
-     -> edge_effects
-  -> transfer::apply_effects
-  -> state::AnalysisState
-  -> oracle::Oracle feasibility / implication queries
-  -> driver::{analyze_adapted_procedure_simple, analyze_adapted_procedure_rules}
-  -> rules::{figure5..figure10}
-  -> summaries::SummaryTables
+Vec<FunctionGraph>
+  -> llvm_adapter::adapt_function_graph_with_purity
+     -> AdaptedProcedure { cfg, node_effects, edge_effects, interface, assertions }
+  -> driver::RuleModuleEngine
+     -> build_base_rule_procedure per function
+     -> build_assertion_query_procedure per assertion
+     -> rewrite_rule_query_procedure for the current memory/call-havoc slice
+     -> rules::{figure5..figure10}
+     -> summaries::{SummaryRepository, SummaryProvider}
+     -> oracle::Oracle feasibility / implication / model queries
+     -> per-procedure RuleProcedureReport values
 ```
 
 ## Important Ownership Rules
@@ -47,8 +47,9 @@ FunctionGraph
 - `driver.rs` currently offers two executable slices:
   - a bounded path explorer that checks obligations against the current path
     formula
-  - a local rule scheduler that rewrites each assertion into a synthetic
-    violation-exit query and runs Figure 5/6/7 over it
+  - an interprocedural rule scheduler that rewrites each assertion into a
+    synthetic violation-exit query and runs the currently supported Figure
+    5-10 slice over it
 - repeated loop traversals are cut off by the temporary per-edge `max_step`
   budget in the bounded slice of `driver.rs`
 - impure calls havoc the currently tracked integer-array memory regions
@@ -73,12 +74,15 @@ Today the remaining caller/driver work is:
 
 - broader candidate `β` formulas beyond the current rewritten memory/havoc slice
 - broader candidate `θ` formulas beyond the current rewritten memory/havoc slice
-- local-variable projection closures for summary creation
+- richer summary projection/elimination beyond the current syntactic interface slice
+- loop-aware summary scheduling
 
 The current driver already computes the scalar acyclic `Assign` / `Assume`
-subset of `β` / `θ` and rewrites the current integer-array memory plus
-impure-call-havoc slice into that scalar form. The remaining pieces belong to
-the future summary-aware driver work.
+subset of `β` / `θ`, rewrites the current integer-array memory plus
+impure-call-havoc slice into that scalar form, alpha-renames and substitutes
+summary interfaces at call sites, and maps supported call queries back to
+callee interfaces. The remaining pieces belong to the broader future driver
+work.
 
 ## Conservative Checks
 
@@ -104,25 +108,30 @@ driver:
     branch paths and report explicit per-assertion `true` / `false` /
     `unknown` outcomes
 - rule-driven slice:
-  - it supports one procedure at a time
+  - it analyzes one module at a time so summaries can be shared across calls
   - it currently requires an acyclic CFG
   - it builds one query-specific synthetic violation exit per assertion
+  - it also builds one base summary-capable rule procedure per analyzed
+    function
   - it computes scalar `β` / `θ` candidates from normalized `Assign` /
     `Assume` effects and `Gamma_e`
   - it rewrites the current `Alloca` / `GetElementPtr` / `Load` / `Store` and
     impure-call-havoc slice into a path-expanded scalar query before those
     rules run
-  - it schedules local Figure 5/6/7 rules plus `IMPL_LEFT` / `IMPL_RIGHT`
+  - it schedules the currently supported Figure 5-10 rules, including summary
+    reuse, subquery enqueueing, and discovered summary recording
+  - it instantiates summaries at call sites through alpha-renamed interface
+    substitution over actual arguments and scalar return targets
   - it also replays one feasible violating path through that query CFG and
     prints the final SMT model
 
 That is enough to run straightline and branchy rule-driven unit tests plus the
-broader bounded-loop temporary checker, but summary-driven calls and loop
-invariants still remain for the future driver.
+broader bounded-loop temporary checker, but loop invariants and richer summary
+interfaces still remain for the future driver.
 
 ## Next Wiring Steps
 
-1. Extend the current rule scheduler to Figures 8-10 call/summary rules.
-2. Connect lowered memory/call effects to richer `β` / `θ` generation.
+1. Add the opt-in candidate-provider path for future LLM or imported summaries/invariants.
+2. Connect lowered memory/call effects to richer `β` / `θ` generation and projection.
 3. Replace temporary `max_step` handling with loop summaries / invariants.
-4. Extend rule-driven witnesses to summary, memory, and loop-aware queries.
+4. Extend rule-driven witnesses to richer summary, memory, and loop-aware queries.

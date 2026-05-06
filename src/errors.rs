@@ -3,7 +3,10 @@
 //! The project uses a single `ProgError` enum so parsing, LLVM graph building,
 //! and filesystem operations can all return the same `Result<T>` alias. Error
 //! variants stay close to the subsystem that detects them, but callers do not
-//! need to thread multiple error types through the analysis pipeline.
+//! need to thread multiple error types through the frontend / graph-building
+//! pipeline. The deeper paper analysis layers use narrower local error types
+//! and are converted only when the CLI/frontend boundary needs one umbrella
+//! result.
 
 use crate::llvm_utils::llvm_wrap::Instruction;
 use thiserror::Error;

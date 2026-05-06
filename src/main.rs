@@ -1,11 +1,11 @@
-//! CLI entry point for the reconstructed milestone.
+//! CLI entry point for the current LLVM-to-SMASH prototype.
 //!
-//! The active CLI surface stops at LLVM graph construction and DOT dumping.
-//! The paper-shaped CFG/effect lowering exists in the crate and is unit-tested.
-//! The current executable surfaces are:
+//! The binary still prints raw `FunctionGraph` summaries and optional DOT
+//! output, but it now also exposes two executable analysis slices:
 //!
-//! - `--simple-check` for the broader temporary bounded checker
-//! - `--rule-check` for the narrower local rule-driven scheduler
+//! - `--simple-check` for the broader bounded single-procedure executor
+//! - `--rule-check` for the paper-shaped rule driver with module-level summary
+//!   reuse across supported calls
 
 mod analysis;
 mod assertions;
@@ -36,7 +36,7 @@ fn main() {
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
         .arg(arg!(--"simple-check" "Run the current bounded single-procedure checker"))
-        .arg(arg!(--"rule-check" "Run the current acyclic scalar rule-driven checker"))
+        .arg(arg!(--"rule-check" "Run the current acyclic summary-driven rule checker"))
         .arg(arg!(--"trace-predicates" "Emit predicate traces for the simple checker as debug logs"))
         .arg(
             arg!(--"max-step" <MAX_STEP> "Temporary per-edge loop visit bound for the simple checker")
@@ -125,15 +125,37 @@ fn handle(
                     }
                 }
                 if rule_check {
-                    match analysis::driver::analyze_function_graph_rules_with_purity(
-                        graph,
-                        &memory_pure_functions,
-                    ) {
-                        Ok(report) => rule_summaries.push(RuleProcedureSummary::Checked(report)),
-                        Err(error) => rule_summaries.push(RuleProcedureSummary::Unsupported {
-                            procedure: graph.name.clone(),
-                            reason: error.to_string(),
-                        }),
+                    // Module-level rule execution is reported after discovery so
+                    // call summaries can be shared across procedures.
+                }
+            }
+            if rule_check {
+                match analysis::driver::analyze_function_graphs_rules_with_purity_best_effort(
+                    &graphs,
+                    &memory_pure_functions,
+                ) {
+                    Ok(results) => {
+                        for (procedure, report) in results {
+                            match report {
+                                Ok(report) => {
+                                    rule_summaries.push(RuleProcedureSummary::Checked(report))
+                                }
+                                Err(error) => {
+                                    rule_summaries.push(RuleProcedureSummary::Unsupported {
+                                        procedure,
+                                        reason: error.to_string(),
+                                    })
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for graph in &graphs {
+                            rule_summaries.push(RuleProcedureSummary::Unsupported {
+                                procedure: graph.name.clone(),
+                                reason: error.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -167,7 +189,7 @@ fn handle(
             }
             if !simple_check && !rule_check {
                 println!(
-                    "Paper CFG/transfer lowering is implemented; use --simple-check for the bounded checker or --rule-check for the current rule-driven scalar DAG checker."
+                    "Paper CFG/transfer lowering is implemented; use --simple-check for the bounded checker or --rule-check for the current acyclic summary-driven rule checker."
                 );
             }
         }

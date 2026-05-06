@@ -15,7 +15,7 @@
 
 use crate::errors::{ProgError, Result};
 use ariadne::{sources, Color, Label, Report, ReportKind};
-///Defines the type of assertions we check for witht he analysis
+/// Defines the operators accepted by the small assertion language.
 use chumsky::{input::BorrowInput, input::ValueInput, pratt::*, prelude::*};
 use std::io::BufRead;
 use std::{fmt, fs};

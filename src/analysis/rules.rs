@@ -14,8 +14,13 @@
 //! - `N_e` as blocked abstract `(ϕ_1, ϕ_2)` pairs per edge
 //! - `⟨ϕ_1 ?⇒_P ϕ_2⟩` as [`ReachabilityQuery`]
 //!
-//! A future `driver.rs` is expected to choose candidate `β` / `θ` formulas and
-//! schedule these rules over lowered LLVM procedures.
+//! `driver.rs` is responsible for choosing candidate `β` / `θ` formulas,
+//! projecting summaries to call interfaces, and scheduling these rules over
+//! lowered LLVM procedures.
+//!
+//! The module therefore stays intentionally close to the paper text: rule
+//! functions expose paper-facing premises and mutate `ProcedureFrame`, but they
+//! do not hide driver policy, LLVM details, or solver orchestration.
 
 use crate::analysis::cfg::{Cfg, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::Formula;

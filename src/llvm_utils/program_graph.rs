@@ -4,6 +4,11 @@
 //! graph stays at instruction granularity, but `may_assert` and obvious noise
 //! calls are removed so later analysis layers work on semantic steps rather
 //! than frontend scaffolding.
+//!
+//! `AGENTS.md` treats this file as the fixed foundation for the later paper
+//! lowering. The analysis stack may be reconstructed around it, but this raw
+//! graph construction remains the source of truth for visible LLVM control and
+//! data-flow structure.
 
 use crate::errors::*;
 use crate::llvm_utils::llvm_wrap::*;
