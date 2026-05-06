@@ -30,6 +30,7 @@ Implemented:
 
 Not wired:
 
+- strong enough direct-call `¬may` summary derivation/reuse to prove the Section 2 Figure 1 paper example safe
 - opt-in LLM candidate provider/injection layer for function summaries and loop invariants
 - richer instruction-aware effect-to-`Pre` / `Post` computation beyond the current integer-array memory and havoc slice
 - full loop-aware CLI rule execution
@@ -38,7 +39,7 @@ Not wired:
 
 ## Next Session Plan
 
-1. Add oracle-backed loop invariant verification/adoption on top of the extracted loop regions and summary structure.
-2. Broaden the default rule-check path from the current visible-memory summary slice to richer interfaces, projections, and memory-aware summaries.
-3. Layer LLM-backed generation on top of the existing external-summary CLI seam while keeping the default non-LLM route unchanged.
-4. Replace the temporary `max_step` policy with loop summaries / invariants.
+1. Make `tests/paper_section2_fig1_not_may.c` return `SAFE` by deriving and reusing the direct-call `¬may` summary `<true not-may=> g (retval < 0)>`.
+2. Strengthen Figure 8/10 call-query mapping, summary creation, and summary reuse for return-value and visible-memory summaries at caller sites.
+3. Add oracle-backed loop invariant verification/adoption on top of the extracted loop regions and summary structure.
+4. Broaden the default rule-check path from the current visible-memory summary slice to richer interfaces, projections, and memory-aware summaries.
