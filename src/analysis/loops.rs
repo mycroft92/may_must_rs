@@ -15,7 +15,9 @@ use crate::analysis::oracle::{Oracle, OracleError, Validity};
 use crate::analysis::summaries::{MustSummary, NotMaySummary};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
@@ -160,6 +162,15 @@ pub struct FunctionSummaryResponse {
     pub memory_summaries: Vec<Formula>,
 }
 
+/// File-backed catalog of externally produced summaries keyed by procedure.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SummaryCatalog {
+    #[serde(default)]
+    pub functions: BTreeMap<String, FunctionSummaryResponse>,
+    #[serde(default)]
+    pub loops: BTreeMap<String, BTreeMap<usize, LoopSummaryResponse>>,
+}
+
 /// Summary-generation request sent through the Tokio-backed placeholder.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SummaryGenerationRequest {
@@ -192,9 +203,13 @@ pub struct KnasterTarskiLoopSummaryGenerator {
     pub max_iterations: usize,
 }
 
+pub const DEFAULT_KNASTER_TARSKI_MAX_ITERATIONS: usize = 16;
+
 impl Default for KnasterTarskiLoopSummaryGenerator {
     fn default() -> Self {
-        Self { max_iterations: 16 }
+        Self {
+            max_iterations: DEFAULT_KNASTER_TARSKI_MAX_ITERATIONS,
+        }
     }
 }
 
@@ -296,6 +311,109 @@ impl SummaryGenerator for KnasterTarskiLoopSummaryGenerator {
     }
 }
 
+/// External summary source loaded from one JSON catalog file.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JsonSummaryCatalogGenerator {
+    catalog: SummaryCatalog,
+}
+
+impl JsonSummaryCatalogGenerator {
+    pub fn from_json_str(json: &str) -> Result<Self, LoopAnalysisError> {
+        let catalog = serde_json::from_str(json)
+            .map_err(|error| LoopAnalysisError::Json(error.to_string()))?;
+        Ok(Self { catalog })
+    }
+
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LoopAnalysisError> {
+        let path = path.as_ref();
+        let json =
+            fs::read_to_string(path).map_err(|error| LoopAnalysisError::ReadSummaryCatalog {
+                path: path.display().to_string(),
+                error: error.to_string(),
+            })?;
+        Self::from_json_str(&json)
+    }
+}
+
+impl SummaryGenerator for JsonSummaryCatalogGenerator {
+    fn generate_loop_summary(
+        &self,
+        _oracle: &Oracle,
+        request: &LoopSummaryRequest,
+    ) -> Result<LoopSummaryResponse, LoopAnalysisError> {
+        self.catalog
+            .loops
+            .get(&request.procedure)
+            .and_then(|loops| loops.get(&request.loop_region.id))
+            .cloned()
+            .ok_or_else(|| LoopAnalysisError::MissingSummaryResponse {
+                kind: "loop".to_string(),
+                procedure: request.procedure.clone(),
+                loop_id: Some(request.loop_region.id),
+            })
+    }
+
+    fn generate_function_summary(
+        &self,
+        _oracle: &Oracle,
+        request: &FunctionSummaryRequest,
+    ) -> Result<FunctionSummaryResponse, LoopAnalysisError> {
+        self.catalog
+            .functions
+            .get(&request.procedure)
+            .cloned()
+            .ok_or_else(|| LoopAnalysisError::MissingSummaryResponse {
+                kind: "function".to_string(),
+                procedure: request.procedure.clone(),
+                loop_id: None,
+            })
+    }
+}
+
+/// Summary generator that falls back to a second source when the primary
+/// source has no entry for the requested procedure or loop.
+#[derive(Clone)]
+pub struct FallbackSummaryGenerator {
+    primary: Arc<dyn SummaryGenerator>,
+    fallback: Arc<dyn SummaryGenerator>,
+}
+
+impl FallbackSummaryGenerator {
+    pub fn new(primary: Arc<dyn SummaryGenerator>, fallback: Arc<dyn SummaryGenerator>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl SummaryGenerator for FallbackSummaryGenerator {
+    fn generate_loop_summary(
+        &self,
+        oracle: &Oracle,
+        request: &LoopSummaryRequest,
+    ) -> Result<LoopSummaryResponse, LoopAnalysisError> {
+        match self.primary.generate_loop_summary(oracle, request) {
+            Ok(summary) => Ok(summary),
+            Err(LoopAnalysisError::MissingSummaryResponse { .. }) => {
+                self.fallback.generate_loop_summary(oracle, request)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn generate_function_summary(
+        &self,
+        oracle: &Oracle,
+        request: &FunctionSummaryRequest,
+    ) -> Result<FunctionSummaryResponse, LoopAnalysisError> {
+        match self.primary.generate_function_summary(oracle, request) {
+            Ok(summary) => Ok(summary),
+            Err(LoopAnalysisError::MissingSummaryResponse { .. }) => {
+                self.fallback.generate_function_summary(oracle, request)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 type SummaryJsonFuture = Pin<Box<dyn Future<Output = String> + Send + 'static>>;
 type SummaryJsonHandler =
     Arc<dyn Fn(SummaryGenerationRequest) -> SummaryJsonFuture + Send + Sync + 'static>;
@@ -380,6 +498,14 @@ pub enum LoopAnalysisError {
     TokioRuntime(String),
     #[error("json summary payload could not be parsed: {0}")]
     Json(String),
+    #[error("summary catalog could not be read from {path}: {error}")]
+    ReadSummaryCatalog { path: String, error: String },
+    #[error("external summary source has no {kind} summary for procedure {procedure}")]
+    MissingSummaryResponse {
+        kind: String,
+        procedure: String,
+        loop_id: Option<usize>,
+    },
     #[error("expected a {expected} summary response but received {received}")]
     UnexpectedSummaryKind { expected: String, received: String },
     #[error(
@@ -898,5 +1024,116 @@ mod tests {
             .unwrap();
         assert_eq!(summary.invariant.predicate, Formula::bool_var("inv"));
         assert_eq!(summary.invariant.memory_summaries.len(), 1);
+    }
+
+    #[test]
+    fn json_catalog_generator_looks_up_procedure_and_loop_entries() {
+        let mut functions = BTreeMap::new();
+        functions.insert(
+            "main".to_string(),
+            FunctionSummaryResponse {
+                must_summaries: Vec::new(),
+                notmay_summaries: Vec::new(),
+                memory_summaries: vec![Formula::memory_eq(
+                    crate::analysis::formula::Memory::var("%mem$mem_out"),
+                    crate::analysis::formula::Memory::var("%mem$mem_in"),
+                )],
+            },
+        );
+        let mut loops = BTreeMap::new();
+        loops.insert(
+            0usize,
+            LoopSummaryResponse {
+                invariant: FormulaSummary {
+                    predicate: Formula::bool_var("inv"),
+                    memory_summaries: Vec::new(),
+                },
+            },
+        );
+        let mut all_loops = BTreeMap::new();
+        all_loops.insert("main".to_string(), loops);
+        let generator = JsonSummaryCatalogGenerator::from_json_str(
+            &serde_json::to_string(&SummaryCatalog {
+                functions,
+                loops: all_loops,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = Cfg::new("entry");
+        let header = cfg.add_node("header");
+        cfg.add_edge(cfg.entry(), header, Formula::True).unwrap();
+        cfg.add_edge(header, header, Formula::True).unwrap();
+        cfg.mark_exit(header).unwrap();
+        let loop_region = extract_loops(&cfg).into_iter().next().unwrap();
+
+        let function = generator
+            .generate_function_summary(
+                &Oracle::new(),
+                &FunctionSummaryRequest {
+                    procedure: "main".to_string(),
+                    interface: SummaryInterface {
+                        parameters: Vec::new(),
+                        return_value: None,
+                        visible_memory_roots: vec!["%mem".to_string()],
+                    },
+                    loops: vec![loop_region.clone()],
+                    summary_structure: summary_structure(&cfg),
+                },
+            )
+            .unwrap();
+        assert_eq!(function.memory_summaries.len(), 1);
+
+        let loop_summary = generator
+            .generate_loop_summary(
+                &Oracle::new(),
+                &LoopSummaryRequest {
+                    procedure: "main".to_string(),
+                    interface: SummaryInterface {
+                        parameters: Vec::new(),
+                        return_value: None,
+                        visible_memory_roots: Vec::new(),
+                    },
+                    loop_region,
+                    summary_structure: summary_structure(&cfg),
+                },
+            )
+            .unwrap();
+        assert_eq!(loop_summary.invariant.predicate, Formula::bool_var("inv"));
+    }
+
+    #[test]
+    fn fallback_generator_uses_internal_route_when_external_entry_is_missing() {
+        let external = Arc::new(
+            JsonSummaryCatalogGenerator::from_json_str(r#"{"functions":{},"loops":{}}"#).unwrap(),
+        ) as Arc<dyn SummaryGenerator>;
+        let internal = Arc::new(KnasterTarskiLoopSummaryGenerator { max_iterations: 2 })
+            as Arc<dyn SummaryGenerator>;
+        let generator = FallbackSummaryGenerator::new(external, internal);
+
+        let mut cfg = Cfg::new("entry");
+        let header = cfg.add_node("header");
+        cfg.add_edge(cfg.entry(), header, Formula::True).unwrap();
+        cfg.add_edge(header, header, Formula::True).unwrap();
+        cfg.mark_exit(header).unwrap();
+        let loop_region = extract_loops(&cfg).into_iter().next().unwrap();
+
+        let summary = generator
+            .generate_loop_summary(
+                &Oracle::new(),
+                &LoopSummaryRequest {
+                    procedure: "main".to_string(),
+                    interface: SummaryInterface {
+                        parameters: Vec::new(),
+                        return_value: None,
+                        visible_memory_roots: Vec::new(),
+                    },
+                    loop_region,
+                    summary_structure: summary_structure(&cfg),
+                },
+            )
+            .unwrap();
+        assert_eq!(summary.invariant.predicate, Formula::True);
     }
 }

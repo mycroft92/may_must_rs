@@ -1,15 +1,11 @@
-//! Executable driver slices for the current milestone.
+//! Executable driver code for the current milestone.
 //!
-//! This module currently exposes two CLI-usable paths:
+//! The only CLI-active path is the rule-driven scheduler over the paper rules
+//! with module-level summary reuse for the supported interprocedural slice.
 //!
-//! - a temporary bounded path explorer for the wider single-procedure subset
-//! - a rule-driven scheduler over the paper rules with module-level summary
-//!   reuse for the supported interprocedural slice
-//!
-//! The bounded explorer handles one lowered procedure at a time, explores
-//! branch paths under a temporary `max_step` loop budget, applies normalized
-//! transfer effects, and uses the SMT oracle to decide whether embedded
-//! `may_assert` obligations are feasible.
+//! A legacy bounded explorer still remains in this file as internal
+//! scaffolding for older tests and some witness-oriented helpers, but it is no
+//! longer a supported solver path.
 //!
 //! The rule-driven slice is deliberately narrower but closer to the paper. For
 //! each assertion query it:
@@ -21,13 +17,15 @@
 //! - schedules the currently supported Figure 5-10 rules;
 //! - uses Figures 8/9/10 to create, cache, instantiate, and reuse summaries
 //!   across supported calls with scalar returns plus visible memory ports;
+//! - attaches the internal Knaster-Tarski generator by default and optionally
+//!   layers JSON-backed external summaries on top through the trait seam in
+//!   `loops.rs`;
 //! - alpha-renames summary variables before instantiating them at a call site;
 //! - replays one feasible must-side witness path plus the final SMT model for
 //!   false results.
 //!
 //! It is still not the full paper scheduler:
 //!
-//! - the path explorer still owns the temporary `max_step` loop policy
 //! - the rule scheduler still rejects procedures whose summary structure
 //!   contains loop regions
 //! - interprocedural summaries currently cover the scalar-return plus visible
@@ -35,15 +33,17 @@
 //! - pointer phis, loop invariants, and richer projection/elimination remain
 //!   future work
 //!
-//! The purpose is to keep one honest executable slice for the current broader
-//! subset while also making the local paper rules runnable end to end.
+//! The purpose is to keep one honest executable rule slice while preserving
+//! enough internal scaffolding to continue the transition toward verified loop
+//! summaries.
 //!
 //! The active CLI-visible result is a per-procedure report with explicit
 //! per-assertion truth values:
 //!
-//! - `true` means every explored reachable check of that assertion is safe
+//! - `true` means the rule engine proved the assertion safe on the supported
+//!   slice
 //! - `false` means a feasible negated obligation was found
-//! - `unknown` means the temporary bounded explorer could not decide
+//! - `unknown` means the current rule slice or its premises could not decide
 //!
 //! When an assertion is `false`, the driver also records a symbolic evidence
 //! trace showing the explored state formulas that led to the failing
@@ -56,9 +56,10 @@ use crate::analysis::llvm_adapter::{
     AdapterError, ProcedureInterface,
 };
 use crate::analysis::loops::{
-    extract_loops, summary_structure, FixedPointKind, FunctionSummaryRequest,
-    FunctionSummaryResponse, KnasterTarskiLoopSummaryGenerator, LoopAnalysisError, LoopRegion,
-    LoopSummaryRequest, LoopSummaryResponse, SummaryGenerator, SummaryInterface, SummaryStructure,
+    extract_loops, summary_structure, FallbackSummaryGenerator, FixedPointKind,
+    FunctionSummaryRequest, FunctionSummaryResponse, KnasterTarskiLoopSummaryGenerator,
+    LoopAnalysisError, LoopRegion, LoopSummaryRequest, LoopSummaryResponse, SummaryGenerator,
+    SummaryInterface, SummaryStructure, DEFAULT_KNASTER_TARSKI_MAX_ITERATIONS,
 };
 use crate::analysis::oracle::{Feasibility, Oracle, OracleError};
 use crate::analysis::rules::{self, ProcedureFrame, QueryJudgement, ReachabilityQuery, RuleError};
@@ -76,6 +77,31 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub const TRACE_TARGET: &str = "analysis_trace";
+pub const DEFAULT_RULE_KT_MAX_ITERATIONS: usize = DEFAULT_KNASTER_TARSKI_MAX_ITERATIONS;
+
+#[derive(Clone)]
+pub struct RuleDriverOptions {
+    pub knaster_tarski_max_iterations: usize,
+    pub external_summary_generator: Option<Arc<dyn SummaryGenerator>>,
+}
+
+impl RuleDriverOptions {
+    pub fn with_knaster_tarski_max_iterations(max_iterations: usize) -> Self {
+        Self {
+            knaster_tarski_max_iterations: max_iterations,
+            external_summary_generator: None,
+        }
+    }
+}
+
+impl Default for RuleDriverOptions {
+    fn default() -> Self {
+        Self {
+            knaster_tarski_max_iterations: DEFAULT_RULE_KT_MAX_ITERATIONS,
+            external_summary_generator: None,
+        }
+    }
+}
 pub const DEFAULT_MAX_STEP: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1317,6 +1343,7 @@ pub fn analyze_function_graph_rules(
     graph: &FunctionGraph,
 ) -> Result<RuleProcedureReport, DriverError> {
     let mut engine = RuleModuleEngine::new(std::slice::from_ref(graph), &BTreeSet::new())?;
+    engine.configure_summary_generator(RuleDriverOptions::default())?;
     engine.analyze_procedure(&graph.name)
 }
 
@@ -1325,6 +1352,7 @@ pub fn analyze_function_graph_rules_with_purity(
     memory_pure_functions: &BTreeSet<String>,
 ) -> Result<RuleProcedureReport, DriverError> {
     let mut engine = RuleModuleEngine::new(std::slice::from_ref(graph), memory_pure_functions)?;
+    engine.configure_summary_generator(RuleDriverOptions::default())?;
     engine.analyze_procedure(&graph.name)
 }
 
@@ -1332,7 +1360,20 @@ pub fn analyze_function_graphs_rules_with_purity(
     graphs: &[FunctionGraph],
     memory_pure_functions: &BTreeSet<String>,
 ) -> Result<Vec<RuleProcedureReport>, DriverError> {
+    analyze_function_graphs_rules_with_options(
+        graphs,
+        memory_pure_functions,
+        RuleDriverOptions::default(),
+    )
+}
+
+pub fn analyze_function_graphs_rules_with_options(
+    graphs: &[FunctionGraph],
+    memory_pure_functions: &BTreeSet<String>,
+    options: RuleDriverOptions,
+) -> Result<Vec<RuleProcedureReport>, DriverError> {
     let mut engine = RuleModuleEngine::new(graphs, memory_pure_functions)?;
+    engine.configure_summary_generator(options)?;
     engine.analyze_all()
 }
 
@@ -1341,16 +1382,34 @@ pub fn analyze_function_graphs_rules_with_purity_and_external_summaries(
     memory_pure_functions: &BTreeSet<String>,
     summary_generator: Arc<dyn SummaryGenerator>,
 ) -> Result<Vec<RuleProcedureReport>, DriverError> {
-    let mut engine = RuleModuleEngine::new(graphs, memory_pure_functions)?;
-    engine.attach_summary_generator(summary_generator)?;
-    engine.analyze_all()
+    analyze_function_graphs_rules_with_options(
+        graphs,
+        memory_pure_functions,
+        RuleDriverOptions {
+            knaster_tarski_max_iterations: DEFAULT_RULE_KT_MAX_ITERATIONS,
+            external_summary_generator: Some(summary_generator),
+        },
+    )
 }
 
 pub fn analyze_function_graphs_rules_with_purity_best_effort(
     graphs: &[FunctionGraph],
     memory_pure_functions: &BTreeSet<String>,
 ) -> Result<Vec<(String, Result<RuleProcedureReport, DriverError>)>, DriverError> {
+    analyze_function_graphs_rules_with_purity_best_effort_with_options(
+        graphs,
+        memory_pure_functions,
+        RuleDriverOptions::default(),
+    )
+}
+
+pub fn analyze_function_graphs_rules_with_purity_best_effort_with_options(
+    graphs: &[FunctionGraph],
+    memory_pure_functions: &BTreeSet<String>,
+    options: RuleDriverOptions,
+) -> Result<Vec<(String, Result<RuleProcedureReport, DriverError>)>, DriverError> {
     let mut engine = RuleModuleEngine::new(graphs, memory_pure_functions)?;
+    engine.configure_summary_generator(options)?;
     let mut reports = Vec::new();
     for procedure in engine.order.clone() {
         let report = engine.analyze_procedure(&procedure);
@@ -1364,6 +1423,7 @@ pub fn analyze_adapted_procedure_rules(
     adapted: &AdaptedProcedure,
 ) -> Result<RuleProcedureReport, DriverError> {
     let mut engine = RuleModuleEngine::from_adapted(vec![adapted.clone()])?;
+    engine.configure_summary_generator(RuleDriverOptions::default())?;
     engine.analyze_procedure(procedure)
 }
 
@@ -1373,7 +1433,10 @@ pub fn analyze_adapted_procedure_rules_with_external_summaries(
     summary_generator: Arc<dyn SummaryGenerator>,
 ) -> Result<RuleProcedureReport, DriverError> {
     let mut engine = RuleModuleEngine::from_adapted(vec![adapted.clone()])?;
-    engine.attach_summary_generator(summary_generator)?;
+    engine.configure_summary_generator(RuleDriverOptions {
+        knaster_tarski_max_iterations: DEFAULT_RULE_KT_MAX_ITERATIONS,
+        external_summary_generator: Some(summary_generator),
+    })?;
     engine.analyze_procedure(procedure)
 }
 
@@ -1477,6 +1540,22 @@ impl RuleModuleEngine {
             self.seed_external_summary_placeholders(adapted)?;
         }
         Ok(())
+    }
+
+    fn configure_summary_generator(
+        &mut self,
+        options: RuleDriverOptions,
+    ) -> Result<(), DriverError> {
+        self.loop_summary_generator.max_iterations = options.knaster_tarski_max_iterations;
+        let internal: Arc<dyn SummaryGenerator> = Arc::new(KnasterTarskiLoopSummaryGenerator {
+            max_iterations: options.knaster_tarski_max_iterations,
+        });
+        let generator = match options.external_summary_generator {
+            Some(external) => Arc::new(FallbackSummaryGenerator::new(external, internal))
+                as Arc<dyn SummaryGenerator>,
+            None => internal,
+        };
+        self.attach_summary_generator(generator)
     }
 
     fn seed_external_summary_placeholders(

@@ -7,8 +7,7 @@ LLVM bitcode
   -> llvm_wrap
   -> program_graph::generate_program_graph
   -> optional DOT dump
-  -> optional driver::analyze_function_graph_simple
-  -> optional driver::analyze_function_graphs_rules_with_purity_best_effort
+  -> driver::analyze_function_graphs_rules_with_purity_best_effort_with_options
 ```
 
 ## Implemented Rule Flow
@@ -47,17 +46,12 @@ Vec<FunctionGraph>
   - `Assume`
   - `Obligation`
   - `Call`
-- `driver.rs` currently offers two executable slices:
-  - a bounded path explorer that checks obligations against the current path
-    formula
-  - an interprocedural rule scheduler that rewrites each assertion into a
-    synthetic violation-exit query and runs the currently supported Figure
-    5-10 slice over it
-- repeated loop traversals are cut off by the temporary per-edge `max_step`
-  budget in the bounded slice of `driver.rs`
+- `driver.rs` currently offers one CLI-active interprocedural rule scheduler
+  that rewrites each assertion into a synthetic violation-exit query and runs
+  the currently supported Figure 5-10 slice over it
 - impure calls havoc the currently tracked integer-array memory regions
 - false assertions already carry a symbolic driver-collected evidence trace,
-  and `--rule-check` now replays one local rule-driven witness plus the final
+  and the default rule-check path now replays one local rule-driven witness plus the final
   SMT model for false results
 
 ## Current Rule API
@@ -101,15 +95,6 @@ Two rule-level checks deserve explicit mention:
 `driver.rs` currently implements a smaller, executable slice than the paper
 driver:
 
-- bounded slice:
-  - it supports one procedure at a time
-  - it bounds loop exploration by per-edge `max_step`
-  - it supports local integer-array memory
-  - it treats calls conservatively: unconstrained returns plus memory havoc
-    unless the callee is inferred memory-pure
-  - it uses `transfer.rs` plus SMT feasibility checks to explore concrete
-    branch paths and report explicit per-assertion `true` / `false` /
-    `unknown` outcomes
 - rule-driven slice:
   - it analyzes one module at a time so summaries can be shared across calls
   - it currently requires an acyclic summary structure
@@ -128,19 +113,20 @@ driver:
     memory ports
   - it already extracts loop regions and the condensation DAG that future
     invariant generation will consume
-  - it can already talk to a trait-based external or internal summary
-    generator, with a Tokio/JSON adapter available in `loops.rs`
+  - it now attaches the internal Knaster-Tarski generator by default and can
+    optionally layer JSON-backed external summaries on top through the trait
+    seam in `loops.rs`
   - it also replays one feasible violating path through that query CFG and
     prints the final SMT model
 
 That is enough to run straightline and branchy rule-driven unit tests plus the
-broader bounded-loop temporary checker, but loop invariants and richer summary
-interfaces still remain for the future driver.
+remaining legacy bounded-executor regression tests, but loop invariants and
+richer summary interfaces still remain for the future driver.
 
 ## Next Wiring Steps
 
 1. Add oracle-backed verification/adoption for loop invariant candidates over the extracted loop regions.
 2. Connect lowered memory/call effects to richer `β` / `θ` generation and projection.
-3. Wire the existing trait-based generator seam into an opt-in CLI path for
-   future LLM or imported summaries/invariants.
+3. Layer future LLM or imported summaries/invariants onto the existing
+   external-summary CLI seam.
 4. Replace temporary `max_step` handling with loop summaries / invariants.

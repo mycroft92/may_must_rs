@@ -2,16 +2,14 @@
 
 ## Current Phase
 
-The active codebase now has both a temporary bounded explorer and an
-interprocedural paper-rule driver:
+The active codebase now has one CLI-active interprocedural paper-rule driver:
 
 - implemented and CLI-active:
   - LLVM bitcode parsing
   - instruction-level `FunctionGraph` construction
   - DOT dumping for those graphs
   - C fixture compilation under `tests/flow/`
-  - `--simple-check` for the current bounded single-procedure checker
-  - `--rule-check` for the current acyclic rule-driven checker
+  - default rule-check execution from the CLI
   - temporary `max_step` loop bounding in `analysis::driver`
   - query-specific assertion lowering plus Figure 5-10 scheduling in
     `analysis::driver`
@@ -59,12 +57,10 @@ raw solver layer               -> src/smt/solver.rs
 - `summaries.rs` stores accepted summary facts and repository/provider reads.
 - `loops.rs` stores loop regions, the condensation DAG, and the trait-based
   generation boundary for internal or external summary producers.
-- `driver.rs` now contains two executable slices:
-  - the broader temporary bounded path explorer
-  - the narrower local rule scheduler for acyclic visible-memory procedures
-- that bounded driver now produces an explicit per-assertion result and, for
-  failing assertions, a symbolic evidence trace built from the explored
-  state/edge formulas.
+- `driver.rs` now contains:
+  - the CLI-active rule scheduler for acyclic visible-memory procedures
+  - a legacy bounded executor that remains only as internal scaffolding until
+    loop summaries fully replace it
 - the rule-driven slice rewrites each assertion into a synthetic violation-exit
   query and computes scalar `β` / `θ` candidates from normalized `Assign` /
   `Assume` effects plus `Gamma_e`.
@@ -75,13 +71,13 @@ raw solver layer               -> src/smt/solver.rs
   function, records discovered `must` / `¬may` summaries, and instantiates
   them at supported call sites through alpha-renamed interface substitution
   over scalar arguments, returns, and visible memory ports.
+- that same rule-driven slice now always attaches an internal
+  Knaster-Tarski-style summary generator; external JSON-backed summary
+  catalogs are optional and fall back to that internal route.
 - that same rule-driven slice replays one feasible path through the assertion
   query CFG and attaches the final SMT model for the violating state.
 - `loops.rs` exposes loop regions and an acyclic summary structure so loop
   invariants can later slot into the driver without re-deriving CFG structure.
-- the temporary loop policy is `APPROX_HEAVY`: each CFG edge may be visited at
-  most `max_step` times on one explored path; budget exhaustion yields
-  `Unknown`.
 - `state.rs` also carries current pointer bindings and per-region memory arrays
   for the active executable slice.
 - `transfer.rs` consumes normalized effects from `llvm_adapter.rs`; it does not

@@ -2,8 +2,8 @@ Experimental LLVM may/must analysis work. MIT Licensed.
 
 ## Current Status
 
-The repository now has two executable driver slices: a broader temporary
-bounded checker and a narrower paper-shaped interprocedural rule driver.
+The repository now has one CLI-active analysis path: the paper-shaped
+interprocedural rule driver.
 
 Implemented and CLI-active:
 
@@ -11,8 +11,7 @@ Implemented and CLI-active:
 - instruction-level `FunctionGraph` construction
 - DOT graph dumping
 - fixture compilation under `tests/flow/`
-- `--simple-check` for the current bounded single-procedure checker
-- `--rule-check` for the current acyclic summary-driven rule checker
+- default rule-check execution from the CLI
 - paper formula / CFG / state / transfer / oracle / rules / summaries modules
   through that rule-driven slice
 - integer-array memory modeling for `alloca` / `load` / `store` / `gep`
@@ -23,6 +22,8 @@ Implemented and CLI-active:
 - repository/provider boundary for accepted summaries and loop invariants
 - trait-based summary-generator boundary for internal algorithms or external
   JSON-backed modules
+- internal Knaster-Tarski summary generation by default, with configurable
+  iteration bound
 - alpha-renaming and call-site substitution for summary instantiation
 - SCC-based loop extraction plus acyclic summary-structure condensation
 
@@ -31,7 +32,6 @@ Implemented but not wired:
 - assertion-to-formula translation
 - loop invariant verification/adoption in `analysis::driver`
 - loop summaries in `analysis::driver`
-- CLI wiring for opt-in external summary/invariant candidate generators
 
 Planned:
 
@@ -58,31 +58,25 @@ Run the CLI on one bitcode file:
 cargo run --bin main -- tests/out/straight_line_assert.bc
 ```
 
-Run the current bounded checker:
+Run the default rule-driven checker:
 
 ```sh
-cargo run --bin main -- --simple-check --no-dot tests/out/multi_exit.bc
+cargo run --bin main -- --no-dot tests/out/multi_exit.bc
 ```
 
-Run the checker with the temporary loop bound set explicitly:
+Run the checker with an explicit Knaster-Tarski iteration limit:
 
 ```sh
-cargo run --bin main -- --simple-check --max-step 2 --no-dot tests/out/multi_exit.bc
+cargo run --bin main -- --kt-max-iterations 8 --no-dot tests/out/multi_exit.bc
 ```
 
-Run the checker with per-step predicate tracing as debug logs:
+Run the checker with external summaries loaded from a JSON catalog:
 
 ```sh
-cargo run --bin main -- --trace-predicates --max-step 2 --no-dot tests/out/multi_exit.bc
+cargo run --bin main -- --external-summaries summaries.json --no-dot <bitcode-file>
 ```
 
-Run the current rule-driven checker:
-
-```sh
-cargo run --bin main -- --rule-check --no-dot <bitcode-file>
-```
-
-That flag is CLI-active today. It currently supports acyclic procedures with
+The CLI-active rule slice currently supports acyclic procedures with
 branching, summary-driven calls over scalar/boolean actuals plus visible
 integer-array memory ports, and the current integer-array memory slice
 (`alloca` / `load` / `store` / `gep`) with conservative impure-call memory
@@ -104,55 +98,14 @@ cargo fmt
 
 ## Current CLI Behavior
 
-The binary currently stops at LLVM graph generation. It:
+The binary:
 
 - parses one `.bc` file
 - builds per-function `FunctionGraph`s
 - optionally dumps DOT output under `graph_dot/<input-stem>/`
 - prints a small per-function summary
-
-With `--simple-check`, the CLI also runs the current bounded single-procedure
-checker over each function and prints one clean summary block per procedure
-after the run.
-
-Those per-procedure summaries include:
-
-- final judgement
-- active `max_step`
-- explored path count
-- pruned path count
-- bounded path count
-- checked obligation count
-- feasible obligation count
-- one explicit `true` / `false` / `unknown` result per lowered assertion
-
-If an assertion is reported `false`, the summary also prints a symbolic
-evidence trace showing the node/edge formulas and the failing obligation query
-that made the negated assertion feasible. This remains a driver-collected
-symbolic trace rather than a reconstructed paper-rule witness.
-
-With `--trace-predicates`, the checker emits debug logs on the dedicated
-`analysis_trace` target for generated formulas after each ordinary node/edge
-step. Repeated loop traversals are summarized once per loop edge visit instead
-of dumping every repeated internal step. Those debug lines also show the
-current per-region memory arrays after each step.
-
-That checker is intentionally limited:
-
-- loops use a temporary per-edge `max_step` cutoff and return `Unknown` when a
-  path is cut off by that budget
-- call results are conservative and summary-free: scalar returns stay
-  unconstrained, and memory is havoced unless the callee is inferred to be
-  memory-pure
-- memory is modeled only as integer arrays; floating-point memory and pointer
-  phis are still outside the active subset
-- some C loop fixtures still lower to memory-heavy or intrinsic forms that are
-  outside the current transfer subset, so bounded-loop behavior is covered most
-  directly by the `analysis::driver` unit tests today
-- it explores paths directly instead of scheduling the full paper rule engine
-
-With `--rule-check`, the CLI runs the current acyclic Figure 5-10 scheduler
-over one assertion query at a time and prints one summary block per procedure.
+- always runs the current acyclic Figure 5-10 scheduler over one assertion
+  query at a time and prints one summary block per procedure
 
 That rule-driven checker is intentionally narrower:
 
@@ -172,6 +125,10 @@ That rule-driven checker is intentionally narrower:
 - it still requires an acyclic summary structure; loops are extracted and kept
   as explicit regions, but remain unsupported there until loop summaries /
   invariants exist
+- by default it seeds loop/function summary generation through the internal
+  Knaster-Tarski generator; `--external-summaries` switches on JSON-backed
+  external candidates while still falling back to that internal route when a
+  catalog entry is missing
 - it schedules the currently supported Figure 5/6/7 local rules plus the
   Figure 8/9/10 summary/call rules for the current interprocedural slice
 - those witnesses currently exist only for that same acyclic interprocedural
@@ -243,11 +200,11 @@ Still unwired:
 - loop invariants / loop summaries
 - external file-backed or LLM-backed candidate providers
 - trait-backed generators already exist in `loops.rs`; the remaining work is
-  CLI wiring and verification/adoption policy around them
+  verification/adoption policy and richer candidate producers around them
 
 ## Next Milestone
 
 1. Add oracle-backed loop invariant verification/adoption over the new loop regions and summary structure.
 2. Broaden the current summary-driven call slice to richer interfaces, memory effects, and projections.
-3. Wire the trait-based external generator seam into an opt-in CLI path for loop/function summary candidates while keeping the default non-LLM route unchanged.
-4. Add loop summaries / invariants to `--rule-check` and retire the temporary bounded loop explorer.
+3. Layer LLM-backed or other generated candidates onto the existing external-summary CLI seam while keeping the default non-LLM route unchanged.
+4. Add loop summaries / invariants to the default rule-check path and retire the remaining legacy bounded executor code.

@@ -131,8 +131,7 @@ plan above:
 
 - CLI-active code exposes:
   - raw LLVM graph generation and DOT dumping
-  - `--simple-check` for the broader bounded executor
-  - `--rule-check` for the current acyclic interprocedural Figure 5-10 slice
+  - the default acyclic interprocedural Figure 5-10 rule-check path
 - `src/analysis/rules.rs` is implemented and scheduled by `driver.rs`.
 - `src/analysis/summaries.rs` stores accepted `¬may ⇒ P`, `must ⇒ P`, and
   loop-invariant facts consumed by the driver.
@@ -140,7 +139,8 @@ plan above:
   trait-based summary-generator seam, including a Tokio/JSON adapter for
   external modules.
 - `src/analysis/driver.rs` now supports module-level work queues, summary reuse
-  across supported calls, and default witnesses for false rule-check results.
+  across supported calls, default witnesses for false rule-check results, and
+  internal Knaster-Tarski summary generation by default.
 - cyclic procedures remain unsupported on the rule-driven path until loop
   summary verification is wired.
 - the curated fixture corpus lives under `tests/flow/`.
