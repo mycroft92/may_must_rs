@@ -2520,6 +2520,37 @@ mod tests {
     }
 
     #[test]
+    fn rule_driver_tracks_memory_across_branching_paths() {
+        let report = analyze_first_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define void @main(i1 %cond) {
+                entry:
+                    %ptr = alloca i32
+                    br i1 %cond, label %then, label %else
+                then:
+                    store i32 1, ptr %ptr
+                    br label %merge
+                else:
+                    store i32 2, ptr %ptr
+                    br label %merge
+                merge:
+                    %expected = phi i32 [1, %then], [2, %else]
+                    %value = load i32, ptr %ptr
+                    %ok = icmp eq i32 %value, %expected
+                    call void @may_assert(i1 %ok)
+                    ret void
+                }
+            "#,
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::True);
+    }
+
+    #[test]
     fn rule_driver_finds_an_unsafe_branch_assertion() {
         let report = analyze_first_rules(
             r#"
