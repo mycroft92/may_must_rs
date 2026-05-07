@@ -232,6 +232,94 @@ impl ProcedureFrame {
     fn omega_or_empty(&self, node: CfgNodeId) -> Formula {
         self.omega.get(&node).cloned().unwrap_or(Formula::False)
     }
+
+    /// Renders one node's current `Π_n` and `Ω_n` entry for focused
+    /// driver-side tracing.
+    pub fn debug_node_snapshot(&self, node: CfgNodeId) -> Option<String> {
+        let node_data = self.cfg.node(node)?;
+        let partition = self
+            .pi
+            .get(&node)
+            .map(|regions| format_formula_list(regions))
+            .unwrap_or_else(|| "[]".to_string());
+        Some(format!(
+            "node n{} {}\n  Pi: {}\n  Omega: {}",
+            node.0,
+            node_data.label,
+            partition,
+            self.omega_or_empty(node)
+        ))
+    }
+
+    /// Renders one edge's current blocked-pair set `N_e` for focused
+    /// driver-side tracing.
+    pub fn debug_edge_snapshot(&self, edge: CfgEdgeId) -> Option<String> {
+        let edge_data = self.cfg.edge(edge)?;
+        let source = self
+            .cfg
+            .node(edge_data.source)
+            .map(|node| node.label.as_str())
+            .unwrap_or("<unknown>");
+        let target = self
+            .cfg
+            .node(edge_data.target)
+            .map(|node| node.label.as_str())
+            .unwrap_or("<unknown>");
+        let mut lines = vec![format!("edge e{} {} -> {}", edge.0, source, target)];
+        let pairs = self.ne.get(&edge).map(Vec::as_slice).unwrap_or(&[]);
+        if pairs.is_empty() {
+            lines.push("  N: []".to_string());
+        } else {
+            for pair in pairs {
+                lines.push(format!(
+                    "  N: ({} => {})",
+                    pair.pre_region, pair.post_region
+                ));
+            }
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// Renders the current `Π_n`, `Ω_n`, and non-empty `N_e` entries in a
+    /// compact node/edge grouped form for driver-side debugging.
+    pub fn debug_snapshot(&self) -> String {
+        let mut lines = vec![format!(
+            "query {}: {} ?=> {}",
+            self.query.procedure, self.query.precondition, self.query.postcondition
+        )];
+        for (node_id, node) in self.cfg.nodes() {
+            lines.push(
+                self.debug_node_snapshot(*node_id)
+                    .unwrap_or_else(|| format!("node n{} {}", node_id.0, node.label)),
+            );
+        }
+        for (edge_id, edge) in self.cfg.edges() {
+            let pairs = self.ne.get(edge_id).map(Vec::as_slice).unwrap_or(&[]);
+            if pairs.is_empty() {
+                continue;
+            }
+            let _ = edge;
+            if let Some(snapshot) = self.debug_edge_snapshot(*edge_id) {
+                lines.push(snapshot);
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+fn format_formula_list(formulas: &[Formula]) -> String {
+    if formulas.is_empty() {
+        "[]".to_string()
+    } else {
+        format!(
+            "[{}]",
+            formulas
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -1397,5 +1485,31 @@ mod tests {
         assert_eq!(may.postcondition, Formula::bool_var("b"));
         assert_eq!(must.precondition, Formula::bool_var("omega"));
         assert_eq!(must.postcondition, Formula::True);
+    }
+
+    #[test]
+    fn debug_snapshot_lists_node_and_edge_predicates() {
+        let mut frame = test_cfg();
+        figure5::INIT_PI_NE(&mut frame).unwrap();
+        figure6::INIT_OMEGA(&mut frame).unwrap();
+        figure6::MUST_POST(&mut frame, CfgEdgeId(0), Formula::bool_var("reachable")).unwrap();
+        frame
+            .add_notmay_pair(
+                CfgEdgeId(1),
+                NotMayPair {
+                    pre_region: Formula::True,
+                    post_region: Formula::bool_var("post"),
+                },
+            )
+            .unwrap();
+
+        let snapshot = frame.debug_snapshot();
+        assert!(snapshot.contains("query P: pre ?=> post"));
+        assert!(snapshot.contains("node n0 entry"));
+        assert!(snapshot.contains("Pi: [true]"));
+        assert!(snapshot.contains("Omega: pre"));
+        assert!(snapshot.contains("Omega: reachable"));
+        assert!(snapshot.contains("edge e1 mid -> exit"));
+        assert!(snapshot.contains("N: (true => post)"));
     }
 }

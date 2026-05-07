@@ -76,6 +76,13 @@ Run the checker with external summaries loaded from a JSON catalog:
 cargo run --bin main -- --external-summaries summaries.json --no-dot <bitcode-file>
 ```
 
+Print the rule-engine predicate state after initialization and each successful
+rule application:
+
+```sh
+cargo run --bin main -- --print-states --no-dot tests/out/straight_line_assert.bc
+```
+
 The CLI-active rule slice currently supports acyclic procedures with
 branching, summary-driven calls over scalar/boolean actuals plus visible
 integer-array memory ports, and the current integer-array memory slice
@@ -135,6 +142,9 @@ That rule-driven checker is intentionally narrower:
   catalog entry is missing
 - it schedules the currently supported Figure 5/6/7 local rules plus the
   Figure 8/9/10 summary/call rules for the current interprocedural slice
+- `--print-states` enables a debug trace of the rule-engine predicates
+  (`Π_n`, `Ω_n`, and non-empty `N_e`) after initialization, after each
+  successful rule application, and at fixpoint/final decisions
 - those witnesses currently exist only for that same acyclic interprocedural
   slice; loops, pointer phis, and richer memory shapes still do not produce
   rule-check results today

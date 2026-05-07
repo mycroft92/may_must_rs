@@ -502,6 +502,35 @@ struct RuleSearchStats {
     unknown_premises: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuleTraceFocus {
+    node: Option<CfgNodeId>,
+    edge: Option<CfgEdgeId>,
+}
+
+impl RuleTraceFocus {
+    fn node(node: CfgNodeId) -> Self {
+        Self {
+            node: Some(node),
+            edge: None,
+        }
+    }
+
+    fn edge(edge: CfgEdgeId) -> Self {
+        Self {
+            node: None,
+            edge: Some(edge),
+        }
+    }
+
+    fn node_and_edge(node: CfgNodeId, edge: CfgEdgeId) -> Self {
+        Self {
+            node: Some(node),
+            edge: Some(edge),
+        }
+    }
+}
+
 impl RuleRewriteState {
     fn from_interface(interface: &ProcedureInterface) -> Self {
         let visible_memory_roots = interface
@@ -1691,10 +1720,12 @@ impl RuleModuleEngine {
         let mut frame = ProcedureFrame::new(query_procedure.cfg.clone(), query.clone());
         rules::figure5::INIT_PI_NE(&mut frame)?;
         rules::figure6::INIT_OMEGA(&mut frame)?;
+        debug_rule_frame("after INIT-PI-NE / INIT-OMEGA", &frame);
 
         let mut stats = RuleSearchStats::default();
         loop {
             if rules::figure6::BUGFOUND(&frame, &self.oracle)? == QueryJudgement::Yes {
+                debug_rule_frame("before BUGFOUND", &frame);
                 self.record_summary_for_judgement(query_procedure, &frame, QueryJudgement::Yes)?;
                 self.completed_queries
                     .push((query.clone(), QueryJudgement::Yes));
@@ -1705,6 +1736,7 @@ impl RuleModuleEngine {
                 });
             }
             if rules::figure5::VERIFIED(&frame, &self.oracle)? == QueryJudgement::No {
+                debug_rule_frame("before VERIFIED", &frame);
                 self.record_summary_for_judgement(query_procedure, &frame, QueryJudgement::No)?;
                 self.completed_queries
                     .push((query.clone(), QueryJudgement::No));
@@ -1726,6 +1758,7 @@ impl RuleModuleEngine {
             changed |= self.apply_call_subquery_round(&frame, query_procedure)?;
 
             if !changed {
+                debug_rule_frame("fixpoint", &frame);
                 break;
             }
         }
@@ -1763,16 +1796,18 @@ impl RuleModuleEngine {
                 .cfg()
                 .edge(edge_id)
                 .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+            let edge_source = edge.source;
+            let edge_target = edge.target;
             let source_regions = frame
-                .partition(edge.source)
+                .partition(edge_source)
                 .ok_or(DriverError::Rule(RuleError::MissingPartition {
-                    node: edge.source,
+                    node: edge_source,
                 }))?
                 .to_vec();
             let target_regions = frame
-                .partition(edge.target)
+                .partition(edge_target)
                 .ok_or(DriverError::Rule(RuleError::MissingPartition {
-                    node: edge.target,
+                    node: edge_target,
                 }))?
                 .to_vec();
             for summary in self.summaries.must_candidates(&call.callee) {
@@ -1787,17 +1822,23 @@ impl RuleModuleEngine {
                     for phi_1 in &source_regions {
                         for phi_2 in &target_regions {
                             let theta = instantiated.postcondition.clone();
-                            changed |= attempt_mutating_rule(frame, stats, |frame| {
-                                rules::figure10::MUST_POST_USESUMMARY(
-                                    frame,
-                                    edge_id,
-                                    phi_1,
-                                    phi_2,
-                                    &instantiated,
-                                    theta.clone(),
-                                    &self.oracle,
-                                )
-                            })?;
+                            changed |= attempt_mutating_rule(
+                                frame,
+                                stats,
+                                "FIG10 MUST-POST-USESUMMARY",
+                                RuleTraceFocus::node(edge_target),
+                                |frame| {
+                                    rules::figure10::MUST_POST_USESUMMARY(
+                                        frame,
+                                        edge_id,
+                                        phi_1,
+                                        phi_2,
+                                        &instantiated,
+                                        theta.clone(),
+                                        &self.oracle,
+                                    )
+                                },
+                            )?;
                         }
                     }
                 }
@@ -1814,17 +1855,23 @@ impl RuleModuleEngine {
                     for phi_1 in &source_regions {
                         for phi_2 in &target_regions {
                             let theta = instantiated.precondition.clone();
-                            changed |= attempt_mutating_rule(frame, stats, |frame| {
-                                rules::figure10::NOTMAY_PRE_USESUMMARY(
-                                    frame,
-                                    edge_id,
-                                    phi_1,
-                                    phi_2,
-                                    &instantiated,
-                                    theta.clone(),
-                                    &self.oracle,
-                                )
-                            })?;
+                            changed |= attempt_mutating_rule(
+                                frame,
+                                stats,
+                                "FIG10 NOTMAY-PRE-USESUMMARY",
+                                RuleTraceFocus::node_and_edge(edge_source, edge_id),
+                                |frame| {
+                                    rules::figure10::NOTMAY_PRE_USESUMMARY(
+                                        frame,
+                                        edge_id,
+                                        phi_1,
+                                        phi_2,
+                                        &instantiated,
+                                        theta.clone(),
+                                        &self.oracle,
+                                    )
+                                },
+                            )?;
                         }
                     }
                 }
@@ -2968,28 +3015,43 @@ fn apply_must_post_round(
             .cfg()
             .edge(edge_id)
             .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+        let edge_source = edge.source;
+        let edge_target = edge.target;
         let source_regions = frame
-            .partition(edge.source)
+            .partition(edge_source)
             .ok_or(DriverError::Rule(RuleError::MissingPartition {
-                node: edge.source,
+                node: edge_source,
             }))?
             .to_vec();
         let target_regions = frame
-            .partition(edge.target)
+            .partition(edge_target)
             .ok_or(DriverError::Rule(RuleError::MissingPartition {
-                node: edge.target,
+                node: edge_target,
             }))?
             .to_vec();
-        let omega_source = frame.omega(edge.source).cloned().unwrap_or(Formula::False);
+        let omega_source = frame.omega(edge_source).cloned().unwrap_or(Formula::False);
         let theta = Formula::and(
             omega_source,
             forward_step_formula(query_procedure, edge_id)?,
         );
         for phi_1 in &source_regions {
             for phi_2 in &target_regions {
-                changed |= attempt_mutating_rule(frame, stats, |frame| {
-                    rules::figure7::MUST_POST(frame, edge_id, phi_1, phi_2, theta.clone(), oracle)
-                })?;
+                changed |= attempt_mutating_rule(
+                    frame,
+                    stats,
+                    "FIG7 MUST-POST",
+                    RuleTraceFocus::node(edge_target),
+                    |frame| {
+                        rules::figure7::MUST_POST(
+                            frame,
+                            edge_id,
+                            phi_1,
+                            phi_2,
+                            theta.clone(),
+                            oracle,
+                        )
+                    },
+                )?;
             }
         }
     }
@@ -3012,24 +3074,39 @@ fn apply_notmay_pre_round(
             .cfg()
             .edge(edge_id)
             .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+        let edge_source = edge.source;
+        let edge_target = edge.target;
         let source_regions = frame
-            .partition(edge.source)
+            .partition(edge_source)
             .ok_or(DriverError::Rule(RuleError::MissingPartition {
-                node: edge.source,
+                node: edge_source,
             }))?
             .to_vec();
         let target_regions = frame
-            .partition(edge.target)
+            .partition(edge_target)
             .ok_or(DriverError::Rule(RuleError::MissingPartition {
-                node: edge.target,
+                node: edge_target,
             }))?
             .to_vec();
         for phi_1 in &source_regions {
             for phi_2 in &target_regions {
                 let beta = backward_pre_candidate(query_procedure, edge_id, phi_2)?;
-                changed |= attempt_mutating_rule(frame, stats, |frame| {
-                    rules::figure7::NOTMAY_PRE(frame, edge_id, phi_1, phi_2, beta.clone(), oracle)
-                })?;
+                changed |= attempt_mutating_rule(
+                    frame,
+                    stats,
+                    "FIG7 NOTMAY-PRE",
+                    RuleTraceFocus::node_and_edge(edge_source, edge_id),
+                    |frame| {
+                        rules::figure7::NOTMAY_PRE(
+                            frame,
+                            edge_id,
+                            phi_1,
+                            phi_2,
+                            beta.clone(),
+                            oracle,
+                        )
+                    },
+                )?;
             }
         }
     }
@@ -3063,28 +3140,40 @@ fn apply_notmay_closure_round(
         let blocked_pairs = frame.notmay_pairs(edge_id).unwrap_or(&[]).to_vec();
         for pair in &blocked_pairs {
             for phi_prime_1 in &source_regions {
-                changed |= attempt_mutating_rule(frame, stats, |frame| {
-                    rules::figure5::IMPL_LEFT(
-                        frame,
-                        edge_id,
-                        &pair.pre_region,
-                        &pair.post_region,
-                        phi_prime_1,
-                        oracle,
-                    )
-                })?;
+                changed |= attempt_mutating_rule(
+                    frame,
+                    stats,
+                    "FIG5 IMPL-LEFT",
+                    RuleTraceFocus::edge(edge_id),
+                    |frame| {
+                        rules::figure5::IMPL_LEFT(
+                            frame,
+                            edge_id,
+                            &pair.pre_region,
+                            &pair.post_region,
+                            phi_prime_1,
+                            oracle,
+                        )
+                    },
+                )?;
             }
             for phi_prime_2 in &target_regions {
-                changed |= attempt_mutating_rule(frame, stats, |frame| {
-                    rules::figure5::IMPL_RIGHT(
-                        frame,
-                        edge_id,
-                        &pair.pre_region,
-                        &pair.post_region,
-                        phi_prime_2,
-                        oracle,
-                    )
-                })?;
+                changed |= attempt_mutating_rule(
+                    frame,
+                    stats,
+                    "FIG5 IMPL-RIGHT",
+                    RuleTraceFocus::edge(edge_id),
+                    |frame| {
+                        rules::figure5::IMPL_RIGHT(
+                            frame,
+                            edge_id,
+                            &pair.pre_region,
+                            &pair.post_region,
+                            phi_prime_2,
+                            oracle,
+                        )
+                    },
+                )?;
             }
         }
     }
@@ -3094,6 +3183,8 @@ fn apply_notmay_closure_round(
 fn attempt_mutating_rule<F>(
     frame: &mut ProcedureFrame,
     stats: &mut RuleSearchStats,
+    rule_name: &'static str,
+    focus: RuleTraceFocus,
     apply_rule: F,
 ) -> Result<bool, DriverError>
 where
@@ -3105,6 +3196,7 @@ where
             let changed = *frame != before;
             if changed {
                 stats.applications += 1;
+                debug_rule_application(rule_name, frame, focus);
             }
             Ok(changed)
         }
@@ -3117,6 +3209,40 @@ where
         | Err(RuleError::MissingNotMayPair { .. }) => Ok(false),
         Err(error) => Err(DriverError::Rule(error)),
     }
+}
+
+fn debug_rule_application(rule_name: &str, frame: &ProcedureFrame, focus: RuleTraceFocus) {
+    if !log_enabled!(target: TRACE_TARGET, Level::Debug) {
+        return;
+    }
+    let mut lines = vec![rule_name.to_string()];
+    lines.push(format!(
+        "query {}: {} ?=> {}",
+        frame.query().procedure,
+        frame.query().precondition,
+        frame.query().postcondition
+    ));
+    if let Some(node) = focus.node {
+        if let Some(snapshot) = frame.debug_node_snapshot(node) {
+            lines.push(snapshot);
+        }
+    }
+    if let Some(edge) = focus.edge {
+        if let Some(snapshot) = frame.debug_edge_snapshot(edge) {
+            lines.push(snapshot);
+        }
+    }
+    if focus.node.is_none() && focus.edge.is_none() {
+        lines.push(frame.debug_snapshot());
+    }
+    debug!(target: TRACE_TARGET, "{}", lines.join("\n"));
+}
+
+fn debug_rule_frame(stage: &str, frame: &ProcedureFrame) {
+    if !log_enabled!(target: TRACE_TARGET, Level::Debug) {
+        return;
+    }
+    debug!(target: TRACE_TARGET, "{stage}\n{}", frame.debug_snapshot());
 }
 
 fn forward_step_formula(

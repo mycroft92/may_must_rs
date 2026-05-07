@@ -10,7 +10,9 @@
 //! The CLI remains intentionally honest about phase boundaries: loop regions
 //! are extracted and reported into the rule pipeline, but verified loop
 //! invariants are not active yet, so cyclic procedures still return
-//! `Unknown`/unsupported on the rule-driven path.
+//! `Unknown`/unsupported on the rule-driven path. An opt-in trace switch can
+//! also dump the rule-engine predicate state (`Π_n`, `Ω_n`, and `N_e`) after
+//! initialization and each successful rule application.
 
 mod analysis;
 mod assertions;
@@ -35,6 +37,7 @@ fn main() {
     let matches = command!()
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
+        .arg(arg!(--"print-states" "Print rule-engine predicate states after each successful step"))
         .arg(
             arg!(--"external-summaries" <SUMMARY_JSON> "Load external loop/function summaries from a JSON catalog")
                 .required(false)
@@ -50,9 +53,10 @@ fn main() {
 
     let input = matches.get_one::<String>("INPUT").unwrap();
     let dump_dot = !matches.get_flag("no-dot");
+    let print_states = matches.get_flag("print-states");
     let external_summaries = matches.get_one::<String>("external-summaries").cloned();
     let kt_max_iterations = *matches.get_one::<usize>("kt-max-iterations").unwrap();
-    init_logging();
+    init_logging(print_states);
     initialize_target();
 
     let context = Context::new();
@@ -69,8 +73,13 @@ fn main() {
     );
 }
 
-fn init_logging() {
-    Builder::from_env(Env::default().default_filter_or("info")).init();
+fn init_logging(print_states: bool) {
+    let default_filter = if print_states {
+        "info,analysis_trace=debug"
+    } else {
+        "info"
+    };
+    Builder::from_env(Env::default().default_filter_or(default_filter)).init();
 }
 
 fn handle(

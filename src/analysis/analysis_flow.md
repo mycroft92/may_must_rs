@@ -53,6 +53,9 @@ Vec<FunctionGraph>
 - `driver.rs` currently offers one CLI-active interprocedural rule scheduler
   that rewrites each assertion into a synthetic violation-exit query and runs
   the currently supported Figure 5-10 slice over it
+- `--print-states` on the CLI enables debug snapshots of `Π_n`, `Ω_n`, and
+  non-empty `N_e` after rule-frame initialization and each successful rule
+  application
 - impure calls havoc the currently tracked integer-array memory regions
 - false assertions already carry a symbolic driver-collected evidence trace,
   and the default rule-check path now replays one local rule-driven witness plus the final
