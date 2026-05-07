@@ -25,6 +25,7 @@ pub mod llvm_adapter;
 pub mod loops;
 pub mod oracle;
 pub mod rules;
+pub mod simplify;
 pub mod state;
 pub mod summaries;
 pub mod transfer;

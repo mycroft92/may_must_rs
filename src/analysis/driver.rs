@@ -63,6 +63,7 @@ use crate::analysis::loops::{
 };
 use crate::analysis::oracle::{Feasibility, Oracle, OracleError};
 use crate::analysis::rules::{self, ProcedureFrame, QueryJudgement, ReachabilityQuery, RuleError};
+use crate::analysis::simplify::{simplify_formula, simplify_memory, simplify_term};
 use crate::analysis::state::{NodeState, PointerValue};
 use crate::analysis::summaries::{MustSummary, NotMaySummary, SummaryProvider, SummaryRepository};
 use crate::analysis::transfer::{
@@ -385,6 +386,8 @@ pub enum DriverError {
         "rule driver currently requires an acyclic CFG until loop summaries/invariants are implemented"
     )]
     CyclicRuleProcedure,
+    #[error("rule query CFG is missing its normalized exit node")]
+    MissingRuleExit,
     #[error(
         "rule driver returned Yes for assertion {assertion_id} but could not replay a witness"
     )]
@@ -648,16 +651,16 @@ impl RuleRewriteState {
     fn load_term(&mut self, source: &str) -> Term {
         let pointer = self.resolve_pointer(source);
         let memory = self.current_memory(pointer.region()).clone();
-        Term::select(memory, pointer.offset().clone())
+        simplify_term(&Term::select(memory, pointer.offset().clone()))
     }
 
     fn store_to_pointer(&mut self, target: &str, value: Term) {
         let pointer = self.resolve_pointer(target);
-        let next_memory = Memory::store(
+        let next_memory = simplify_memory(&Memory::store(
             self.current_memory(pointer.region()).clone(),
             pointer.offset().clone(),
             value,
-        );
+        ));
         self.memory_regions
             .insert(pointer.region().to_string(), next_memory);
     }
@@ -1886,6 +1889,8 @@ impl RuleModuleEngine {
         query_procedure: &AssertionQueryProcedure,
     ) -> Result<bool, DriverError> {
         let before = self.summary_counts();
+        let mut backward_demands = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
         for (edge_id, call) in call_edges(query_procedure) {
             let Some(callee) = self.procedures.get(&call.callee).cloned() else {
                 continue;
@@ -1908,10 +1913,20 @@ impl RuleModuleEngine {
                 .to_vec();
             let omega_source = frame.omega(edge.source).cloned().unwrap_or(Formula::False);
             let omega_target = frame.omega(edge.target).cloned().unwrap_or(Formula::False);
+            let call_postcondition = backward_path_demand(
+                query_procedure,
+                &frame.query().postcondition,
+                edge.target,
+                &mut backward_demands,
+                &mut visiting,
+            )?;
             for phi_1 in &source_regions {
                 for phi_2 in &target_regions {
-                    let may_query =
-                        rules::figure8::MAY_CALL(&call.callee, phi_1.clone(), phi_2.clone());
+                    let may_query = rules::figure8::MAY_CALL(
+                        &call.callee,
+                        phi_1.clone(),
+                        Formula::and(phi_2.clone(), call_postcondition.clone()),
+                    );
                     if let Some(mapped) = map_query_to_callee_interface(
                         &call,
                         &callee.base_rule_procedure,
@@ -2591,7 +2606,11 @@ fn instantiate_formula_at_callsite(
     let alpha_renamed = formula
         .alpha_rename(&alpha_map)
         .alpha_rename_memory(&memory_alpha);
-    Some(alpha_renamed.substitute_interface(&term_subst, &bool_subst, &memory_subst))
+    Some(simplify_formula(&alpha_renamed.substitute_interface(
+        &term_subst,
+        &bool_subst,
+        &memory_subst,
+    )))
 }
 
 fn fresh_formal_var(
@@ -2639,7 +2658,7 @@ fn project_query_formula_to_callee(
     include_return: bool,
 ) -> Option<Formula> {
     let visible = caller_visible_names(call, include_return);
-    let projected = project_formula_to_visible(formula, &visible);
+    let projected = project_formula_to_visible(&simplify_formula(formula), &visible);
     let mut term_subst = BTreeMap::<String, Term>::new();
     let mut bool_subst = BTreeMap::<String, Formula>::new();
     let mut memory_subst = BTreeMap::<String, Memory>::new();
@@ -2728,7 +2747,7 @@ fn project_query_formula_to_callee(
             .chain(extra_bindings)
             .collect::<Vec<_>>(),
     );
-    Some(result)
+    Some(simplify_formula(&result))
 }
 
 fn caller_visible_names(call: &CallSiteEffect, include_return: bool) -> BTreeSet<String> {
@@ -2786,14 +2805,42 @@ fn callee_visible_names(interface: &ProcedureInterface) -> BTreeSet<String> {
 }
 
 fn project_summary_formula(formula: &Formula, interface: &ProcedureInterface) -> Formula {
-    project_formula_to_visible(formula, &callee_visible_names(interface))
+    let simplified = simplify_formula(formula);
+    simplify_formula(&project_formula_to_visible(
+        &simplified,
+        &callee_visible_names(interface),
+    ))
 }
 
 fn project_formula_to_visible(formula: &Formula, visible: &BTreeSet<String>) -> Formula {
-    let mut conjuncts = match formula.clone() {
-        Formula::And(items) => items,
-        other => vec![other],
-    };
+    match formula {
+        Formula::And(items) => project_conjunction_to_visible(items.clone(), visible),
+        Formula::Or(items) => Formula::or_all(
+            items
+                .iter()
+                .map(|item| project_formula_to_visible(item, visible))
+                .filter(|item| *item != Formula::False)
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Not(_) if formula.mentions_only(visible) => formula.clone(),
+        Formula::Not(_) => Formula::True,
+        other => {
+            if other.mentions_only(visible) {
+                other.clone()
+            } else {
+                // APPROX_HEAVY: hidden atoms that are not eliminated through a
+                // visible assignment shape are existentially dropped rather
+                // than solved exactly.
+                Formula::True
+            }
+        }
+    }
+}
+
+fn project_conjunction_to_visible(
+    mut conjuncts: Vec<Formula>,
+    visible: &BTreeSet<String>,
+) -> Formula {
     loop {
         let mut changed = false;
         for index in 0..conjuncts.len() {
@@ -2823,6 +2870,17 @@ fn project_formula_to_visible(formula: &Formula, visible: &BTreeSet<String>) -> 
     Formula::and_all(
         conjuncts
             .into_iter()
+            .map(|conjunct| match conjunct {
+                Formula::And(items) => project_conjunction_to_visible(items, visible),
+                Formula::Or(items) => Formula::or_all(
+                    items
+                        .into_iter()
+                        .map(|item| project_formula_to_visible(&item, visible))
+                        .filter(|item| *item != Formula::False)
+                        .collect::<Vec<_>>(),
+                ),
+                other => other,
+            })
             .filter(|conjunct| conjunct.mentions_only(visible))
             .collect::<Vec<_>>(),
     )
@@ -3289,7 +3347,62 @@ fn backward_pre_candidate(
     if edge.relation != Formula::True {
         current = Formula::and(edge.relation.clone(), current);
     }
-    Ok(current)
+    Ok(simplify_formula(&current))
+}
+
+fn backward_path_demand(
+    query_procedure: &AssertionQueryProcedure,
+    exit_postcondition: &Formula,
+    node: CfgNodeId,
+    cache: &mut BTreeMap<CfgNodeId, Formula>,
+    visiting: &mut BTreeSet<CfgNodeId>,
+) -> Result<Formula, DriverError> {
+    if let Some(cached) = cache.get(&node) {
+        return Ok(cached.clone());
+    }
+    if !visiting.insert(node) {
+        return Err(DriverError::CyclicRuleProcedure);
+    }
+    let exit = query_procedure
+        .cfg
+        .exit()
+        .ok_or(DriverError::MissingRuleExit)?;
+    let result = if node == exit {
+        exit_postcondition.clone()
+    } else {
+        let outgoing = query_procedure
+            .cfg
+            .outgoing_edges(node)
+            .map_err(|_| DriverError::UnknownNode { node })?;
+        let mut supported = Vec::new();
+        for edge_id in outgoing {
+            let edge = query_procedure
+                .cfg
+                .edge(edge_id)
+                .ok_or(DriverError::MissingEdge { edge: edge_id.0 })?;
+            let target_demand = match backward_path_demand(
+                query_procedure,
+                exit_postcondition,
+                edge.target,
+                cache,
+                visiting,
+            ) {
+                Ok(demand) => demand,
+                Err(DriverError::UnsupportedRuleEffect { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            match backward_pre_candidate(query_procedure, edge_id, &target_demand) {
+                Ok(beta) => supported.push(beta),
+                Err(DriverError::UnsupportedRuleEffect { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Formula::or_all(supported)
+    };
+    visiting.remove(&node);
+    let simplified = simplify_formula(&result);
+    cache.insert(node, simplified.clone());
+    Ok(simplified)
 }
 
 fn effect_formulas_for_rules(effects: &[TransferEffect]) -> Result<Vec<Formula>, DriverError> {
@@ -3322,12 +3435,16 @@ fn backward_pre_through_effect(
 ) -> Result<Formula, DriverError> {
     match effect {
         TransferEffect::Assign { target, value } => match value {
-            AssignValue::Term(term) => Ok(substitute_term_assignment(&formula, target, term)),
-            AssignValue::Predicate(predicate) => {
-                Ok(substitute_bool_assignment(&formula, target, predicate))
-            }
+            AssignValue::Term(term) => Ok(simplify_formula(&substitute_term_assignment(
+                &formula, target, term,
+            ))),
+            AssignValue::Predicate(predicate) => Ok(simplify_formula(&substitute_bool_assignment(
+                &formula, target, predicate,
+            ))),
         },
-        TransferEffect::Assume(guard) => Ok(Formula::and(guard.clone(), formula)),
+        TransferEffect::Assume(guard) => {
+            Ok(simplify_formula(&Formula::and(guard.clone(), formula)))
+        }
         TransferEffect::Nop => Ok(formula),
         other => Err(DriverError::UnsupportedRuleEffect {
             effect: format!("{other:?}"),
@@ -3599,6 +3716,106 @@ mod tests {
         let module = context.parse_ir_str(ir, "driver_rule_test").unwrap();
         let graphs = generate_program_graph(&module).unwrap();
         analyze_function_graph_rules(&graphs[0]).unwrap_err()
+    }
+
+    #[test]
+    fn summary_projection_preserves_visible_disjunctions() {
+        let interface = ProcedureInterface {
+            parameters: vec!["i".to_string()],
+            return_value: Some(Var::int("__return")),
+            visible_memory_roots: Vec::new(),
+        };
+        let hidden_pos = Var::int("%hidden_pos");
+        let hidden_neg = Var::int("%hidden_neg");
+        let input = Var::int("i");
+        let ret = Var::int("__return");
+        let formula = Formula::or_all(vec![
+            Formula::and_all(vec![
+                Formula::gt(Term::Var(input.clone()), Term::int(0)),
+                Formula::eq(Term::Var(hidden_pos.clone()), Term::Var(input.clone())),
+                Formula::eq(Term::Var(ret.clone()), Term::Var(hidden_pos)),
+            ]),
+            Formula::and_all(vec![
+                Formula::le(Term::Var(input.clone()), Term::int(0)),
+                Formula::eq(
+                    Term::Var(hidden_neg.clone()),
+                    Term::sub(Term::int(0), Term::Var(input.clone())),
+                ),
+                Formula::eq(Term::Var(ret.clone()), Term::Var(hidden_neg)),
+            ]),
+        ]);
+
+        let projected = project_summary_formula(&formula, &interface);
+        assert_eq!(
+            projected,
+            Formula::or_all(vec![
+                Formula::and_all(vec![
+                    Formula::gt(Term::Var(input.clone()), Term::int(0)),
+                    Formula::eq(Term::Var(ret.clone()), Term::Var(input.clone())),
+                ]),
+                Formula::and_all(vec![
+                    Formula::le(Term::Var(input.clone()), Term::int(0)),
+                    Formula::eq(Term::Var(ret), Term::sub(Term::int(0), Term::Var(input)),),
+                ]),
+            ])
+        );
+    }
+
+    #[test]
+    fn summary_projection_simplifies_alloca_backed_returns() {
+        let interface = ProcedureInterface {
+            parameters: vec!["i".to_string()],
+            return_value: Some(Var::int("__return")),
+            visible_memory_roots: Vec::new(),
+        };
+        let input = Var::int("i");
+        let ret = Var::int("__return");
+        let arg_slot = Memory::store(
+            Memory::var("%arg.slot$mem0"),
+            Term::int(0),
+            Term::Var(input.clone()),
+        );
+        let pos_ret_slot = Memory::store(
+            Memory::var("%ret.slot$mem0"),
+            Term::int(0),
+            Term::select(arg_slot.clone(), Term::int(0)),
+        );
+        let neg_ret_slot = Memory::store(
+            Memory::var("%ret.slot$mem0"),
+            Term::int(0),
+            Term::sub(Term::int(0), Term::select(arg_slot.clone(), Term::int(0))),
+        );
+        let formula = Formula::or_all(vec![
+            Formula::and_all(vec![
+                Formula::gt(Term::select(arg_slot.clone(), Term::int(0)), Term::int(0)),
+                Formula::eq(
+                    Term::Var(ret.clone()),
+                    Term::select(pos_ret_slot, Term::int(0)),
+                ),
+            ]),
+            Formula::and_all(vec![
+                Formula::le(Term::select(arg_slot.clone(), Term::int(0)), Term::int(0)),
+                Formula::eq(
+                    Term::Var(ret.clone()),
+                    Term::select(neg_ret_slot, Term::int(0)),
+                ),
+            ]),
+        ]);
+
+        let projected = project_summary_formula(&formula, &interface);
+        assert_eq!(
+            projected,
+            Formula::or_all(vec![
+                Formula::and_all(vec![
+                    Formula::gt(Term::Var(input.clone()), Term::int(0)),
+                    Formula::eq(Term::Var(ret.clone()), Term::Var(input.clone())),
+                ]),
+                Formula::and_all(vec![
+                    Formula::le(Term::Var(input.clone()), Term::int(0)),
+                    Formula::eq(Term::Var(ret), Term::sub(Term::int(0), Term::Var(input))),
+                ]),
+            ])
+        );
     }
 
     #[test]
@@ -4082,6 +4299,104 @@ mod tests {
         assert_eq!(report.assertions.len(), 1);
         assert_eq!(report.assertions[0].result, AssertionResult::False);
         assert!(report.assertions[0].witness.is_some());
+    }
+
+    #[test]
+    fn rule_driver_proves_abs_like_helper_calls_safe() {
+        let report = analyze_named_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @g(i32 %i) {
+                entry:
+                    %cond = icmp sgt i32 %i, 0
+                    br i1 %cond, label %pos, label %neg
+                pos:
+                    ret i32 %i
+                neg:
+                    %negv = sub i32 0, %i
+                    ret i32 %negv
+                }
+
+                define void @main(i32 %i1, i32 %i2, i32 %i3) {
+                entry:
+                    %x1 = call i32 @g(i32 %i1)
+                    %x2 = call i32 @g(i32 %i2)
+                    %x3 = call i32 @g(i32 %i3)
+                    %s1 = icmp sge i32 %x1, 0
+                    %s2 = icmp sge i32 %x2, 0
+                    %s12 = and i1 %s1, %s2
+                    %s3 = icmp sge i32 %x3, 0
+                    %all = and i1 %s12, %s3
+                    call void @may_assert(i1 %all)
+                    ret void
+                }
+            "#,
+            "main",
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::True);
+    }
+
+    #[test]
+    fn rule_driver_proves_alloca_lowered_helper_calls_safe() {
+        let report = analyze_named_rules(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @g(i32 %i) {
+                entry:
+                    %ret.slot = alloca i32
+                    %arg.slot = alloca i32
+                    store i32 %i, ptr %arg.slot
+                    %arg.cond = load i32, ptr %arg.slot
+                    %cond = icmp sgt i32 %arg.cond, 0
+                    br i1 %cond, label %pos, label %neg
+                pos:
+                    %arg.pos = load i32, ptr %arg.slot
+                    store i32 %arg.pos, ptr %ret.slot
+                    br label %exit
+                neg:
+                    %arg.neg = load i32, ptr %arg.slot
+                    %negv = sub i32 0, %arg.neg
+                    store i32 %negv, ptr %ret.slot
+                    br label %exit
+                exit:
+                    %retv = load i32, ptr %ret.slot
+                    ret i32 %retv
+                }
+
+                define void @main(i32 %i1, i32 %i2, i32 %i3) {
+                entry:
+                    %x1.slot = alloca i32
+                    %x2.slot = alloca i32
+                    %x3.slot = alloca i32
+                    %x1 = call i32 @g(i32 %i1)
+                    store i32 %x1, ptr %x1.slot
+                    %x2 = call i32 @g(i32 %i2)
+                    store i32 %x2, ptr %x2.slot
+                    %x3 = call i32 @g(i32 %i3)
+                    store i32 %x3, ptr %x3.slot
+                    %x1.load = load i32, ptr %x1.slot
+                    %s1 = icmp sge i32 %x1.load, 0
+                    %x2.load = load i32, ptr %x2.slot
+                    %s2 = icmp sge i32 %x2.load, 0
+                    %s12 = and i1 %s1, %s2
+                    %x3.load = load i32, ptr %x3.slot
+                    %s3 = icmp sge i32 %x3.load, 0
+                    %all = and i1 %s12, %s3
+                    call void @may_assert(i1 %all)
+                    ret void
+                }
+            "#,
+            "main",
+        );
+
+        assert_eq!(report.judgement, QueryJudgement::No);
+        assert_eq!(report.assertions.len(), 1);
+        assert_eq!(report.assertions[0].result, AssertionResult::True);
     }
 
     #[test]

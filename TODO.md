@@ -4,6 +4,7 @@
 
 - make `tests/paper_section2_fig1_not_may.c` return `SAFE` by deriving and reusing the paper-style direct-call `¬may` summary `<true not-may=> g (retval < 0)>`
 - strengthen Figure 8/10 call-subquery derivation and call-summary reuse so return-value and visible-memory `¬may` summaries are discovered and applied at caller sites
+- refactor the executable state carrier to one accumulated reachability formula per program point instead of separate `path_summary` and `facts`, and use oracle-backed projection/elimination at procedure boundaries
 - change the external loop-summary design: after lowering detects loops, send the loop body/instructions through an external interface, parse the returned summary, and attach it to the current procedure instead of sourcing loop summaries from the CLI layer
 - add an opt-in LLM candidate-generation layer for loop invariants and function summaries on top of the existing external-summary CLI seam
 - keep the default non-LLM route as the baseline/fallback for summary and invariant discovery

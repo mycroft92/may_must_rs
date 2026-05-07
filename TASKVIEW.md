@@ -40,6 +40,6 @@ Not wired:
 ## Next Session Plan
 
 1. Make `tests/paper_section2_fig1_not_may.c` return `SAFE` by deriving and reusing the direct-call `¬may` summary `<true not-may=> g (retval < 0)>`.
-2. Strengthen Figure 8/10 call-query mapping, summary creation, and summary reuse for return-value and visible-memory summaries at caller sites.
+2. Refactor the active state/query plumbing toward one accumulated reachability formula per point, then use oracle-backed interface projection for call queries and summaries.
 3. Add oracle-backed loop invariant verification/adoption on top of the extracted loop regions and summary structure.
 4. Broaden the default rule-check path from the current visible-memory summary slice to richer interfaces, projections, and memory-aware summaries.

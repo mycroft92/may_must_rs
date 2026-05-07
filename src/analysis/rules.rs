@@ -883,8 +883,14 @@ pub mod figure9 {
 
     /// Figure 9 `CREATE-MUSTSUMMARY`.
     ///
-    /// Projects the current exit must-region and stores a summary when it still
-    /// overlaps the query postcondition.
+    /// Projects the disjunction of the concrete-exit must-regions and stores a
+    /// summary when it still overlaps the query postcondition.
+    ///
+    /// The synthetic single-exit node is only a CFG normalization device.
+    /// Building a must summary from that node alone can lose branch-sensitive
+    /// interface relations when one concrete exit reaches the synthetic exit
+    /// before another under the Figure 7 disjointness premises. The summary is
+    /// therefore formed from the real exits directly.
     pub fn CREATE_MUSTSUMMARY<P>(
         frame: &ProcedureFrame,
         summaries: &mut SummaryTables,
@@ -894,7 +900,15 @@ pub mod figure9 {
     where
         P: Fn(&Formula) -> Formula,
     {
-        let theta = project_locals(&frame.omega_or_empty(frame.exit()?));
+        let theta = Formula::or_all(
+            frame
+                .cfg()
+                .concrete_exits()
+                .iter()
+                .copied()
+                .map(|exit| project_locals(&frame.omega_or_empty(exit)))
+                .collect::<Vec<_>>(),
+        );
         require_overlap(
             "CREATE-MUSTSUMMARY",
             "θ ∩ ϕ̂2 ≠ {}",
