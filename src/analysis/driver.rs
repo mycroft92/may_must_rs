@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::analysis::adapter::{
     adapt, adapt_with_purity_and_summaries, collect_callee_names, compute_return_summary,
     AdapterError, CallSummaryRegistry,

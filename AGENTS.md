@@ -1,16 +1,22 @@
-
 # AGENTS.md
 
-This file is the first stop for future coding-agent sessions in this
-repository. Read it before changing code. We are implementing the following paper on LLVM IR programs:
+Read this file before changing code in this repository.
+
+We are still pursuing the same paper-level goal: given an assertion and a
+program, either show that the assertion site is unreachable or show that the
+assertion condition always holds on reachable executions. The implementation
+shape changed, so do not assume the older `cfg/state/loops/transfer`
+paper-tree is still the active code path.
+
+Paper reference:
 
 https://dl.acm.org/doi/10.1145/1707801.1706307
 
 ## Session Startup
 
-At the start of a new session, read these files in order (create an initial version if not present):
+At the start of a new session, read these files in order:
 
-1. `README.md` (or `Readme.md` if that is the current file in the branch)
+1. `README.md` (or `Readme.md` if that is the branch-local spelling)
 2. `TODO.md`
 3. `TASKVIEW.md`
 4. `AGENTS.md`
@@ -19,162 +25,112 @@ At the start of a new session, read these files in order (create an initial vers
 
 Then inspect the relevant Rust modules before editing.
 
-If the session goal is to reconstruct or audit the implemented milestone from
-scratch, also read `Reproducer.md`.
+If the session goal is to reconstruct or audit the milestone from scratch,
+also read `Reproducer.md`.
 
-For active paper-shaped work, start with:
+For active analysis work, start with:
 
 ```text
-src/analysis/rules.rs
-src/analysis/state.rs
-src/analysis/cfg.rs
-src/analysis/loops.rs
-src/analysis/oracle.rs
-src/analysis/llvm_adapter.rs
-src/analysis/transfer.rs
-src/analysis/summaries.rs
+src/analysis/abstract_cfg.rs
+src/analysis/adapter.rs
+src/analysis/backward.rs
 src/analysis/driver.rs
 src/analysis/formula.rs
+src/analysis/node_summary.rs
+src/analysis/oracle.rs
+src/analysis/providers.rs
+src/analysis/rules.rs
+src/analysis/source.rs
+src/analysis/summaries.rs
+src/llvm_utils/program_graph.rs
 ```
-## Idea
-We are try to prove or counter with evidence that: given an assertion and a program, either the assertion is unreachable (vacuous true) or is reachable and always `true` under reachable conditions. We perform both forward and backward analyses of the LLVM IR program.
 
+## Active Architecture
 
-## Architecture
-
-The active implementation is the paper-shaped tree in `src/analysis`.
-
-The intended module boundaries are:
+The active implementation is the current `src/analysis` tree:
 
 ```text
-raw LLVM program graph                  -> src/llvm_utils/program_graph.rs
-assertion frontend lowering             -> src/assertions/translation.rs
-named SMASH rules                       -> src/analysis/rules.rs
-Pi_n / Omega_n / N_e and path summaries -> src/analysis/state.rs
-P / n / e / Gamma_e                     -> src/analysis/cfg.rs
-loop regions / summary generators       -> src/analysis/loops.rs
-predicate vocabulary                    -> src/analysis/formula.rs
-set/sat/evidence queries                -> src/analysis/oracle.rs
-LLVM decoding and lowering              -> src/analysis/llvm_adapter.rs
-normalized step relations               -> src/analysis/transfer.rs
-procedure summaries                     -> src/analysis/summaries.rs
-summary orchestration                   -> src/analysis/driver.rs
+raw LLVM wrapper/query boundary          -> src/llvm_utils/llvm_wrap.rs
+raw LLVM instruction graph               -> src/llvm_utils/program_graph.rs
+assertion text translation               -> src/assertions/translation.rs
+formula / term vocabulary                -> src/analysis/formula.rs
+abstract CFG + transfer semantics        -> src/analysis/abstract_cfg.rs
+LLVM graph -> abstract CFG lowering      -> src/analysis/adapter.rs
+per-node reach/state summaries           -> src/analysis/node_summary.rs
+local backward propagation rules         -> src/analysis/rules.rs
+acyclic assertion checking               -> src/analysis/backward.rs
+SMT feasibility / implication queries    -> src/analysis/oracle.rs
+summary/provider seam                    -> src/analysis/providers.rs
+summary table data structures            -> src/analysis/summaries.rs
+module orchestration + summary reuse     -> src/analysis/driver.rs
+source location value type               -> src/analysis/source.rs
+raw Z3 lowering                          -> src/smt/solver.rs
 ```
 
-Keep the core paper modules (`cfg`, `formula`, `state`, `rules`, `summaries`,
-`driver`, `oracle`, `loops`) free of LLVM and Z3 details except where a module
-is explicitly the boundary for them. LLVM specifics should stay in `llvm_utils`
-and `llvm_adapter.rs`. Raw solver details should stay in `smt/solver.rs` and
-`oracle.rs`. `transfer.rs` should consume a normalized effect/instruction layer
-produced by `llvm_adapter.rs`, not raw
-`llvm_wrap::Instruction` handles.
+Keep LLVM-specific querying in `llvm_utils`. Keep raw solver details in
+`smt/solver.rs`. Keep solver policy in `analysis/oracle.rs`.
 
-`llvm_adapter.rs` should lower one procedure into the paper `cfg` plus
-pre-normalized `node_effects` and `edge_effects` for `transfer.rs`.
+`adapter.rs` is the lowering boundary from `FunctionGraph` to the active
+semantic model. `abstract_cfg.rs` owns the CFG and transfer semantics used by
+the checker. `backward.rs` and `rules.rs` should stay focused on analysis
+logic, not LLVM parsing.
 
-Track path predicates in `state.rs`, not in `cfg.rs`. `cfg.rs` should only
-store edge-local relations/guards (`Gamma_e`). The accumulated path summary for
-the current analysis frontier belongs in `state.rs`.
+## Current Behavioral Boundaries
 
-Lower ordinary branch conditions into `cfg.rs` edge relations, not into the
-normalized transfer-effect stream. Lower `phi` nodes as predecessor-specific
-normalized assignments on incoming edges. Reserve `Assume`-style transfer
-effects for extra trusted refinements such as user-supplied contracts.
+Implemented and CLI-active:
 
-`oracle.rs` is the only place that should answer satisfiability, implication,
-or evidence/model queries against the SMT solver. Other modules may build
-formulas but should not own solver policy.
+- integer and boolean reasoning
+- integer-array memory slice for `alloca` / `load` / `store` / `gep`
+- `phi` lowering on incoming edges
+- branch-guard lowering on edges
+- direct-call return-summary inference/reuse
+- acyclic backward checking
+- multi-exit normalization
+- best-effort unsupported reporting in the CLI
 
-Before loop invariants exist, use a `max_step` engine as the temporary loop
-policy:
+Implemented but not wired:
 
-- `state.rs` should be able to carry the visit-count or bounded-progress facts
-  needed by that engine.
-- `driver.rs` should enforce the revisit bound and decide when exploration
-  stops because the temporary loop budget is exhausted.
-- `transfer.rs` should stay local to one normalized step; it should not own the
-  global loop bound policy.
+- assertion text translation
+- manual/external summary providers
+- source-coordinate reporting from LLVM debug info
 
-When we replace bounded loop handling with loop invariants:
+Unsupported and should remain honest:
 
-- `llvm_adapter.rs` should identify the relevant loop structure in the lowered
-  CFG, such as headers, latches, backedges, or SCC-based loop regions.
-- `loops.rs` should own loop extraction, structural summary sequencing, and
-  the boundary for internal or external loop/function summary generation.
-- `transfer.rs` should encode one-iteration semantic steps, not invent
-  invariants.
-- `state.rs` should store candidate/header facts and the accumulated path
-  summaries those candidates summarize.
-- `oracle.rs` should check initiation, inductiveness, and evidence queries for
-  invariant candidates.
-- `summaries.rs` should store accepted loop invariants and reusable summaries,
-  not generate them.
-- `driver.rs` should orchestrate when invariant generation/checking runs and
-  when a loop summary is accepted into the analysis.
+- loops / cyclic CFGs
+- floating-point lowering
+- loop invariants and loop summaries
+- broader cast/instruction coverage beyond the current subset
 
-The program graph generation is written in `llvm_utils` directory.
-If an LLVM/function graph has multiple exits, lower it to a single paper exit
-by creating one synthetic exit node and adding trivial (`true`) edges from each
-real exit to that synthetic exit.
+Prefer `UNKNOWN` over an unsound proof claim.
 
-Do not generate summaries for `may_assert` call edges. If possible do not even generate the call edges for it, instead we generate the assertion `true =>(not-May) PathCondition /\  !(assert_expression)`.
+## Development Direction
 
-## Development idea
-- We first develop this for straightline programs, then for programs with single procedures, then finally when function calls are present. 
-- To deal with loops, first implement a `max_step` engine where we wont revisit an instruction/edge for more than that number. Only after that is stable should we replace it with loop summary generation / loop invariant extraction in `summaries.rs`, checked through `oracle.rs`, and orchestrated by `driver.rs`.
-- Clearly notate in TASKVIEW which phase of the development we are in.
-- Add examples from the paper as targets for each of these goals. 
-- Do not add fallback summary generations ever. Instead let the analysis discover them automatically as the development progresses.
-
-Current reproduced branch milestone is earlier than the later driver/summaries
-plan above:
-
-- CLI-active code exposes:
-  - raw LLVM graph generation and DOT dumping
-  - the default acyclic interprocedural Figure 5-10 rule-check path
-- `src/analysis/rules.rs` is implemented and scheduled by `driver.rs`.
-- `src/analysis/summaries.rs` stores accepted `¬may ⇒ P`, `must ⇒ P`, and
-  loop-invariant facts consumed by the driver.
-- `src/analysis/loops.rs` owns loop extraction, condensation ordering, and the
-  trait-based summary-generator seam, including a Tokio/JSON adapter for
-  external modules.
-- `src/analysis/driver.rs` now supports module-level work queues, summary reuse
-  across supported calls, default witnesses for false rule-check results, and
-  internal Knaster-Tarski summary generation by default.
-- cyclic procedures remain unsupported on the rule-driven path until loop
-  summary verification is wired.
-- the curated fixture corpus lives under `tests/flow/`.
-- `make -C tests smoke` compiles that corpus and runs the CLI over the
-  resulting bitcode files.
+- Treat the current abstract-CFG pipeline as the active baseline.
+- Do not document or extend removed architecture as if it were still live.
+- When broadening support, keep the semantic layers aligned:
+  `formula.rs`, `abstract_cfg.rs`, `adapter.rs`, `oracle.rs`, and
+  `smt/solver.rs` should evolve together.
+- For loops, decide the sound strategy before coding. Right now the checker is
+  intentionally acyclic only.
 
 Important organization rule:
 
 - when a new concept is logically independent, split it into a new focused
   module instead of flattening more code into an existing file
-- only keep code together when the coupling is real and the separation would
-  be artificial
-
+- only keep code together when the coupling is real and separation would be
+  artificial
 
 When adding a new active analysis concept:
 
 1. Put the implementation in the narrowest correct module.
 2. Add focused unit tests.
-3. Add a short module-level doc comment that states the module intention and the paper notation or definition it implements.
-4. Update `TODO.md` if it changes the backlog.
-5. Update `TASKVIEW.md` if it changes the next-session plan.
-6. Update `src/analysis/design.md` if it changes the paper-to-code mapping.
-7. Update `README.md` or `Readme.md` when user-facing behavior or run instructions change.
-8. If the task is complete and the user did not say otherwise, commit and push the branch after verification.
-
-Do not overclaim. Clearly distinguish:
-
-```text
-implemented and CLI-active
-implemented but not wired
-archived reference code
-planned
-unsupported and returns Unknown
-```
+3. Add a short module-level doc comment when the module intent changes.
+4. Update `TODO.md` if the backlog changes.
+5. Update `TASKVIEW.md` if the next-session plan changes.
+6. Update `src/analysis/design.md` if the architecture mapping changes.
+7. Update `README.md` when CLI behavior or support boundaries change.
+8. If the task is complete and the user did not say otherwise, commit and push
+   the branch after verification.
 
 ## Verification Commands
 
@@ -185,29 +141,20 @@ cargo fmt
 cargo test
 ```
 
-Run when touching CLI behavior, graph construction, LLVM wrapping, tests, or
-smoke assumptions:
+Run when touching CLI behavior, LLVM graph construction, lowering, or smoke
+assumptions:
 
 ```sh
 make -C tests smoke
 ```
 
-If the current branch does not yet contain the smoke harness, state that
-clearly and fall back to the available Rust verification commands.
-
-Use offline cargo only when needed:
-
-```sh
-CARGO_FLAGS=--offline make -C tests smoke
-```
+If the smoke harness is unavailable on the branch, say so clearly and fall
+back to the available Rust verification commands.
 
 ## Guardrails
 
 - Prefer `UNKNOWN` over unsound success claims.
-- Annotate every deliberate approximation-heavy site with an
-  `APPROX_HEAVY:` code comment so it is auditable and removable.
-- Do not read `obsolete` folder at all 
+- Mark heavy approximations with `APPROX_HEAVY:` comments.
+- Do not read `obsolete/`.
 - Keep generated `.ll`, `.bc`, and DOT files out of source control.
 - Keep C test inputs in `tests/`; generated artifacts belong in `tests/out/`.
-- Keep the active implementation close to the paper and fill only the gaps the
-  current milestone needs. 

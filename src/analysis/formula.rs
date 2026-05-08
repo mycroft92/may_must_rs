@@ -1,9 +1,10 @@
+#![allow(dead_code)]
+
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt;
 use thiserror::Error;
 
-pub type SmtModel = BTreeMap<String, String>;
+pub type SmtModel = String;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Sort {
@@ -150,6 +151,7 @@ pub enum Term {
     Var(Var),
     Int(i64),
     Real(Rational),
+    BoolToInt(Box<Formula>),
     Select(Box<Memory>, Box<Term>),
     Add(Box<Term>, Box<Term>),
     Sub(Box<Term>, Box<Term>),
@@ -169,6 +171,10 @@ impl Term {
 
     pub fn real(value: Rational) -> Self {
         Term::Real(value)
+    }
+
+    pub fn bool_to_int(value: Formula) -> Self {
+        Term::BoolToInt(Box::new(value))
     }
 
     pub fn select(memory: Memory, index: Term) -> Self {
@@ -200,6 +206,10 @@ impl Term {
             Term::Var(var) => Ok(var.sort()),
             Term::Int(_) => Ok(Sort::Int),
             Term::Real(_) => Ok(Sort::Real),
+            Term::BoolToInt(value) => {
+                value.validate()?;
+                Ok(Sort::Int)
+            }
             Term::Select(_, index) => {
                 let index_sort = index.sort()?;
                 if index_sort != Sort::Int {
@@ -241,6 +251,7 @@ impl fmt::Display for Term {
             Term::Var(var) => write!(f, "{var}"),
             Term::Int(value) => write!(f, "{value}"),
             Term::Real(value) => write!(f, "{value}"),
+            Term::BoolToInt(value) => write!(f, "bool_to_int({value})"),
             Term::Select(memory, index) => write!(f, "select({memory}, {index})"),
             Term::Add(lhs, rhs) => write!(f, "({lhs} + {rhs})"),
             Term::Sub(lhs, rhs) => write!(f, "({lhs} - {rhs})"),
@@ -568,5 +579,13 @@ mod tests {
             Formula::eq(Term::var("x", Sort::Int), Term::int(4)),
         );
         assert_eq!(formula.to_string(), "(a => (x == 4))");
+    }
+
+    #[test]
+    fn bool_to_int_is_integer_sorted() {
+        assert_eq!(
+            Term::bool_to_int(Formula::bool_var("b")).sort(),
+            Ok(Sort::Int)
+        );
     }
 }

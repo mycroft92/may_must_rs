@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::analysis::formula::{Formula, FormulaError, SmtModel};
 use crate::analysis::node_summary::NodeSummary;
 use crate::smt::solver::SmtScope;
@@ -50,7 +52,7 @@ impl Oracle {
         let report = match scope.check() {
             SatResult::Sat => FeasibilityReport {
                 feasibility: Feasibility::Feasible,
-                model: scope.model_bindings(),
+                model: scope.model_string(),
             },
             SatResult::Unsat => FeasibilityReport {
                 feasibility: Feasibility::Infeasible,
@@ -58,7 +60,7 @@ impl Oracle {
             },
             SatResult::Unknown => FeasibilityReport {
                 feasibility: Feasibility::Unknown,
-                model: scope.model_bindings(),
+                model: scope.model_string(),
             },
         };
         Ok(report)

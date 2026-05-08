@@ -115,6 +115,12 @@ impl SmtScope {
             },
             Term::Int(value) => Ok(EncodedTerm::Int(Int::from_i64(*value))),
             Term::Real(value) => Ok(EncodedTerm::Real(self.real_constant(value))),
+            Term::BoolToInt(value) => {
+                let condition = self.lower_formula(value)?;
+                Ok(EncodedTerm::Int(
+                    condition.ite(&Int::from_i64(1), &Int::from_i64(0)),
+                ))
+            }
             Term::Select(memory, index) => {
                 let memory = self.lower_memory(memory)?;
                 let index = match self.lower_term(index)? {

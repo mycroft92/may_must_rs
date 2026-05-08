@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::analysis::formula::{Formula, Memory, Term, Var};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -574,6 +576,9 @@ pub fn substitute_var_in_term(target: &Var, replacement: &Term, term: &Term) -> 
         Term::Var(var) => Term::Var(var.clone()),
         Term::Int(value) => Term::Int(*value),
         Term::Real(value) => Term::Real(*value),
+        Term::BoolToInt(inner) => {
+            Term::bool_to_int(substitute_var_in_formula(target, replacement, inner))
+        }
         Term::Select(memory, index) => Term::select(
             substitute_var_in_memory(target, replacement, memory),
             substitute_var_in_term(target, replacement, index),
@@ -703,6 +708,9 @@ pub fn substitute_memory_var_in_term(region: &str, replacement: &Memory, term: &
         Term::Var(var) => Term::Var(var.clone()),
         Term::Int(value) => Term::Int(*value),
         Term::Real(value) => Term::Real(*value),
+        Term::BoolToInt(inner) => {
+            Term::bool_to_int(substitute_memory_var_in_formula(region, replacement, inner))
+        }
         Term::Select(memory, index) => Term::select(
             substitute_memory_var_in_memory(region, replacement, memory),
             substitute_memory_var_in_term(region, replacement, index),

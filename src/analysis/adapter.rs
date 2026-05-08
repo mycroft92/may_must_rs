@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::analysis::abstract_cfg::{
     AbstractCfg, AssignValue, CallMemoryEffect, CfgEdgeId, CfgNodeId, PointerEnv, SourceLocation,
     TransferEffect, TransferFn,
@@ -119,13 +121,6 @@ pub fn adapt_with_purity_and_summaries(
     )?);
     let mut instruction_nodes = HashMap::new();
     instruction_nodes.insert(start, cfg.entry());
-    if let Some(location) = start.get_source_location() {
-        cfg.set_source_location(
-            cfg.entry(),
-            SourceLocation::new(location.file, location.line, location.column),
-        )
-        .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-    }
 
     for instruction in &graph.vertices {
         if *instruction == start {
@@ -140,13 +135,6 @@ pub fn adapt_with_purity_and_summaries(
         )?;
         let node_id = cfg.add_node(instruction.print(), transfer);
         instruction_nodes.insert(*instruction, node_id);
-        if let Some(location) = instruction.get_source_location() {
-            cfg.set_source_location(
-                node_id,
-                SourceLocation::new(location.file, location.line, location.column),
-            )
-            .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-        }
     }
 
     for exit in &graph.end {
@@ -503,6 +491,21 @@ fn lower_node_transfer(
                 value: AssignValue::Predicate(predicate),
             });
         }
+        InstructionOpcode::ZExt => {
+            let target = assigned_var(function_name, instruction)?;
+            let source = instruction
+                .get_operand(0)
+                .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
+            let value = match sort_of_instruction_value(source)? {
+                Sort::Bool => {
+                    AssignValue::Term(Term::bool_to_int(lower_bool_value(function_name, source)?))
+                }
+                Sort::Int | Sort::Real => {
+                    return Err(AdapterError::UnsupportedInstruction(instruction.print()));
+                }
+            };
+            effects.push(TransferEffect::Assign { target, value });
+        }
         InstructionOpcode::Alloca => {
             let target = pointer_name(function_name, instruction);
             let region = allocation_regions
@@ -720,7 +723,7 @@ fn lower_assertions(
         sites.push(AssertionSite {
             id: index + 1,
             node,
-            source_location: site.source_location.clone().into(),
+            source_location: SourceLocation::default(),
             location: assertion_location(site),
             obligation,
         });
@@ -939,6 +942,7 @@ pub fn rename_vars_in_term(term: &Term, rename: impl Fn(&str) -> String + Copy) 
         Term::Var(var) => Term::Var(Var::new(rename(var.name()), var.sort())),
         Term::Int(value) => Term::Int(*value),
         Term::Real(value) => Term::Real(*value),
+        Term::BoolToInt(value) => Term::bool_to_int(rename_vars_in_formula(value, rename)),
         Term::Select(memory, index) => Term::select(
             rename_vars_in_memory(memory, rename),
             rename_vars_in_term(index, rename),
@@ -1036,6 +1040,9 @@ fn substitute_var_name_with_term_term(term: &Term, name: &str, replacement: &Ter
         Term::Var(var) => Term::Var(var.clone()),
         Term::Int(value) => Term::Int(*value),
         Term::Real(value) => Term::Real(*value),
+        Term::BoolToInt(value) => {
+            Term::bool_to_int(substitute_var_name_with_term(value, name, replacement))
+        }
         Term::Select(memory, index) => Term::select(
             substitute_var_name_with_term_memory(memory, name, replacement),
             substitute_var_name_with_term_term(index, name, replacement),
@@ -1105,6 +1112,7 @@ fn term_contains_var(term: &Term, name: &str) -> bool {
     match term {
         Term::Var(var) => var.name() == name,
         Term::Int(_) | Term::Real(_) => false,
+        Term::BoolToInt(value) => formula_contains_var(value, name),
         Term::Select(memory, index) => {
             memory_contains_var(memory, name) || term_contains_var(index, name)
         }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::analysis::abstract_cfg::AbstractCfg;
 use crate::analysis::adapter::AssertionSite;
 use crate::analysis::formula::Formula;
@@ -86,9 +88,9 @@ pub fn render_result(result: &AssertionResult) -> String {
         Judgement::Unknown => lines.push("    judgement: Unknown".to_string()),
         Judgement::BugFound { model } => {
             lines.push("    judgement: BugFound".to_string());
-            if let Some(model) = model {
-                for (name, value) in model {
-                    lines.push(format!("    model: {name} = {value}"));
+            if let Some(model) = model.as_ref() {
+                for line in model.lines() {
+                    lines.push(format!("    model: {line}"));
                 }
             }
         }

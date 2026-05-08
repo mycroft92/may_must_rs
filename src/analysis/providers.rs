@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::analysis::adapter::ReturnSummary;
 use crate::analysis::formula::Formula;
 use std::collections::BTreeMap;

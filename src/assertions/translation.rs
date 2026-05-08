@@ -303,8 +303,8 @@ mod tests {
         assert_eq!(
             translated.stmt.predicate,
             Formula::eq(
-                Term::add(Term::var("%x", Sort::Real), Term::real(1, 1)),
-                Term::real(9, 2)
+                Term::add(Term::var("%x", Sort::Real), Term::real(Rational::new(1, 1))),
+                Term::real(Rational::new(9, 2))
             )
         );
     }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::analysis::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId};
 use crate::analysis::formula::{Formula, SmtModel};
 use crate::analysis::node_summary::NodeSummary;
