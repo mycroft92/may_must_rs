@@ -1,22 +1,8 @@
-//! SMT-backed oracle queries over paper formulas and state carriers.
-//!
-//! This module owns satisfiability and implication checks for the paper-level
-//! objects built in `formula.rs` and `state.rs`. It is the only analysis
-//! module that should talk to the raw solver layer.
-//!
-//! The driver uses it both for ordinary premise checks and for on-demand model
-//! generation during witness replay. Formula alpha-renaming and interface
-//! substitution stay in `formula.rs`; loop extraction and candidate-generation
-//! plumbing stay in `loops.rs`; the oracle consumes the already-renamed
-//! formulas and answers only semantic questions about them.
-
-use crate::analysis::formula::{Formula, FormulaError};
-use crate::analysis::state::{NodeState, PathSummary};
+use crate::analysis::formula::{Formula, FormulaError, SmtModel};
+use crate::analysis::node_summary::NodeSummary;
 use crate::smt::solver::SmtScope;
-use thiserror::Error;
 use z3::SatResult;
 
-/// Three-way answer for feasibility checks over paper formulas/states.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Feasibility {
     Feasible,
@@ -24,7 +10,6 @@ pub enum Feasibility {
     Unknown,
 }
 
-/// Three-way answer for implication checks over paper formulas/states.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Validity {
     Valid,
@@ -34,16 +19,14 @@ pub enum Validity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeasibilityReport {
-    /// Satisfiability status of the queried formula.
     pub feasibility: Feasibility,
-    /// Optional model rendered by the raw solver for feasible/unknown queries.
-    pub model: Option<String>,
+    pub model: Option<SmtModel>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Oracle;
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OracleError {
     #[error(transparent)]
     Formula(#[from] FormulaError),
@@ -64,40 +47,25 @@ impl Oracle {
     ) -> Result<FeasibilityReport, OracleError> {
         let mut scope = SmtScope::new();
         scope.assert_formula(formula)?;
-        let result = scope.check();
-        let model = matches!(result, SatResult::Sat | SatResult::Unknown)
-            .then(|| scope.model_string())
-            .flatten();
-        Ok(FeasibilityReport {
-            feasibility: match result {
-                SatResult::Sat => Feasibility::Feasible,
-                SatResult::Unsat => Feasibility::Infeasible,
-                SatResult::Unknown => Feasibility::Unknown,
+        let report = match scope.check() {
+            SatResult::Sat => FeasibilityReport {
+                feasibility: Feasibility::Feasible,
+                model: scope.model_bindings(),
             },
-            model,
-        })
+            SatResult::Unsat => FeasibilityReport {
+                feasibility: Feasibility::Infeasible,
+                model: None,
+            },
+            SatResult::Unknown => FeasibilityReport {
+                feasibility: Feasibility::Unknown,
+                model: scope.model_bindings(),
+            },
+        };
+        Ok(report)
     }
 
-    pub fn path_summary_feasibility(
-        &self,
-        path_summary: &PathSummary,
-    ) -> Result<Feasibility, OracleError> {
-        self.feasibility(path_summary.predicate())
-    }
-
-    pub fn state_feasibility(&self, state: &NodeState) -> Result<Feasibility, OracleError> {
-        self.feasibility(&state.feasibility_formula())
-    }
-
-    pub fn state_feasibility_with_model(
-        &self,
-        state: &NodeState,
-    ) -> Result<FeasibilityReport, OracleError> {
-        self.feasibility_with_model(&state.feasibility_formula())
-    }
-
-    pub fn obligation_feasibility(&self, state: &NodeState) -> Result<Feasibility, OracleError> {
-        self.feasibility(&state.obligation_query_formula())
+    pub fn check_summary(&self, summary: &NodeSummary) -> Result<FeasibilityReport, OracleError> {
+        self.feasibility_with_model(&summary.combined())
     }
 
     pub fn implies(
@@ -106,120 +74,62 @@ impl Oracle {
         conclusion: &Formula,
     ) -> Result<Validity, OracleError> {
         let counterexample = Formula::and(assumptions.clone(), Formula::not(conclusion.clone()));
-        Ok(match self.feasibility(&counterexample)? {
-            Feasibility::Feasible => Validity::Invalid,
+        let result = match self.feasibility(&counterexample)? {
             Feasibility::Infeasible => Validity::Valid,
+            Feasibility::Feasible => Validity::Invalid,
             Feasibility::Unknown => Validity::Unknown,
-        })
+        };
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::formula::{Sort, Term, Var};
+    use crate::analysis::abstract_cfg::CfgNodeId;
+    use crate::analysis::formula::{Sort, Term};
 
     #[test]
-    fn formula_feasibility_distinguishes_sat_and_unsat() {
+    fn feasibility_sat_formula() {
         let oracle = Oracle::new();
-
-        let sat = oracle
-            .feasibility(&Formula::eq(Term::var("x", Sort::Int), Term::int(2)))
-            .unwrap();
-        let unsat = oracle
-            .feasibility(&Formula::and(
-                Formula::eq(Term::var("x", Sort::Int), Term::int(0)),
-                Formula::gt(Term::var("x", Sort::Int), Term::int(1)),
-            ))
-            .unwrap();
-
-        assert_eq!(sat, Feasibility::Feasible);
-        assert_eq!(unsat, Feasibility::Infeasible);
+        let formula = Formula::eq(Term::var("x", Sort::Int), Term::int(1));
+        let report = oracle.feasibility_with_model(&formula).unwrap();
+        assert_eq!(report.feasibility, Feasibility::Feasible);
+        assert!(report.model.is_some());
     }
 
     #[test]
-    fn path_summary_feasibility_queries_the_summary_predicate() {
+    fn feasibility_unsat_formula() {
         let oracle = Oracle::new();
-        let mut summary = PathSummary::reachable();
-        summary.refine(Formula::bool_var("p"));
-        summary.refine(Formula::not(Formula::bool_var("p")));
-
-        assert_eq!(
-            oracle.path_summary_feasibility(&summary).unwrap(),
-            Feasibility::Infeasible
+        let formula = Formula::and(
+            Formula::eq(Term::var("x", Sort::Int), Term::int(1)),
+            Formula::eq(Term::var("x", Sort::Int), Term::int(2)),
         );
+        let report = oracle.feasibility_with_model(&formula).unwrap();
+        assert_eq!(report.feasibility, Feasibility::Infeasible);
+        assert!(report.model.is_none());
     }
 
     #[test]
-    fn state_feasibility_conjoins_path_summaries_and_facts() {
+    fn implication_validity() {
         let oracle = Oracle::new();
-        let mut state = NodeState::entry();
-        state.path_summary_mut().refine(Formula::bool_var("path"));
-        state
-            .facts_mut()
-            .push(Formula::eq(Term::Var(Var::int("x")), Term::int(3)));
-        state
-            .facts_mut()
-            .push(Formula::gt(Term::Var(Var::int("x")), Term::int(1)));
-
+        let assumptions = Formula::eq(Term::var("x", Sort::Int), Term::int(1));
+        let conclusion = Formula::le(Term::var("x", Sort::Int), Term::int(1));
         assert_eq!(
-            oracle.state_feasibility(&state).unwrap(),
-            Feasibility::Feasible
-        );
-    }
-
-    #[test]
-    fn obligation_feasibility_includes_negated_assertions() {
-        let oracle = Oracle::new();
-        let mut state = NodeState::entry();
-        state
-            .facts_mut()
-            .push(Formula::eq(Term::Var(Var::int("x")), Term::int(3)));
-        state
-            .obligations_mut()
-            .push(Formula::gt(Term::Var(Var::int("x")), Term::int(4)));
-
-        assert_eq!(
-            oracle.obligation_feasibility(&state).unwrap(),
-            Feasibility::Infeasible
-        );
-    }
-
-    #[test]
-    fn implication_checks_for_counterexample_feasibility() {
-        let oracle = Oracle::new();
-        let assumptions = Formula::eq(Term::var("x", Sort::Int), Term::int(3));
-
-        assert_eq!(
-            oracle
-                .implies(
-                    &assumptions,
-                    &Formula::gt(Term::var("x", Sort::Int), Term::int(1))
-                )
-                .unwrap(),
+            oracle.implies(&assumptions, &conclusion).unwrap(),
             Validity::Valid
         );
-        assert_eq!(
-            oracle
-                .implies(
-                    &assumptions,
-                    &Formula::gt(Term::var("x", Sort::Int), Term::int(4))
-                )
-                .unwrap(),
-            Validity::Invalid
-        );
     }
 
     #[test]
-    fn feasibility_with_model_returns_a_model_for_sat_queries() {
+    fn check_summary_uses_combined_formula() {
         let oracle = Oracle::new();
-        let report = oracle
-            .feasibility_with_model(&Formula::eq(Term::var("x", Sort::Int), Term::int(11)))
-            .unwrap();
-
-        assert_eq!(report.feasibility, Feasibility::Feasible);
-        let model = report.model.expect("sat query should expose a model");
-        assert!(model.contains("x"));
-        assert!(model.contains("11"));
+        let summary = NodeSummary {
+            node: CfgNodeId(0),
+            reach: Formula::True,
+            state: Formula::False,
+        };
+        let report = oracle.check_summary(&summary).unwrap();
+        assert_eq!(report.feasibility, Feasibility::Infeasible);
     }
 }
