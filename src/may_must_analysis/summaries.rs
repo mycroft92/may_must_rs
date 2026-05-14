@@ -98,6 +98,7 @@ impl SummaryTables {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::abstract_cfg::CfgNodeId;
 
     #[test]
     fn notmay_deduplicates() {
@@ -126,5 +127,15 @@ mod tests {
         let tables = SummaryTables::new();
         assert!(tables.notmay("missing").is_empty());
         assert!(tables.must("missing").is_empty());
+    }
+
+    #[test]
+    fn loop_invariants_round_trip() {
+        let mut tables = SummaryTables::new();
+        tables.set_loop_invariants("loop_fn", vec![(CfgNodeId(3), Formula::bool_var("inv"))]);
+        assert_eq!(
+            tables.get_loop_invariants("loop_fn"),
+            &[(CfgNodeId(3), Formula::bool_var("inv"))]
+        );
     }
 }

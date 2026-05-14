@@ -180,6 +180,28 @@ pub fn analyze_module_with_llm(
             },
         );
     }
+    for graph in graphs {
+        let adapted = if summaries.is_empty() && memory_pure.is_empty() {
+            adapt(graph)
+        } else {
+            adapt_with_purity_and_summaries(graph, memory_pure, &summaries)
+        };
+        let Ok(adapted) = adapted else {
+            continue;
+        };
+        if let Some(precomputed) = (adapted.cfg.topological_order().is_none())
+            .then(|| {
+                crate::may_must_analysis::backward::discover_loop_invariants(
+                    &adapted.cfg,
+                    &adapted.name,
+                    oracle,
+                )
+            })
+            .flatten()
+        {
+            summary_tables.set_loop_invariants(adapted.name, precomputed);
+        }
+    }
 
     let mut reports = Vec::new();
     for graph in graphs {
@@ -241,6 +263,20 @@ pub fn analyze_with_summaries(
     } else {
         adapt_with_purity_and_summaries(graph, memory_pure, summaries)?
     };
+    let cached_invariants = tables
+        .map(|tables| tables.get_loop_invariants(&adapted.name).to_vec())
+        .filter(|items| !items.is_empty());
+    let precomputed = if adapted.cfg.topological_order().is_none() {
+        cached_invariants.or_else(|| {
+            crate::may_must_analysis::backward::discover_loop_invariants(
+                &adapted.cfg,
+                &adapted.name,
+                oracle,
+            )
+        })
+    } else {
+        None
+    };
 
     let mut assertions = Vec::new();
     let mut failures = Vec::new();
@@ -253,7 +289,7 @@ pub fn analyze_with_summaries(
                 oracle,
                 tables,
                 config,
-                None,
+                precomputed.as_deref(),
             )
         } else {
             analyze(&adapted.cfg, site, oracle)
@@ -261,7 +297,7 @@ pub fn analyze_with_summaries(
         match result {
             Ok(result) => assertions.push(result),
             Err(BackwardError::CyclicCfgUnsupported) => failures.push(format!(
-                "assertion #{} ({}): CFG has a cycle; loops are not supported",
+                "assertion #{} ({}): CFG has a cycle and no loop invariant was accepted",
                 site.id, site.location
             )),
             Err(error) => failures.push(format!(

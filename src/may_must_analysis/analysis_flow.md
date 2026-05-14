@@ -16,15 +16,17 @@
    - instruction-to-node bookkeeping
 
 4. `analysis::driver`
-   optionally infers and reuses direct-call return summaries across the module.
+   infers and reuses direct-call return summaries across the module, and
+   precomputes/cache loop invariants for cyclic procedures.
 
 5. `analysis::backward::analyze`
    checks one assertion site:
-   - require an acyclic CFG via `topological_order()`
+   - if acyclic, analyze directly
+   - if cyclic, precompute or search for an accepted loop invariant
    - initialize node summaries
    - propagate reachability forward
    - seed the negated assertion obligation at the assertion node
-   - propagate backward state to the entry
+   - run the reach/state fixpoint
    - ask `oracle.rs` whether the entry summary is feasible
 
 6. `analysis::oracle`
@@ -47,6 +49,8 @@
 ## Loop Behavior Today
 
 - Loops survive graph generation and lowering.
-- The checker stops at cyclic CFG detection.
-- Result: assertions in cyclic procedures are currently reported as
+- The driver first discovers algorithmic candidates for cyclic procedures.
+- The backward checker can then validate algorithmic, CHC, Houdini, template,
+  and optional LLM candidates.
+- If no candidate is accepted, assertions in cyclic procedures remain
   unsupported/`UNKNOWN`.

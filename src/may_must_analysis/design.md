@@ -32,7 +32,7 @@ modules. Instead:
 - transfer effects
 - weakest-precondition / strongest-postcondition helpers
 - single-exit normalization
-- topological-order check used to reject cyclic CFGs
+- topological-order and back-edge helpers used by the cyclic checker
 
 `adapter.rs`
 
@@ -57,10 +57,12 @@ modules. Instead:
 
 `backward.rs`
 
-- orchestrates one assertion query on one acyclic CFG
-- rejects cyclic CFGs early
+- orchestrates one assertion query on one procedure CFG
+- uses direct backward checking for acyclic procedures
+- for cyclic procedures, reuses precomputed invariants or searches
+  algorithmic/CHC/Houdini/template/LLM candidates
 - seeds the obligation at the assertion node
-- runs forward reach, then backward state propagation
+- runs summary-aware reach/state fixpoint propagation
 
 `oracle.rs`
 
@@ -70,27 +72,28 @@ modules. Instead:
 `providers.rs`
 
 - seam for external/manual summaries
-- loop-invariant hook exists as a placeholder only
+- loop-invariant / LLM context plumbing
 
 `summaries.rs`
 
 - reusable summary-table data structures
-- not currently the main CLI-active storage path
+- includes cached loop invariants used for reporting and reuse
 
 `driver.rs`
 
 - module-level orchestration
 - fixed-point style return-summary accumulation
+- loop-invariant precomputation and caching
 - report construction for procedures
 
 ## Current Soundness Boundary
 
 The current checker is intentionally limited.
 
-- Acyclic integer/boolean procedures are the supported core.
+- Integer/boolean procedures are the supported core.
 - Direct-call reasoning works only through the current inferred/manual
   return-summary slice.
-- Loops are preserved in the CFG but not analyzed; cyclic procedures return
-  `UNKNOWN`.
+- Cyclic procedures are only handled when the checker accepts a loop invariant;
+  otherwise they remain `UNKNOWN`.
 - Floating-point procedures are reported as unsupported and therefore
   `UNKNOWN`.

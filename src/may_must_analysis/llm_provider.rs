@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::common::abstract_cfg::{AssignValue, TransferEffect};
 use crate::common::adapter::ReturnSummary;
 use crate::common::formula::{Formula, Sort, Term};
 use crate::may_must_analysis::llm_response_parser;
@@ -140,10 +141,57 @@ impl LlmBackend for SubprocessLlmBackend {
 }
 
 pub fn collect_variable_sorts(
-    _loop_info: &LoopInfo,
-    _cfg: &crate::common::abstract_cfg::AbstractCfg,
+    loop_info: &LoopInfo,
+    cfg: &crate::common::abstract_cfg::AbstractCfg,
 ) -> BTreeMap<String, Sort> {
-    BTreeMap::new()
+    let mut sorts = BTreeMap::new();
+    for node_id in &loop_info.body {
+        let Ok(node) = cfg.node(*node_id) else {
+            continue;
+        };
+        for effect in &node.transfer.effects {
+            match effect {
+                TransferEffect::Assign { target, value } => {
+                    sorts.insert(target.name().to_string(), target.sort());
+                    match value {
+                        AssignValue::Term(term) => collect_term_var_sorts(term, &mut sorts),
+                        AssignValue::Predicate(formula) => {
+                            collect_formula_var_sorts_rec(formula, &mut sorts)
+                        }
+                    }
+                }
+                TransferEffect::Assume(formula) | TransferEffect::Obligation(formula) => {
+                    collect_formula_var_sorts_rec(formula, &mut sorts);
+                }
+                TransferEffect::Load { target, .. } => {
+                    sorts.insert(target.name().to_string(), target.sort());
+                }
+                TransferEffect::MemoryStore { offset, value, .. } => {
+                    collect_term_var_sorts(offset, &mut sorts);
+                    collect_term_var_sorts(value, &mut sorts);
+                }
+                TransferEffect::GetElementPtr { offset, .. } => {
+                    collect_term_var_sorts(offset, &mut sorts);
+                }
+                TransferEffect::Store { value, .. } => collect_term_var_sorts(value, &mut sorts),
+                TransferEffect::Alloca { .. }
+                | TransferEffect::PointerStore { .. }
+                | TransferEffect::PointerLoad { .. }
+                | TransferEffect::Nop
+                | TransferEffect::Call { .. } => {}
+            }
+        }
+    }
+    for edge_id in cfg.edge_ids() {
+        let Ok(edge) = cfg.edge(edge_id) else {
+            continue;
+        };
+        if !loop_info.body.contains(&edge.source) && edge.target != loop_info.header {
+            continue;
+        }
+        collect_formula_var_sorts_rec(&edge.guard, &mut sorts);
+    }
+    sorts
 }
 
 pub fn build_full_loop_context(
@@ -154,10 +202,14 @@ pub fn build_full_loop_context(
     exit_postcondition: Formula,
     previous_attempts: Vec<CegisAttempt>,
 ) -> FullLoopContext {
+    let header_wp = cfg
+        .node(loop_info.header)
+        .map(|node| node.transfer.wp(&exit_postcondition))
+        .unwrap_or(Formula::True);
     FullLoopContext {
         base,
         assertion_location,
-        header_wp: Formula::True,
+        header_wp,
         variable_sorts: collect_variable_sorts(loop_info, cfg),
         header_label: cfg
             .node(loop_info.header)
@@ -167,10 +219,33 @@ pub fn build_full_loop_context(
             .node(loop_info.latch)
             .map(|node| clean_node_label(&node.label))
             .unwrap_or_default(),
-        header_out_edges: Vec::new(),
-        entry_edges: Vec::new(),
-        body_node_labels: Vec::new(),
-        exit_edges: Vec::new(),
+        header_out_edges: cfg
+            .outgoing_edges(loop_info.header)
+            .into_iter()
+            .filter_map(|edge_id| cfg.edge(edge_id).ok().map(format_edge))
+            .collect(),
+        entry_edges: cfg
+            .incoming_edges(loop_info.header)
+            .into_iter()
+            .filter_map(|edge_id| {
+                let edge = cfg.edge(edge_id).ok()?;
+                (!loop_info.body.contains(&edge.source)).then(|| format_edge(edge))
+            })
+            .collect(),
+        body_node_labels: loop_info
+            .body
+            .iter()
+            .filter_map(|node_id| {
+                cfg.node(*node_id)
+                    .ok()
+                    .map(|node| clean_node_label(&node.label))
+            })
+            .collect(),
+        exit_edges: loop_info
+            .exit_edges
+            .iter()
+            .filter_map(|edge_id| cfg.edge(*edge_id).ok().map(format_edge))
+            .collect(),
         back_edge_guard: loop_info.back_edge_guard.clone(),
         source_location: loop_info.source_location.as_ref().map(ToString::to_string),
         exit_postcondition,
@@ -259,6 +334,10 @@ fn tagged<'a>(raw: &'a str, tag: &str) -> Option<&'a str> {
     let start = raw.find(&open)? + open.len();
     let end = raw[start..].find(&close)? + start;
     Some(&raw[start..end])
+}
+
+fn format_edge(edge: &crate::common::abstract_cfg::AbstractEdge) -> String {
+    format!("{:?} --{}--> {:?}", edge.source, edge.guard, edge.target)
 }
 
 fn collect_formula_var_sorts_rec(formula: &Formula, vars: &mut BTreeMap<String, Sort>) {

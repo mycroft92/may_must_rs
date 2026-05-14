@@ -240,6 +240,16 @@ fn print_module_report(report: &ModuleReport, graphs: &[FunctionGraph], show_sum
                 );
             }
         }
+        println!("[loop invariants]");
+        for name in report.summaries.all_procedure_names() {
+            for (header, invariant) in report.summaries.get_loop_invariants(&name) {
+                println!(
+                    "  {name} @ {:?}: {}",
+                    header,
+                    backward::pretty_formula(invariant)
+                );
+            }
+        }
     }
 }
 
