@@ -593,7 +593,7 @@ fn lower_node_transfer(
                     value_ptr: pointer_name(function_name, stored),
                 });
             } else {
-                let value = lower_integer_value(function_name, stored)?;
+                let value = lower_numeric_value(function_name, stored)?;
                 effects.push(TransferEffect::Store { target, value });
             }
         }
@@ -868,24 +868,50 @@ fn resolve_memory_effects(cfg: &mut AbstractCfg) {
                 }
                 TransferEffect::Load { target, source } => {
                     if let Some(binding) = env.get(&source) {
-                        rewritten.push(TransferEffect::Assign {
-                            target,
-                            value: AssignValue::Term(Term::select(
-                                crate::common::formula::Memory::var(&binding.region),
-                                binding.offset.clone(),
-                            )),
-                        });
+                        if target.sort() == Sort::Real {
+                            if let Some(slot) =
+                                scalar_memory_slot_var(&binding.region, &binding.offset, Sort::Real)
+                            {
+                                rewritten.push(TransferEffect::Assign {
+                                    target,
+                                    value: AssignValue::Term(Term::Var(slot)),
+                                });
+                            } else {
+                                rewritten.push(TransferEffect::Load { target, source });
+                            }
+                        } else {
+                            rewritten.push(TransferEffect::Assign {
+                                target,
+                                value: AssignValue::Term(Term::select(
+                                    crate::common::formula::Memory::var(&binding.region),
+                                    binding.offset.clone(),
+                                )),
+                            });
+                        }
                     } else {
                         rewritten.push(TransferEffect::Load { target, source });
                     }
                 }
                 TransferEffect::Store { target, value } => {
                     if let Some(binding) = env.get(&target) {
-                        rewritten.push(TransferEffect::MemoryStore {
-                            region: binding.region.clone(),
-                            offset: binding.offset.clone(),
-                            value,
-                        });
+                        if value.sort().ok() == Some(Sort::Real) {
+                            if let Some(slot) =
+                                scalar_memory_slot_var(&binding.region, &binding.offset, Sort::Real)
+                            {
+                                rewritten.push(TransferEffect::Assign {
+                                    target: slot,
+                                    value: AssignValue::Term(value),
+                                });
+                            } else {
+                                rewritten.push(TransferEffect::Store { target, value });
+                            }
+                        } else {
+                            rewritten.push(TransferEffect::MemoryStore {
+                                region: binding.region.clone(),
+                                offset: binding.offset.clone(),
+                                value,
+                            });
+                        }
                     } else {
                         rewritten.push(TransferEffect::Store { target, value });
                     }
@@ -915,6 +941,13 @@ fn resolve_memory_effects(cfg: &mut AbstractCfg) {
         if let Ok(node) = cfg.node_mut(node_id) {
             node.transfer.effects = rewritten;
         }
+    }
+}
+
+fn scalar_memory_slot_var(region: &str, offset: &Term, sort: Sort) -> Option<Var> {
+    match offset {
+        Term::Int(value) => Some(Var::new(format!("{region}$slot{value}"), sort)),
+        _ => None,
     }
 }
 

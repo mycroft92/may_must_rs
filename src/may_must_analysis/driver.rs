@@ -447,6 +447,33 @@ mod tests {
     }
 
     #[test]
+    fn float_local_store_and_load_do_not_block_integer_assertions() {
+        with_graphs(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @main() {
+                entry:
+                    %average = alloca float
+                    %sumf = sitofp i32 6 to float
+                    %lenf = sitofp i32 2 to float
+                    %div = fdiv float %sumf, %lenf
+                    store float %div, ptr %average
+                    %loaded = load float, ptr %average
+                    %ok = icmp eq i32 1, 1
+                    call void @may_assert(i1 %ok)
+                    ret i32 0
+                }
+            "#,
+            |graphs| {
+                let oracle = Oracle::new();
+                let report = analyze_function_graph(&graphs[0], &oracle).unwrap();
+                assert_eq!(report.verdict(), SafetyVerdict::Safe);
+            },
+        );
+    }
+
+    #[test]
     fn extern_summary_via_provider_is_used() {
         with_graphs(
             r#"
