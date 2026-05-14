@@ -1,92 +1,270 @@
-//! CLI entry point for the current LLVM-to-abstract-CFG prototype.
-//!
-//! The binary parses LLVM bitcode, builds raw instruction graphs, optionally
-//! emits DOT output, lowers each procedure into the current abstract CFG, and
-//! runs the active backward safety checker. Loops are still reported honestly:
-//! cyclic CFGs remain unsupported by the checker and therefore yield
-//! `UNKNOWN`.
+//! CLI entrypoint for the reconstructed may/must analyzer.
 
-mod analysis;
-mod assertions;
-mod errors;
-mod expressions;
-mod llvm_utils;
-mod smt;
+mod absint_analysis;
+mod common;
+mod may_must_analysis;
 
-use analysis::driver::ProcedureReport;
 use clap::{arg, command, value_parser};
-use llvm_utils::llvm_wrap::{initialize_target, Context, Module};
-use llvm_utils::program_graph::{dump_graphs, generate_program_graph};
+use common::adapter::{ReturnSummary, WriteEffectSummary};
+use common::llvm_utils::llvm_wrap::{initialize_target, Context, Module};
+use common::llvm_utils::program_graph::{dump_graphs, generate_program_graph, FunctionGraph};
+use common::oracle::Oracle;
+use env_logger::{Builder, Env};
+use may_must_analysis::backward::{self, InvariantConfig, InvariantMethod, LlmInvariantConfig};
+use may_must_analysis::driver::{ModuleReport, SafetyVerdict};
+use may_must_analysis::llm_provider::SubprocessLlmBackend;
+use may_must_analysis::providers::NoProvider;
 use std::path::Path;
 
-enum CliReport {
-    Checked(ProcedureReport),
-    Unsupported { procedure: String, reason: String },
-}
+const DEFAULT_LLM_SCRIPT: &str = "tools/llm_invariant.py";
+const DEFAULT_LLM_MODEL: &str = "anthropic::claude-4-5-sonnet";
+const DEFAULT_LLM_TRIES: usize = 5;
 
 fn main() {
     let matches = command!()
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
+        .arg(arg!(--"show-summaries" "Print inferred summaries"))
+        .arg(arg!(--"debug-invariants" "Enable loop invariant debug logging"))
+        .arg(arg!(--"llm-invariants" "Ask an LLM backend for loop invariants"))
+        .arg(arg!(--"llm-force" "Use LLM invariant search before algorithmic search"))
+        .arg(
+            arg!(--"llm-tries" <N> "Maximum LLM invariant proposals")
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("5"),
+        )
+        .arg(
+            arg!(--"llm-model" <MODEL> "LLM backend model name")
+                .required(false)
+                .value_parser(value_parser!(String))
+                .default_value(DEFAULT_LLM_MODEL),
+        )
+        .arg(
+            arg!(--"llm-script" <PATH> "LLM subprocess script")
+                .required(false)
+                .value_parser(value_parser!(String))
+                .default_value(DEFAULT_LLM_SCRIPT),
+        )
+        .arg(
+            arg!(--"llm-prompt-template" <FILE> "Prompt template file")
+                .required(false)
+                .value_parser(value_parser!(String)),
+        )
+        .arg(arg!(--"inv-chc" "Enable CHC invariant candidates"))
+        .arg(arg!(--"inv-houdini" "Enable Houdini invariant candidates"))
+        .arg(arg!(--"inv-template" "Enable template invariant candidates"))
         .get_matches();
 
-    let input = matches.get_one::<String>("INPUT").unwrap();
-    let dump_dot = !matches.get_flag("no-dot");
+    init_logging(matches.get_flag("debug-invariants"));
     initialize_target();
 
+    let input = matches.get_one::<String>("INPUT").unwrap();
     let context = Context::new();
     let Some(module) = context.parse_bc_file(input) else {
         eprintln!("Unable to parse bitcode file: {input}");
         std::process::exit(1);
     };
-    handle(module, input, dump_dot);
+
+    let inv_config = invariant_config(&matches);
+    handle(
+        module,
+        input,
+        !matches.get_flag("no-dot"),
+        matches.get_flag("show-summaries"),
+        inv_config,
+    );
 }
 
-fn handle(module: Module, input_file: &str, dump_dot: bool) {
-    match generate_program_graph(&module) {
-        Ok(graphs) => {
-            let memory_pure_functions = analysis::adapter::infer_memory_pure_functions(&graphs);
-            if dump_dot {
-                let out_dir = graph_output_dir(input_file);
-                dump_graphs(&graphs, &out_dir);
-                println!("DOT graphs written to {out_dir}");
-            }
-            for graph in &graphs {
-                println!(
-                    "Function {}: {} visible instructions, {} assertion sites",
-                    graph.name,
-                    graph.vertices.len(),
-                    graph.asserts.len()
-                );
-            }
-            let oracle = analysis::oracle::Oracle::new();
+fn init_logging(debug_invariants: bool) {
+    let default_filter = if debug_invariants {
+        "info,loop_invariant=debug"
+    } else {
+        "info"
+    };
+    Builder::from_env(Env::default().default_filter_or(default_filter)).init();
+}
 
-            println!();
-            println!("Analysis summaries:");
-            let reports =
-                collect_reports(&graphs, &memory_pure_functions, &oracle).unwrap_or_else(|error| {
-                    eprintln!("{error}");
-                    std::process::exit(1);
-                });
-            for report in reports {
-                match report {
-                    CliReport::Checked(report) => {
-                        println!("{report}");
-                        println!("  verdict: {}", report.verdict());
-                    }
-                    CliReport::Unsupported { procedure, reason } => {
-                        println!("procedure {procedure}");
-                        println!("  unsupported: {reason}");
-                        println!("  verdict: UNKNOWN");
-                    }
-                }
-                println!();
-            }
+fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
+    let mut methods = Vec::new();
+    if matches.get_flag("inv-chc") {
+        methods.push(InvariantMethod::Chc);
+    }
+    if matches.get_flag("inv-houdini") {
+        methods.push(InvariantMethod::Houdini);
+    }
+    if matches.get_flag("inv-template") {
+        methods.push(InvariantMethod::Template);
+    }
+
+    let llm_enabled = matches.get_flag("llm-invariants") || matches.get_flag("llm-force");
+    let llm = llm_enabled.then(|| {
+        let script_path = matches
+            .get_one::<String>("llm-script")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_LLM_SCRIPT.to_string());
+        let model = matches
+            .get_one::<String>("llm-model")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
+        let max_tries = *matches
+            .get_one::<usize>("llm-tries")
+            .unwrap_or(&DEFAULT_LLM_TRIES);
+        let prompt_template = matches
+            .get_one::<String>("llm-prompt-template")
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        LlmInvariantConfig {
+            backend: Box::new(SubprocessLlmBackend { script_path, model }),
+            max_tries,
+            force: matches.get_flag("llm-force"),
+            prompt_template,
         }
+    });
+
+    InvariantConfig {
+        methods,
+        llm,
+        skip_algorithmic: false,
+    }
+}
+
+fn handle(
+    module: Module,
+    input_file: &str,
+    dump_dot: bool,
+    show_summaries: bool,
+    inv_config: InvariantConfig,
+) {
+    let graphs = match generate_program_graph(&module) {
+        Ok(graphs) => graphs,
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(1);
         }
+    };
+
+    if dump_dot {
+        let out_dir = graph_output_dir(input_file);
+        dump_graphs(&graphs, &out_dir);
+        println!("DOT graphs written to {out_dir}");
+    }
+    for graph in &graphs {
+        println!(
+            "Function {}: {} visible instructions, {} assertion sites",
+            graph.name,
+            graph.vertices.len(),
+            graph.asserts.len()
+        );
+    }
+
+    let memory_pure = common::adapter::infer_memory_pure_functions(&graphs);
+    let oracle = Oracle::new();
+    let report = may_must_analysis::driver::analyze_module_with_llm(
+        &graphs,
+        &memory_pure,
+        &NoProvider,
+        &oracle,
+        &inv_config,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+
+    print_module_report(&report, &graphs, show_summaries);
+}
+
+fn print_module_report(report: &ModuleReport, graphs: &[FunctionGraph], show_summaries: bool) {
+    println!();
+    println!("Analysis summaries:");
+    let mut module_verdict = SafetyVerdict::Safe;
+    for procedure in &report.reports {
+        let graph = graphs
+            .iter()
+            .find(|graph| graph.name == procedure.procedure);
+        let assertion_count = procedure.assertions.len();
+        let instruction_count = graph
+            .map(|graph| graph.vertices.len())
+            .unwrap_or(procedure.instruction_count);
+        let loop_count = procedure.loop_count;
+        let recursive = procedure.recursive;
+        println!(
+            "procedure {}  [{} assertion(s), {} instruction(s){}{}]",
+            procedure.procedure,
+            assertion_count,
+            instruction_count,
+            if loop_count > 0 {
+                format!(" | {loop_count} loop(s)")
+            } else {
+                String::new()
+            },
+            if recursive { " | recursive" } else { "" }
+        );
+        for assertion in &procedure.assertions {
+            println!("{}", backward::render_result(assertion));
+        }
+        for failure in &procedure.failures {
+            println!("  unsupported: {failure}");
+        }
+        if recursive {
+            println!("  note: procedure participates in a direct or indirect call cycle");
+        }
+        let verdict = procedure.verdict();
+        println!("  verdict: {verdict}");
+        module_verdict = combine_verdict(module_verdict, verdict);
+        println!();
+    }
+    println!("module verdict: {module_verdict}");
+
+    if show_summaries {
+        println!();
+        println!("[return summaries]");
+        for summary in &report.computed_summaries {
+            print_summary(summary);
+        }
+        println!("[must summaries]");
+        for name in report.summaries.all_procedure_names() {
+            for summary in report.summaries.must(&name) {
+                println!(
+                    "  {name}: {} => {}",
+                    summary.precondition, summary.postcondition
+                );
+            }
+        }
+        println!("[not-may summaries]");
+        for name in report.summaries.all_procedure_names() {
+            for summary in report.summaries.notmay(&name) {
+                println!(
+                    "  {name}: {} => {}",
+                    summary.precondition, summary.postcondition
+                );
+            }
+        }
+    }
+}
+
+fn print_summary(summary: &ReturnSummary) {
+    println!("  {}:", summary.function);
+    println!("    params: {}", summary.formal_parameters.join(", "));
+    println!("    retval: {}", summary.retval_name);
+    println!("    relation: {}", summary.relation);
+    for write in &summary.write_effects {
+        print_write_effect(write);
+    }
+}
+
+fn print_write_effect(write: &WriteEffectSummary) {
+    println!(
+        "    write param #{} {} -> {}: {}",
+        write.param_index, write.ext_region_name, write.obs_name, write.relation
+    );
+}
+
+fn combine_verdict(lhs: SafetyVerdict, rhs: SafetyVerdict) -> SafetyVerdict {
+    match (lhs, rhs) {
+        (SafetyVerdict::Unsafe, _) | (_, SafetyVerdict::Unsafe) => SafetyVerdict::Unsafe,
+        (SafetyVerdict::Unknown, _) | (_, SafetyVerdict::Unknown) => SafetyVerdict::Unknown,
+        (SafetyVerdict::Safe, SafetyVerdict::Safe) => SafetyVerdict::Safe,
     }
 }
 
@@ -98,67 +276,12 @@ fn graph_output_dir(input_file: &str) -> String {
     format!("graph_dot/{stem}")
 }
 
-fn collect_reports(
-    graphs: &[llvm_utils::program_graph::FunctionGraph],
-    memory_pure_functions: &std::collections::BTreeSet<String>,
-    oracle: &analysis::oracle::Oracle,
-) -> Result<Vec<CliReport>, analysis::driver::DriverError> {
-    match analysis::driver::analyze_module(graphs, memory_pure_functions, oracle) {
-        Ok(reports) => Ok(reports.into_iter().map(CliReport::Checked).collect()),
-        Err(_) => {
-            let mut reports = Vec::new();
-            for graph in graphs {
-                match analysis::driver::analyze_function_graph_with_purity(
-                    graph,
-                    memory_pure_functions,
-                    oracle,
-                ) {
-                    Ok(report) => reports.push(CliReport::Checked(report)),
-                    Err(error) => reports.push(CliReport::Unsupported {
-                        procedure: graph.name.clone(),
-                        reason: error.to_string(),
-                    }),
-                }
-            }
-            Ok(reports)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn graph_output_dir_uses_input_stem() {
-        assert_eq!(graph_output_dir("/tmp/sample.bc"), "graph_dot/sample");
-    }
-
-    #[test]
-    fn collect_reports_falls_back_to_unsupported_entries() {
-        initialize_target();
-        let context = Context::new();
-        let module = context
-            .parse_ir_str(
-                r#"
-                    declare void @may_assert(i1)
-                    define void @main(float %x) {
-                    entry:
-                        %c = fcmp ogt float %x, 0.0
-                        call void @may_assert(i1 %c)
-                        ret void
-                    }
-                "#,
-                "test",
-            )
-            .unwrap();
-        let graphs = generate_program_graph(&module).unwrap();
-        let oracle = analysis::oracle::Oracle::new();
-        let reports = collect_reports(&graphs, &std::collections::BTreeSet::new(), &oracle)
-            .expect("fallback reporting should succeed");
-        assert!(matches!(
-            reports.as_slice(),
-            [CliReport::Unsupported { procedure, .. }] if procedure == "main"
-        ));
+        assert_eq!(graph_output_dir("tests/out/foo.bc"), "graph_dot/foo");
     }
 }
