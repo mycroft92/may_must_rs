@@ -1,6 +1,5 @@
-# GPTREPRODUCER
-
-Ignore `REPRODUCER.md`. Reconstruct current repo state from this file only.
+# REPRODUCER
+Reconstruct current repo state from this file only.
 
 Assumption already available:
 - `src/common/llvm_utils/llvm_wrap.rs`
