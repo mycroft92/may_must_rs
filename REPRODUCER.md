@@ -107,7 +107,7 @@ Purpose: CLI entrypoint; always dispatch through `may_must_analysis::driver::ana
 
 Exact constants:
 - `DEFAULT_LLM_SCRIPT = "tools/llm_invariant.py"`
-- `DEFAULT_LLM_MODEL = "anthropic::claude-4-5-sonnet"`
+- `DEFAULT_LLM_MODEL = "gpt-5.3"`
 - `DEFAULT_LLM_TRIES = 5`
 
 Module declarations:

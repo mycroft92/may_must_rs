@@ -17,7 +17,7 @@ use may_must_analysis::providers::NoProvider;
 use std::path::Path;
 
 const DEFAULT_LLM_SCRIPT: &str = "tools/llm_invariant.py";
-const DEFAULT_LLM_MODEL: &str = "anthropic::claude-4-5-sonnet";
+const DEFAULT_LLM_MODEL: &str = "gpt-5.3";
 const DEFAULT_LLM_TRIES: usize = 5;
 
 fn main() {
