@@ -1,5 +1,5 @@
 #include <stdio.h>
-
+#include "local_assert.h"
 int main() {
     // Declare and initialize an array
     int numbers[5] = {10, 20, 30, 40, 50};
@@ -31,5 +31,10 @@ int main() {
     }
     printf("Maximum: %d\n", max);
     
+    may_assert(max >= numbers[0]);
+    may_assert(max >= numbers[1]);
+    may_assert(max >= numbers[2]);
+    may_assert(max >= numbers[3]);
+    may_assert(max >= numbers[4]);
     return 0;
 }
