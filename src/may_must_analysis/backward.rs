@@ -1,16 +1,17 @@
 #![allow(dead_code)]
 
-use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, TransferEffect};
+use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId};
 use crate::common::adapter::AssertionSite;
 use crate::common::formula::Formula;
 use crate::common::oracle::{Oracle, OracleError};
 use crate::may_must_analysis::llm_provider::{
-    build_full_loop_context, build_loop_invariant_prompt, parse_candidate, CegisAttempt, LlmBackend,
+    build_full_loop_context, build_loop_invariant_prompt, collect_variable_sorts, parse_candidate,
+    CegisAttempt, LlmBackend,
 };
 use crate::may_must_analysis::loops::{
     algorithmic_candidates, chc_loop_invariant, check_loop_invariant_verbose,
-    collect_loop_body_int_constants, detect_loops, houdini_candidates, sort_innermost_first,
-    InvariantCheckResult,
+    collect_loop_body_int_constants, detect_loops, houdini_candidates, normalize_candidate,
+    sort_innermost_first, InvariantCheckResult,
 };
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::providers::LoopContext;
@@ -117,9 +118,6 @@ fn run_backward(
     loop_invariants: &[(CfgNodeId, Formula)],
     tables: &SummaryTables,
 ) -> Result<AssertionResult, BackwardError> {
-    let mut cfg = cfg.clone();
-    inject_loop_invariants(&mut cfg, loop_invariants)?;
-
     let order = cfg
         .topological_order_excluding(excluded_edges)
         .ok_or(BackwardError::CyclicCfgUnsupported)?;
@@ -131,10 +129,13 @@ fn run_backward(
         engine.block_edge(*edge);
     }
 
-    for node in &order {
-        for edge in cfg.outgoing_edges(*node) {
-            engine.must_post(edge)?;
-        }
+    for (header, invariant) in conjunct_loop_invariants(loop_invariants) {
+        let summary = engine.summary_mut(header)?;
+        summary.reach = if summary.reach == Formula::False {
+            invariant
+        } else {
+            Formula::and(summary.reach.clone(), invariant)
+        };
     }
 
     let neg_obligation = Formula::not(site.obligation.clone());
@@ -167,7 +168,7 @@ fn run_backward(
 pub fn discover_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
-    _oracle: &Oracle,
+    oracle: &Oracle,
 ) -> Option<Vec<(CfgNodeId, Formula)>> {
     if cfg.topological_order().is_some() {
         return None;
@@ -184,10 +185,20 @@ pub fn discover_loop_invariants(
             index + 1,
             format_candidates(&candidates)
         );
-        let Some(candidate) = candidates.into_iter().next() else {
+        let Some(candidate) = first_accepted_candidate(
+            function,
+            index + 1,
+            "algorithmic-precompute",
+            &loop_info,
+            cfg,
+            &candidates,
+            oracle,
+            &BTreeMap::new(),
+            &accepted,
+        ) else {
             log::debug!(
                 target: "loop_invariant",
-                "function {function} loop {} produced no algorithmic candidate",
+                "function {function} loop {} produced no accepted algorithmic invariant",
                 index + 1
             );
             return None;
@@ -216,7 +227,6 @@ fn synthesize_loop_invariants(
         compute_preliminary_backward_states(cfg, site, excluded_back_edges)?;
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
-    let variable_sorts = collect_variable_sorts(cfg);
     let methods = selected_methods(config);
     let skip_algorithmic = config.is_some_and(|config| config.skip_algorithmic);
     let llm_config = config.and_then(|config| config.llm.as_ref());
@@ -231,7 +241,7 @@ fn synthesize_loop_invariants(
             loop_info.header,
             loop_info.body
         );
-        let augmented_cfg = cfg_with_invariants(cfg, &accepted)?;
+        let variable_sorts = collect_variable_sorts(&loop_info, cfg);
         let mut accepted_candidate = None;
 
         if !skip_algorithmic && !force_llm {
@@ -247,7 +257,7 @@ fn synthesize_loop_invariants(
                 index + 1,
                 "algorithmic",
                 &loop_info,
-                &augmented_cfg,
+                cfg,
                 &candidates,
                 oracle,
                 &assertion_postconditions,
@@ -270,7 +280,7 @@ fn synthesize_loop_invariants(
                 index + 1,
                 "chc",
                 &loop_info,
-                &augmented_cfg,
+                cfg,
                 &candidates,
                 oracle,
                 &assertion_postconditions,
@@ -296,7 +306,7 @@ fn synthesize_loop_invariants(
                 index + 1,
                 "houdini",
                 &loop_info,
-                &augmented_cfg,
+                cfg,
                 &candidates,
                 oracle,
                 &assertion_postconditions,
@@ -315,11 +325,8 @@ fn synthesize_loop_invariants(
 
         if accepted_candidate.is_none() {
             if let Some(llm) = llm_config {
-                let exit_postcondition = exit_postcondition_for_loop(
-                    &loop_info,
-                    &assertion_postconditions,
-                    &augmented_cfg,
-                );
+                let exit_postcondition =
+                    exit_postcondition_for_loop(&loop_info, &assertion_postconditions, cfg);
                 let mut attempts = Vec::<CegisAttempt>::new();
                 for _ in 0..llm.max_tries.max(1) {
                     let ctx = build_full_loop_context(
@@ -328,7 +335,7 @@ fn synthesize_loop_invariants(
                             loop_id: index + 1,
                         },
                         &loop_info,
-                        &augmented_cfg,
+                        cfg,
                         site.location.clone(),
                         exit_postcondition.clone(),
                         attempts.clone(),
@@ -353,7 +360,7 @@ fn synthesize_loop_invariants(
                     };
                     let result = check_loop_invariant_verbose(
                         &loop_info,
-                        &augmented_cfg,
+                        cfg,
                         &candidate,
                         oracle,
                         &assertion_postconditions,
@@ -435,109 +442,6 @@ fn compute_preliminary_backward_states(
         .collect())
 }
 
-fn collect_variable_sorts(cfg: &AbstractCfg) -> BTreeMap<String, crate::common::formula::Sort> {
-    let mut sorts = BTreeMap::new();
-    for node in cfg.nodes().values() {
-        for effect in &node.transfer.effects {
-            collect_effect_sorts(effect, &mut sorts);
-        }
-    }
-    for edge in cfg.edges().values() {
-        collect_formula_sorts(&edge.guard, &mut sorts);
-        for effect in &edge.effects {
-            collect_effect_sorts(effect, &mut sorts);
-        }
-    }
-    sorts
-}
-
-fn collect_effect_sorts(
-    effect: &TransferEffect,
-    sorts: &mut BTreeMap<String, crate::common::formula::Sort>,
-) {
-    use crate::common::abstract_cfg::AssignValue;
-    match effect {
-        TransferEffect::Assign { target, value } => {
-            sorts.insert(target.name().to_string(), target.sort());
-            match value {
-                AssignValue::Term(term) => collect_term_sorts(term, sorts),
-                AssignValue::Predicate(formula) => collect_formula_sorts(formula, sorts),
-            }
-        }
-        TransferEffect::Assume(formula) | TransferEffect::Obligation(formula) => {
-            collect_formula_sorts(formula, sorts)
-        }
-        TransferEffect::Load { target, .. } => {
-            sorts.insert(target.name().to_string(), target.sort());
-        }
-        TransferEffect::MemoryStore { offset, value, .. } => {
-            collect_term_sorts(offset, sorts);
-            collect_term_sorts(value, sorts);
-        }
-        TransferEffect::GetElementPtr { offset, .. }
-        | TransferEffect::Store { value: offset, .. } => {
-            collect_term_sorts(offset, sorts);
-        }
-        TransferEffect::Alloca { .. }
-        | TransferEffect::PointerStore { .. }
-        | TransferEffect::PointerLoad { .. }
-        | TransferEffect::Nop
-        | TransferEffect::Call { .. } => {}
-    }
-}
-
-fn collect_formula_sorts(
-    formula: &Formula,
-    sorts: &mut BTreeMap<String, crate::common::formula::Sort>,
-) {
-    match formula {
-        Formula::True | Formula::False => {}
-        Formula::Var(var) => {
-            sorts.insert(var.name().to_string(), var.sort());
-        }
-        Formula::Not(inner) => collect_formula_sorts(inner, sorts),
-        Formula::And(items) | Formula::Or(items) => {
-            for item in items {
-                collect_formula_sorts(item, sorts);
-            }
-        }
-        Formula::Implies(lhs, rhs) => {
-            collect_formula_sorts(lhs, sorts);
-            collect_formula_sorts(rhs, sorts);
-        }
-        Formula::Eq(lhs, rhs)
-        | Formula::Lt(lhs, rhs)
-        | Formula::Le(lhs, rhs)
-        | Formula::Gt(lhs, rhs)
-        | Formula::Ge(lhs, rhs) => {
-            collect_term_sorts(lhs, sorts);
-            collect_term_sorts(rhs, sorts);
-        }
-        Formula::MemoryEq(_, _) => {}
-    }
-}
-
-fn collect_term_sorts(
-    term: &crate::common::formula::Term,
-    sorts: &mut BTreeMap<String, crate::common::formula::Sort>,
-) {
-    use crate::common::formula::Term;
-
-    match term {
-        Term::Var(var) => {
-            sorts.insert(var.name().to_string(), var.sort());
-        }
-        Term::Int(_) | Term::Real(_) => {}
-        Term::BoolToInt(inner) => collect_formula_sorts(inner, sorts),
-        Term::Select(_, index) => collect_term_sorts(index, sorts),
-        Term::Add(lhs, rhs) | Term::Sub(lhs, rhs) | Term::Mul(lhs, rhs) | Term::Div(lhs, rhs) => {
-            collect_term_sorts(lhs, sorts);
-            collect_term_sorts(rhs, sorts);
-        }
-        Term::Neg(inner) => collect_term_sorts(inner, sorts),
-    }
-}
-
 fn selected_methods(config: Option<&InvariantConfig>) -> Vec<InvariantMethod> {
     let Some(config) = config else {
         return vec![
@@ -557,28 +461,17 @@ fn selected_methods(config: Option<&InvariantConfig>) -> Vec<InvariantMethod> {
     }
 }
 
-fn cfg_with_invariants(
-    cfg: &AbstractCfg,
-    invariants: &[(CfgNodeId, Formula)],
-) -> Result<AbstractCfg, BackwardError> {
-    let mut cfg = cfg.clone();
-    inject_loop_invariants(&mut cfg, invariants)?;
-    Ok(cfg)
-}
-
-fn inject_loop_invariants(
-    cfg: &mut AbstractCfg,
-    invariants: &[(CfgNodeId, Formula)],
-) -> Result<(), BackwardError> {
-    for (node, invariant) in invariants {
-        let header = cfg
-            .node_mut(*node)
-            .map_err(|_| crate::may_must_analysis::rules::RuleError::UnknownNode { node: *node })?;
-        let mut effects = vec![TransferEffect::Assume(invariant.clone())];
-        effects.extend(std::mem::take(&mut header.transfer.effects));
-        header.transfer.effects = effects;
+fn conjunct_loop_invariants(invariants: &[(CfgNodeId, Formula)]) -> BTreeMap<CfgNodeId, Formula> {
+    let mut combined = BTreeMap::new();
+    for (header, invariant) in invariants {
+        combined
+            .entry(*header)
+            .and_modify(|current: &mut Formula| {
+                *current = Formula::and(current.clone(), invariant.clone());
+            })
+            .or_insert_with(|| invariant.clone());
     }
-    Ok(())
+    combined
 }
 
 fn first_accepted_candidate(
@@ -593,6 +486,7 @@ fn first_accepted_candidate(
     accepted_inner: &[(CfgNodeId, Formula)],
 ) -> Option<Formula> {
     for candidate in candidates {
+        let normalized = normalize_candidate(cfg, loop_info.header, candidate);
         let result = check_loop_invariant_verbose(
             loop_info,
             cfg,
@@ -606,11 +500,11 @@ fn first_accepted_candidate(
             "function {function} loop {} {} candidate {} => {}",
             loop_index,
             phase,
-            pretty_formula(candidate),
+            pretty_formula(&normalized),
             render_invariant_result(&result)
         );
         if result == InvariantCheckResult::Accepted {
-            return Some(candidate.clone());
+            return Some(normalized);
         }
     }
     None

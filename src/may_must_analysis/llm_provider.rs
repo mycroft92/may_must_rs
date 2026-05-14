@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::common::abstract_cfg::{AssignValue, TransferEffect};
+use crate::common::abstract_cfg::TransferEffect;
 use crate::common::adapter::ReturnSummary;
 use crate::common::formula::{Formula, Sort, Term};
 use crate::may_must_analysis::llm_response_parser;
@@ -150,47 +150,12 @@ pub fn collect_variable_sorts(
             continue;
         };
         for effect in &node.transfer.effects {
-            match effect {
-                TransferEffect::Assign { target, value } => {
-                    sorts.insert(target.name().to_string(), target.sort());
-                    match value {
-                        AssignValue::Term(term) => collect_term_var_sorts(term, &mut sorts),
-                        AssignValue::Predicate(formula) => {
-                            collect_formula_var_sorts_rec(formula, &mut sorts)
-                        }
-                    }
-                }
-                TransferEffect::Assume(formula) | TransferEffect::Obligation(formula) => {
-                    collect_formula_var_sorts_rec(formula, &mut sorts);
-                }
-                TransferEffect::Load { target, .. } => {
-                    sorts.insert(target.name().to_string(), target.sort());
-                }
-                TransferEffect::MemoryStore { offset, value, .. } => {
-                    collect_term_var_sorts(offset, &mut sorts);
-                    collect_term_var_sorts(value, &mut sorts);
-                }
-                TransferEffect::GetElementPtr { offset, .. } => {
-                    collect_term_var_sorts(offset, &mut sorts);
-                }
-                TransferEffect::Store { value, .. } => collect_term_var_sorts(value, &mut sorts),
-                TransferEffect::Alloca { .. }
-                | TransferEffect::PointerStore { .. }
-                | TransferEffect::PointerLoad { .. }
-                | TransferEffect::Nop
-                | TransferEffect::Call { .. } => {}
+            if let TransferEffect::Assign { target, .. } = effect {
+                sorts.insert(target.name().to_string(), target.sort());
             }
         }
     }
-    for edge_id in cfg.edge_ids() {
-        let Ok(edge) = cfg.edge(edge_id) else {
-            continue;
-        };
-        if !loop_info.body.contains(&edge.source) && edge.target != loop_info.header {
-            continue;
-        }
-        collect_formula_var_sorts_rec(&edge.guard, &mut sorts);
-    }
+    let _ = cfg;
     sorts
 }
 

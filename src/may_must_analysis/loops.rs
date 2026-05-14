@@ -36,6 +36,12 @@ pub enum InvariantCheckResult {
     ExitClosureFailed { exit_edge: CfgEdgeId },
 }
 
+pub fn normalize_candidate(cfg: &AbstractCfg, header: CfgNodeId, candidate: &Formula) -> Formula {
+    cfg.node(header)
+        .map(|node| node.transfer.wp(candidate))
+        .unwrap_or_else(|_| candidate.clone())
+}
+
 pub fn fmt_loop_loc(info: &LoopInfo) -> String {
     info.source_location
         .as_ref()
@@ -89,21 +95,22 @@ pub fn sort_innermost_first(loops: &mut [LoopInfo]) {
 }
 
 pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula> {
+    let defs = collect_loop_definitions(info, cfg);
     let mut candidates = Vec::new();
-    push_nontrivial(&mut candidates, info.back_edge_guard.clone());
-    emit_counter_bounds(&mut candidates, &info.back_edge_guard);
+    push_candidate(&mut candidates, &defs, info.back_edge_guard.clone());
+    emit_counter_bounds(&mut candidates, &defs, &info.back_edge_guard);
     for edge_id in cfg.outgoing_edges(info.header) {
         if let Ok(edge) = cfg.edge(edge_id) {
             if info.body.contains(&edge.target) {
-                push_nontrivial(&mut candidates, edge.guard.clone());
-                emit_counter_bounds(&mut candidates, &edge.guard);
+                push_candidate(&mut candidates, &defs, edge.guard.clone());
+                emit_counter_bounds(&mut candidates, &defs, &edge.guard);
             }
         }
     }
     for edge_id in &info.exit_edges {
         if let Ok(edge) = cfg.edge(*edge_id) {
-            push_nontrivial(&mut candidates, Formula::not(edge.guard.clone()));
-            emit_counter_bounds(&mut candidates, &edge.guard);
+            push_candidate(&mut candidates, &defs, Formula::not(edge.guard.clone()));
+            emit_counter_bounds(&mut candidates, &defs, &edge.guard);
         }
     }
     for node in &info.body {
@@ -114,12 +121,13 @@ pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula
                         target,
                         value: AssignValue::Predicate(predicate),
                     } => {
-                        push_nontrivial(&mut candidates, predicate.clone());
-                        push_nontrivial(&mut candidates, Formula::not(predicate.clone()));
-                        emit_counter_bounds(&mut candidates, predicate);
+                        push_candidate(&mut candidates, &defs, predicate.clone());
+                        push_candidate(&mut candidates, &defs, Formula::not(predicate.clone()));
+                        emit_counter_bounds(&mut candidates, &defs, predicate);
                         if target.sort() == Sort::Bool {
-                            push_nontrivial(
+                            push_candidate(
                                 &mut candidates,
+                                &defs,
                                 Formula::implies(Formula::Var(target.clone()), predicate.clone()),
                             );
                         }
@@ -128,8 +136,9 @@ pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula
                         target,
                         value: AssignValue::Term(Term::Int(value)),
                     } if target.sort() == Sort::Int => {
-                        push_nontrivial(
+                        push_candidate(
                             &mut candidates,
+                            &defs,
                             Formula::ge(Term::Var(target.clone()), Term::int(*value)),
                         );
                     }
@@ -138,8 +147,9 @@ pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula
                         value: AssignValue::Term(term),
                     } if target.sort() == Sort::Int => {
                         if is_self_increment(target, term) {
-                            push_nontrivial(
+                            push_candidate(
                                 &mut candidates,
+                                &defs,
                                 Formula::ge(Term::Var(target.clone()), Term::int(0)),
                             );
                         }
@@ -241,14 +251,17 @@ pub fn check_loop_invariant_verbose(
     candidate: &Formula,
     oracle: &Oracle,
     assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    _inner: InnerInvariants<'_>,
+    inner: InnerInvariants<'_>,
 ) -> InvariantCheckResult {
+    let candidate = normalize_candidate(cfg, info.header, candidate);
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
     let Some(initiation_states) = backward_states(
         cfg,
         &[(info.header, Formula::not(candidate.clone()))],
         &excluded,
         None,
+        false,
+        &[],
     ) else {
         return InvariantCheckResult::InitiationFailed;
     };
@@ -266,7 +279,7 @@ pub fn check_loop_invariant_verbose(
         Ok(crate::common::oracle::Feasibility::Infeasible) => {}
     }
 
-    let Some(back_edge_requirement) = edge_source_requirement(cfg, info.back_edge, candidate)
+    let Some(back_edge_requirement) = edge_source_requirement(cfg, info.back_edge, &candidate)
     else {
         return InvariantCheckResult::InductivenessFailed;
     };
@@ -275,6 +288,8 @@ pub fn check_loop_invariant_verbose(
         &[(info.latch, back_edge_requirement)],
         &excluded,
         Some(&info.body),
+        true,
+        inner,
     ) else {
         return InvariantCheckResult::InductivenessFailed;
     };
@@ -282,7 +297,7 @@ pub fn check_loop_invariant_verbose(
         .get(&info.header)
         .cloned()
         .unwrap_or(Formula::False);
-    match oracle.implies(candidate, &inductive_header) {
+    match oracle.implies(&candidate, &inductive_header) {
         Ok(Validity::Valid) => {}
         Ok(Validity::Invalid) => return InvariantCheckResult::InductivenessFailed,
         Ok(Validity::Unknown) | Err(_) => return InvariantCheckResult::InductivenessFailed,
@@ -308,6 +323,8 @@ pub fn check_loop_invariant_verbose(
             &[(edge.source, exit_requirement)],
             &excluded,
             Some(&info.body),
+            true,
+            inner,
         ) else {
             return InvariantCheckResult::ExitClosureFailed {
                 exit_edge: *exit_edge,
@@ -317,7 +334,7 @@ pub fn check_loop_invariant_verbose(
             .get(&info.header)
             .cloned()
             .unwrap_or(Formula::False);
-        match oracle.implies(candidate, &exit_header) {
+        match oracle.implies(&candidate, &exit_header) {
             Ok(Validity::Valid) => {}
             Ok(Validity::Invalid) | Ok(Validity::Unknown) | Err(_) => {
                 return InvariantCheckResult::ExitClosureFailed {
@@ -330,21 +347,33 @@ pub fn check_loop_invariant_verbose(
     InvariantCheckResult::Accepted
 }
 
-fn emit_counter_bounds(candidates: &mut Vec<Formula>, formula: &Formula) {
+fn emit_counter_bounds(
+    candidates: &mut Vec<Formula>,
+    defs: &BTreeMap<String, AssignValue>,
+    formula: &Formula,
+) {
     let Some((counter, bound)) = extract_counter_bound(formula) else {
         return;
     };
     let lower = Formula::ge(counter.clone(), Term::int(0));
     let upper = Formula::le(counter.clone(), bound);
-    push_nontrivial(candidates, lower.clone());
-    push_nontrivial(candidates, upper.clone());
-    push_nontrivial(candidates, Formula::and(lower, upper));
+    push_candidate(candidates, defs, lower.clone());
+    push_candidate(candidates, defs, upper.clone());
+    push_candidate(candidates, defs, Formula::and(lower, upper));
 }
 
 fn push_nontrivial(candidates: &mut Vec<Formula>, formula: Formula) {
     if formula != Formula::True && formula != Formula::False && !candidates.contains(&formula) {
         candidates.push(formula);
     }
+}
+
+fn push_candidate(
+    candidates: &mut Vec<Formula>,
+    defs: &BTreeMap<String, AssignValue>,
+    formula: Formula,
+) {
+    push_nontrivial(candidates, normalize_formula_with_defs(&formula, defs));
 }
 
 fn extract_counter_bound(formula: &Formula) -> Option<(Term, Term)> {
@@ -385,6 +414,148 @@ fn is_self_increment(target: &Var, term: &Term) -> bool {
 
 fn matches_same_var(term: &Term, target: &Var) -> bool {
     matches!(term, Term::Var(var) if var == target)
+}
+
+fn collect_loop_definitions(info: &LoopInfo, cfg: &AbstractCfg) -> BTreeMap<String, AssignValue> {
+    let mut defs = BTreeMap::new();
+    for node_id in &info.body {
+        let Ok(node) = cfg.node(*node_id) else {
+            continue;
+        };
+        for effect in &node.transfer.effects {
+            if let TransferEffect::Assign { target, value } = effect {
+                let recursive = match value {
+                    AssignValue::Term(term) => term_mentions_var(term, target.name()),
+                    AssignValue::Predicate(formula) => formula_mentions_var(formula, target.name()),
+                };
+                if !recursive {
+                    defs.insert(target.name().to_string(), value.clone());
+                }
+            }
+        }
+    }
+    defs
+}
+
+fn normalize_formula_with_defs(formula: &Formula, defs: &BTreeMap<String, AssignValue>) -> Formula {
+    match formula {
+        Formula::True => Formula::True,
+        Formula::False => Formula::False,
+        Formula::Var(var) => {
+            if let Some(AssignValue::Predicate(predicate)) = defs.get(var.name()) {
+                normalize_formula_with_defs(predicate, defs)
+            } else {
+                Formula::Var(var.clone())
+            }
+        }
+        Formula::Not(inner) => Formula::not(normalize_formula_with_defs(inner, defs)),
+        Formula::And(items) => Formula::and_all(
+            items
+                .iter()
+                .map(|item| normalize_formula_with_defs(item, defs))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Or(items) => Formula::or_all(
+            items
+                .iter()
+                .map(|item| normalize_formula_with_defs(item, defs))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Implies(lhs, rhs) => Formula::implies(
+            normalize_formula_with_defs(lhs, defs),
+            normalize_formula_with_defs(rhs, defs),
+        ),
+        Formula::Eq(lhs, rhs) => Formula::eq(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(lhs.clone(), rhs.clone()),
+        Formula::Lt(lhs, rhs) => Formula::lt(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Formula::Le(lhs, rhs) => Formula::le(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Formula::Gt(lhs, rhs) => Formula::gt(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Formula::Ge(lhs, rhs) => Formula::ge(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+    }
+}
+
+fn normalize_term_with_defs(term: &Term, defs: &BTreeMap<String, AssignValue>) -> Term {
+    match term {
+        Term::Var(var) => {
+            if let Some(AssignValue::Term(value)) = defs.get(var.name()) {
+                normalize_term_with_defs(value, defs)
+            } else {
+                Term::Var(var.clone())
+            }
+        }
+        Term::Int(value) => Term::int(*value),
+        Term::Real(value) => Term::real(*value),
+        Term::BoolToInt(inner) => Term::bool_to_int(normalize_formula_with_defs(inner, defs)),
+        Term::Select(memory, index) => Term::select(
+            memory.as_ref().clone(),
+            normalize_term_with_defs(index, defs),
+        ),
+        Term::Add(lhs, rhs) => Term::add(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Term::Sub(lhs, rhs) => Term::sub(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Term::Mul(lhs, rhs) => Term::mul(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Term::Div(lhs, rhs) => Term::div(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
+        Term::Neg(inner) => Term::neg(normalize_term_with_defs(inner, defs)),
+    }
+}
+
+fn formula_mentions_var(formula: &Formula, name: &str) -> bool {
+    match formula {
+        Formula::True | Formula::False => false,
+        Formula::Var(var) => var.name() == name,
+        Formula::Not(inner) => formula_mentions_var(inner, name),
+        Formula::And(items) | Formula::Or(items) => {
+            items.iter().any(|item| formula_mentions_var(item, name))
+        }
+        Formula::Implies(lhs, rhs) => {
+            formula_mentions_var(lhs, name) || formula_mentions_var(rhs, name)
+        }
+        Formula::Eq(lhs, rhs)
+        | Formula::Lt(lhs, rhs)
+        | Formula::Le(lhs, rhs)
+        | Formula::Gt(lhs, rhs)
+        | Formula::Ge(lhs, rhs) => term_mentions_var(lhs, name) || term_mentions_var(rhs, name),
+        Formula::MemoryEq(_, _) => false,
+    }
+}
+
+fn term_mentions_var(term: &Term, name: &str) -> bool {
+    match term {
+        Term::Var(var) => var.name() == name,
+        Term::Int(_) | Term::Real(_) => false,
+        Term::BoolToInt(inner) => formula_mentions_var(inner, name),
+        Term::Select(_, index) => term_mentions_var(index, name),
+        Term::Add(lhs, rhs) | Term::Sub(lhs, rhs) | Term::Mul(lhs, rhs) | Term::Div(lhs, rhs) => {
+            term_mentions_var(lhs, name) || term_mentions_var(rhs, name)
+        }
+        Term::Neg(inner) => term_mentions_var(inner, name),
+    }
 }
 
 fn collect_int_constants(formula: &Formula) -> Vec<i64> {
@@ -437,6 +608,8 @@ fn backward_states(
     seeds: &[(CfgNodeId, Formula)],
     excluded_edges: &BTreeSet<CfgEdgeId>,
     restrict_to: Option<&BTreeSet<CfgNodeId>>,
+    ignore_body_guards: bool,
+    inner: InnerInvariants<'_>,
 ) -> Option<BTreeMap<CfgNodeId, Formula>> {
     let order = cfg.topological_order_excluding(excluded_edges)?;
     let mut states = cfg
@@ -447,8 +620,16 @@ fn backward_states(
         let entry = states.entry(*node).or_insert(Formula::False);
         *entry = Formula::or(entry.clone(), formula.clone());
     }
+    let (inner_headers, summarized_inner_nodes) = summarize_inner_loops(cfg, restrict_to, inner);
+    for (header, invariant) in &inner_headers {
+        let state = states.entry(*header).or_insert(Formula::False);
+        *state = Formula::or(state.clone(), invariant.clone());
+    }
 
     for node in order.iter().rev() {
+        if summarized_inner_nodes.contains(node) {
+            continue;
+        }
         for edge_id in cfg.incoming_edges(*node) {
             if excluded_edges.contains(&edge_id) {
                 continue;
@@ -459,9 +640,19 @@ fn backward_states(
                     continue;
                 }
             }
+            if summarized_inner_nodes.contains(&edge.source)
+                || summarized_inner_nodes.contains(&edge.target)
+            {
+                continue;
+            }
             let target_state = states.get(&edge.target).cloned().unwrap_or(Formula::False);
             let edge_pre = edge.transfer().wp(&target_state);
-            let post_at_source = Formula::and(edge.guard.clone(), edge_pre);
+            let guard = if ignore_body_guards {
+                Formula::True
+            } else {
+                edge.guard.clone()
+            };
+            let post_at_source = Formula::and(guard, edge_pre);
             let pre_at_source = cfg.node(edge.source).ok()?.transfer.wp(&post_at_source);
             let existing = states.get(&edge.source).cloned().unwrap_or(Formula::False);
             states.insert(edge.source, Formula::or(existing, pre_at_source));
@@ -480,6 +671,36 @@ fn edge_source_requirement(
     let edge_pre = edge.transfer().wp(target);
     let post_at_source = Formula::and(edge.guard.clone(), edge_pre);
     Some(cfg.node(edge.source).ok()?.transfer.wp(&post_at_source))
+}
+
+fn summarize_inner_loops(
+    cfg: &AbstractCfg,
+    restrict_to: Option<&BTreeSet<CfgNodeId>>,
+    inner: InnerInvariants<'_>,
+) -> (BTreeMap<CfgNodeId, Formula>, BTreeSet<CfgNodeId>) {
+    let Some(body) = restrict_to else {
+        return (BTreeMap::new(), BTreeSet::new());
+    };
+    let loop_bodies = detect_loops(cfg)
+        .into_iter()
+        .map(|info| (info.header, info.body))
+        .collect::<BTreeMap<_, _>>();
+    let mut headers = BTreeMap::new();
+    let mut blocked_nodes = BTreeSet::new();
+    for (header, invariant) in inner {
+        if !body.contains(header) {
+            continue;
+        }
+        headers.insert(*header, invariant.clone());
+        if let Some(inner_body) = loop_bodies.get(header) {
+            for node in inner_body {
+                if node != header {
+                    blocked_nodes.insert(*node);
+                }
+            }
+        }
+    }
+    (headers, blocked_nodes)
 }
 
 pub fn collect_loop_body_int_constants(info: &LoopInfo, cfg: &AbstractCfg) -> BTreeSet<i64> {

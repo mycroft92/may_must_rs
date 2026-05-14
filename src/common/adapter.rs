@@ -830,9 +830,9 @@ fn assertion_location(site: &crate::common::llvm_utils::program_graph::AssertSit
 }
 
 fn resolve_memory_effects(cfg: &mut AbstractCfg) {
-    let Some(order) = cfg.topological_order() else {
-        return;
-    };
+    let order = cfg
+        .topological_order()
+        .unwrap_or_else(|| cfg.node_ids().collect::<Vec<_>>());
 
     let mut env = PointerEnv::default();
     for node_id in order {

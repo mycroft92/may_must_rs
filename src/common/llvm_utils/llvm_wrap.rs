@@ -529,9 +529,26 @@ impl Instruction {
             }
         } else if let Some(value) = self.as_constant_int() {
             value.to_string()
+        } else if let Some(name) = self.print_based_name() {
+            name
         } else {
             self.print()
         }
+    }
+
+    fn print_based_name(&self) -> Option<String> {
+        let printed = self.print();
+        if let Some((lhs, _)) = printed.split_once('=') {
+            let lhs = lhs.trim();
+            if lhs.starts_with('%') || lhs.starts_with('@') {
+                return Some(lhs.to_string());
+            }
+        }
+        printed
+            .split_whitespace()
+            .map(|token| token.trim_matches(|ch: char| matches!(ch, ',' | '(' | ')')))
+            .find(|token| token.starts_with('%') || token.starts_with('@'))
+            .map(ToString::to_string)
     }
 
     pub fn get_opcode(&self) -> InstructionOpcode {

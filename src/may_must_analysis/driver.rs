@@ -7,7 +7,8 @@ use crate::common::adapter::{
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{
-    analyze, analyze_with_tables, render_result, AssertionResult, BackwardError, InvariantConfig,
+    analyze, analyze_with_tables, discover_loop_invariants, render_result, AssertionResult,
+    BackwardError, InvariantConfig,
 };
 use crate::may_must_analysis::providers::{CandidateProvider, NoProvider};
 use crate::may_must_analysis::rules::Judgement;
@@ -180,6 +181,7 @@ pub fn analyze_module_with_llm(
             },
         );
     }
+    let mut reports = Vec::new();
     for graph in graphs {
         let adapted = if summaries.is_empty() && memory_pure.is_empty() {
             adapt(graph)
@@ -189,21 +191,13 @@ pub fn analyze_module_with_llm(
         let Ok(adapted) = adapted else {
             continue;
         };
-        if let Some(precomputed) = (adapted.cfg.topological_order().is_none())
-            .then(|| {
-                crate::may_must_analysis::backward::discover_loop_invariants(
-                    &adapted.cfg,
-                    &adapted.name,
-                    oracle,
-                )
-            })
-            .flatten()
-        {
-            summary_tables.set_loop_invariants(adapted.name, precomputed);
+        if adapted.cfg.topological_order().is_some() {
+            continue;
+        }
+        if let Some(invariants) = discover_loop_invariants(&adapted.cfg, &adapted.name, oracle) {
+            summary_tables.set_loop_invariants(adapted.name.clone(), invariants);
         }
     }
-
-    let mut reports = Vec::new();
     for graph in graphs {
         let report = match analyze_with_summaries(
             graph,
@@ -263,20 +257,13 @@ pub fn analyze_with_summaries(
     } else {
         adapt_with_purity_and_summaries(graph, memory_pure, summaries)?
     };
-    let cached_invariants = tables
-        .map(|tables| tables.get_loop_invariants(&adapted.name).to_vec())
-        .filter(|items| !items.is_empty());
-    let precomputed = if adapted.cfg.topological_order().is_none() {
-        cached_invariants.or_else(|| {
-            crate::may_must_analysis::backward::discover_loop_invariants(
-                &adapted.cfg,
-                &adapted.name,
-                oracle,
-            )
+    let precomputed_owned = tables
+        .and_then(|tables| {
+            let invariants = tables.get_loop_invariants(&adapted.name);
+            (!invariants.is_empty()).then(|| invariants.to_vec())
         })
-    } else {
-        None
-    };
+        .or_else(|| discover_loop_invariants(&adapted.cfg, &adapted.name, oracle));
+    let precomputed = precomputed_owned.as_deref();
 
     let mut assertions = Vec::new();
     let mut failures = Vec::new();
@@ -289,7 +276,7 @@ pub fn analyze_with_summaries(
                 oracle,
                 tables,
                 config,
-                precomputed.as_deref(),
+                precomputed,
             )
         } else {
             analyze(&adapted.cfg, site, oracle)
@@ -490,6 +477,60 @@ mod tests {
                     analyze_module_with_provider(graphs, &BTreeSet::new(), &provider, &oracle)
                         .unwrap();
                 assert_eq!(reports.reports[0].verdict(), SafetyVerdict::Safe);
+            },
+        );
+    }
+
+    #[test]
+    fn loop_counter_assertion_is_safe() {
+        with_graphs(
+            r#"
+                declare void @may_assert(i1)
+
+                define i32 @main() {
+                entry:
+                    %call = call i32 @subject(i32 4)
+                    ret i32 %call
+                }
+
+                define internal i32 @subject(i32 %n) {
+                entry:
+                    %i = alloca i32
+                    store i32 0, ptr %i
+                    br label %header
+
+                header:
+                    %cur = load i32, ptr %i
+                    %cond = icmp slt i32 %cur, %n
+                    br i1 %cond, label %body, label %exit
+
+                body:
+                    %old = load i32, ptr %i
+                    %next = add i32 %old, 1
+                    store i32 %next, ptr %i
+                    br label %header
+
+                exit:
+                    %done = load i32, ptr %i
+                    %ok = icmp sge i32 %done, 0
+                    call void @may_assert(i1 %ok)
+                    ret i32 %done
+                }
+            "#,
+            |graphs| {
+                let oracle = Oracle::new();
+                let report = analyze_module(graphs, &BTreeSet::new(), &oracle).unwrap();
+                let subject = report
+                    .reports
+                    .iter()
+                    .find(|procedure| procedure.procedure == "subject")
+                    .expect("subject procedure report");
+                assert_eq!(subject.verdict(), SafetyVerdict::Safe);
+                assert!(report
+                    .summaries
+                    .get_loop_invariants("subject")
+                    .iter()
+                    .any(|(_, invariant)| invariant.to_string().contains(">= 0")));
             },
         );
     }

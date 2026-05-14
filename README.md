@@ -136,4 +136,4 @@ Loop support is invariant-driven and still partial.
 Observed current behavior on `tests/out/loop_counter.bc`:
 
 - `main` is `SAFE` because it has no assertions.
-- `subject` logs the generated loop candidates and currently reports `UNSAFE`.
+- `subject` precomputes `((select subject$stack1 0) >= 0)` and reports `SAFE`.
