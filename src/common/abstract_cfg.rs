@@ -198,6 +198,20 @@ pub enum TransferEffect {
     /// Declare that two pointer names alias. Used only for
     /// pointer-environment propagation; WP treats it as transparent.
     PointerAlias { target: String, source: String },
+    /// A GEP whose final step is a struct field access.
+    ///
+    /// Instead of incrementing the offset within the base region, the
+    /// result pointer is redirected to a dedicated per-field region
+    /// `{base_region}$f{field_index}` at offset 0.  This lets the backward
+    /// analysis reason about individual struct fields as independent scalar
+    /// (or array) variables without needing array-theory lemmas to separate them.
+    ///
+    /// Used only for pointer-environment propagation; WP treats it as a no-op.
+    StructFieldGep {
+        target: String,
+        base: String,
+        field_index: u32,
+    },
     /// A path condition that must hold for execution to reach this point.
     /// WP: `condition => post`.
     Assume(Formula),
@@ -299,6 +313,16 @@ impl TransferFn {
                             parent.region.clone(),
                             Term::add(parent.offset.clone(), offset.clone()),
                         );
+                    }
+                }
+                TransferEffect::StructFieldGep {
+                    target,
+                    base,
+                    field_index,
+                } => {
+                    if let Some(parent) = env.get(base) {
+                        let field_region = format!("{}$f{}", parent.region, field_index);
+                        env.bind(target.clone(), field_region, Term::int(0));
                     }
                 }
                 _ => {}
@@ -845,6 +869,7 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
         TransferEffect::Nop
         | TransferEffect::Alloca { .. }
         | TransferEffect::GetElementPtr { .. }
+        | TransferEffect::StructFieldGep { .. }
         | TransferEffect::PointerStore { .. }
         | TransferEffect::PointerLoad { .. }
         | TransferEffect::PointerAlias { .. }
@@ -876,6 +901,7 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
         TransferEffect::Nop
         | TransferEffect::Alloca { .. }
         | TransferEffect::GetElementPtr { .. }
+        | TransferEffect::StructFieldGep { .. }
         | TransferEffect::PointerStore { .. }
         | TransferEffect::PointerLoad { .. }
         | TransferEffect::PointerAlias { .. }

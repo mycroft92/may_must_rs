@@ -598,95 +598,121 @@ fn pointer_name(function_name: &str, value: Instruction) -> String {
     local_name(function_name, value)
 }
 
-/// Computes the abstract integer offset for a GEP instruction, normalised to
-/// i32 units (divide all byte offsets by 4).
+/// The result of lowering a GEP instruction.
 ///
-/// Walks the GEP index chain using LLVM type information from `layout`:
-/// - **Pointer dereference** (first index): stride = `store_size_of_type(pointee) / 4`
-/// - **Array element** (index into `[N x T]`): stride = `store_size_of_type(T) / 4`
-/// - **Struct field** (constant index into a struct): offset = `offset_of_element(...) / 4`
+/// Most GEPs produce a plain byte offset within the same memory region as the
+/// base pointer.  When the GEP's final step is a direct struct-field access
+/// (source element type is a struct, pointer-deref index = 0, single constant
+/// field index), the result is a `StructField` redirect: the target pointer
+/// belongs to a dedicated per-field region `{base}$f{N}` at offset 0 rather
+/// than an offset within the base region.
+enum GepLowering {
+    /// Regular offset within the base pointer's region.
+    Offset(Term),
+    /// Redirect to a per-field region: field `field_index` of the struct the
+    /// base pointer points to.
+    StructField(u32),
+}
+
+/// Lowers a GEP instruction to a [`GepLowering`], choosing the correct
+/// representation for the pointer arithmetic.
 ///
-/// Normalising to i32 units preserves backward compatibility: existing integer
-/// array tests use i32 elements (stride = 4/4 = 1), so their element indices
-/// are unchanged.  Mixed-width structs and non-i32 arrays now produce correct
-/// distinct offsets.
+/// The first GEP index is always a **pointer-level stride** (advance N
+/// elements of the source element type), regardless of whether the source
+/// type is a struct, array, or scalar.  Subsequent indices walk into the type:
+/// array elements use stride = `store_size(elem) / 4`; struct fields use
+/// `offset_of_element / 4`.
 ///
-/// Falls back to plain index summation (the old behaviour) when type
-/// information is unavailable.
-fn lower_gep_offset(
+/// The special case `GepLowering::StructField(N)` is returned when:
+/// - The source element type is a struct.
+/// - There are exactly two indices: pointer deref (constant 0) + field index N.
+///
+/// Falls back to plain index summation when no LLVM type info is available.
+fn lower_gep(
     function_name: &str,
     instruction: Instruction,
     layout: &TargetData,
-) -> Result<Term, AdapterError> {
-    // Try to walk the GEP type chain for a precise byte-based offset.
+) -> Result<GepLowering, AdapterError> {
     let operands: Vec<Instruction> = instruction.get_operands().into_iter().collect();
-    // operands[0] = base pointer; operands[1..] = indices
     if operands.is_empty() {
-        return Ok(Term::int(0));
+        return Ok(GepLowering::Offset(Term::int(0)));
     }
 
-    let Some(mut current_type) = instruction.get_gep_source_element_type() else {
-        // No type info available; fall back to plain summation.
-        return lower_gep_offset_fallback(function_name, instruction);
+    let Some(source_ty) = instruction.get_gep_source_element_type() else {
+        // No type info; fall back to plain index summation.
+        let mut offset = Term::int(0);
+        for idx_instr in operands.iter().skip(1) {
+            let term = lower_integer_value(function_name, *idx_instr)?;
+            offset = Term::add(offset, term);
+        }
+        return Ok(GepLowering::Offset(offset));
     };
 
-    let mut offset = Term::int(0);
+    // Collect the indices (everything after operands[0] = base pointer).
+    let indices: Vec<Instruction> = operands.into_iter().skip(1).collect();
 
-    for (step, index_instr) in operands.iter().skip(1).enumerate() {
-        match current_type.kind() {
-            TypeKind::Struct => {
-                // Struct field index must be a compile-time constant.
-                if let Some(field_idx) = index_instr.as_constant_int() {
-                    let byte_off = layout.offset_of_element(current_type, field_idx as u32);
-                    offset = Term::add(offset, Term::int((byte_off / 4) as i64));
-                    if let Some(field_ty) =
-                        current_type.get_struct_element_type_at(field_idx as u32)
-                    {
-                        current_type = field_ty;
-                    }
-                } else {
-                    // Non-constant struct index is undefined behaviour in C/C++;
-                    // treat as zero offset and stop walking.
-                    break;
-                }
-            }
-            TypeKind::Array => {
-                let elem_ty = current_type.get_element_type().unwrap_or(current_type);
-                let stride = layout.store_size_of_type(elem_ty).max(4) / 4;
-                let idx = lower_integer_value(function_name, *index_instr)?;
-                offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
-                current_type = elem_ty;
-            }
-            _ => {
-                // Pointer dereference (step 0) or scalar: stride by element size.
-                let stride = layout.store_size_of_type(current_type).max(4) / 4;
-                if step == 0 {
-                    let idx = lower_integer_value(function_name, *index_instr)?;
-                    offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
-                } else {
-                    let idx = lower_integer_value(function_name, *index_instr)?;
-                    offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
-                }
-                // No further type to walk into for scalar types.
+    // Detect the pure struct-field pattern: source_ty is Struct, exactly two
+    // indices [0, field_N], first index is compile-time constant 0.
+    if source_ty.kind() == TypeKind::Struct && indices.len() == 2 {
+        if let (Some(0), Some(field_idx)) = (
+            indices[0].as_constant_int(),
+            indices[1].as_constant_int(),
+        ) {
+            if field_idx >= 0 {
+                return Ok(GepLowering::StructField(field_idx as u32));
             }
         }
     }
 
-    Ok(offset)
-}
-
-/// Fallback used when no GEP source element type is available.
-/// Sums all indices as plain integers (original behaviour, correct for i32 arrays).
-fn lower_gep_offset_fallback(
-    function_name: &str,
-    instruction: Instruction,
-) -> Result<Term, AdapterError> {
+    // General case: compute the byte offset and normalise to i32 units.
+    //
+    // Index 0 (step 0) is always a pointer-level stride — it advances through
+    // an array of `source_ty` elements regardless of what kind source_ty is.
+    // Only indices 1+ walk into the type.
+    let mut current_type = source_ty;
     let mut offset = Term::int(0);
-    for operand in instruction.get_operands().into_iter().skip(1) {
-        let term = lower_integer_value(function_name, operand)?;
-        offset = Term::add(offset, term);
+
+    for (step, index_instr) in indices.iter().enumerate() {
+        if step == 0 {
+            // Pointer-level stride: advance `idx × sizeof(source_ty)` bytes.
+            let stride = layout.store_size_of_type(current_type).max(4) / 4;
+            let idx = lower_integer_value(function_name, *index_instr)?;
+            offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
+            // current_type is unchanged — subsequent indices walk *into* it.
+        } else {
+            match current_type.kind() {
+                TypeKind::Struct => {
+                    if let Some(field_idx) = index_instr.as_constant_int() {
+                        let byte_off =
+                            layout.offset_of_element(current_type, field_idx as u32);
+                        offset = Term::add(offset, Term::int((byte_off / 4) as i64));
+                        if let Some(field_ty) =
+                            current_type.get_struct_element_type_at(field_idx as u32)
+                        {
+                            current_type = field_ty;
+                        }
+                    } else {
+                        // Non-constant struct index is UB in C/C++; stop walking.
+                        break;
+                    }
+                }
+                TypeKind::Array => {
+                    let elem_ty = current_type.get_element_type().unwrap_or(current_type);
+                    let stride = layout.store_size_of_type(elem_ty).max(4) / 4;
+                    let idx = lower_integer_value(function_name, *index_instr)?;
+                    offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
+                    current_type = elem_ty;
+                }
+                _ => {
+                    let stride = layout.store_size_of_type(current_type).max(4) / 4;
+                    let idx = lower_integer_value(function_name, *index_instr)?;
+                    offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
+                }
+            }
+        }
     }
-    Ok(offset)
+
+    Ok(GepLowering::Offset(offset))
 }
 
 /// Translates a single LLVM instruction into the list of [`TransferEffect`]s that form
@@ -916,12 +942,14 @@ fn lower_node_transfer(
                     .get_operand(0)
                     .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?,
             );
-            let offset = lower_gep_offset(function_name, instruction, layout)?;
-            effects.push(TransferEffect::GetElementPtr {
-                target,
-                base,
-                offset,
-            });
+            match lower_gep(function_name, instruction, layout)? {
+                GepLowering::Offset(offset) => {
+                    effects.push(TransferEffect::GetElementPtr { target, base, offset });
+                }
+                GepLowering::StructField(field_index) => {
+                    effects.push(TransferEffect::StructFieldGep { target, base, field_index });
+                }
+            }
         }
         InstructionOpcode::PHI | InstructionOpcode::Br => {}
         InstructionOpcode::Ret => {
@@ -1336,6 +1364,17 @@ fn resolve_memory_effects(
                 TransferEffect::PointerAlias { target, source } => {
                     if let Some(binding) = env.get(&source).cloned() {
                         env.bind(target.clone(), binding.region, binding.offset);
+                    }
+                    rewritten.push(TransferEffect::Nop);
+                }
+                TransferEffect::StructFieldGep {
+                    target,
+                    base,
+                    field_index,
+                } => {
+                    if let Some(parent) = env.get(&base).cloned() {
+                        let field_region = format!("{}$f{}", parent.region, field_index);
+                        env.bind(target.clone(), field_region, Term::int(0));
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
