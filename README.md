@@ -2,8 +2,8 @@
 
 An LLVM IR implementation of the compositional may/must analysis described in:
 
-> **Compositional May-Must Program Analysis: Unleashing the Power of Alternation**  
-> Patrice Godefroid, Aditya V. Nori, Sriram K. Rajamani, SaiDeep Tetali  
+> **Compositional May-Must Program Analysis: Unleashing the Power of Alternation**
+> Patrice Godefroid, Aditya V. Nori, Sriram K. Rajamani, SaiDeep Tetali
 > POPL 2010 — https://dl.acm.org/doi/10.1145/1707801.1706307
 
 Given an LLVM bitcode file, the tool either proves that each assertion
@@ -59,8 +59,7 @@ runs the checker on each one, printing a `SAFE` / `UNSAFE` / `UNKNOWN` verdict.
 
 Include `verification.h` (at the project root) and use the standard `assert()`
 macro. The checker recognises `assert` calls, strips them from the visible CFG,
-and records each condition as a formal verification obligation. At runtime,
-`may_assert` is a no-op — no overhead in production builds.
+and records each condition as a formal verification obligation.
 
 ```c
 #include "verification.h"
@@ -94,14 +93,6 @@ extracts the asserted condition, and verifies it. If `<assert.h>` is also
 included, `verification.h` shadows its `assert` definition — include
 `verification.h` last (or first — it unconditionally `#undef`s `assert`).
 
-If you prefer to use the sentinel name directly without overriding `assert`:
-
-```c
-extern void may_assert(_Bool condition);
-
-may_assert(result >= 0);
-```
-
 ---
 
 ## Example Output
@@ -130,6 +121,9 @@ procedure subject  [1 assertion(s), 26 instruction(s)]
   verdict: UNSAFE
 ```
 
+Source locations (`file:line:col`) are reported when the bitcode was compiled
+with `-g`.
+
 ---
 
 ## How It Works
@@ -148,33 +142,50 @@ under which the assertion could be violated.
 function entry. Infeasible → `Verified`; feasible with a model → `UNSAFE`;
 indeterminate → `UNKNOWN`.
 
-Interprocedural reasoning uses summaries in both directions:
+**Loop invariant synthesis** is attempted in order:
+1. Algorithmic pattern matching (counter bounds from back-edge guards).
+2. Constrained Horn Clause (CHC) solving via Z3's SPACER engine.
+3. Houdini weakening — a large template set is pruned to an inductive subset.
+4. LLM-guided CEGIS (optional, when an LLM provider is configured).
+
+**Interprocedural reasoning** uses summaries in both directions:
 - `ReturnSummary`: relates return values to inputs, inferred by backward WP.
 - `SummaryTables`: loop invariants cached per procedure and reused by callers.
 - Cyclic callees (looping helpers) are handled via observer-invariant synthesis,
-  which finds an inductive loop invariant of the form
-  `counter ≤ k ∨ accumulator ≥ ext[k]` and verifies it with the full
-  bidirectional check.
+  which finds an inductive invariant `counter ≤ k ∨ accumulator ≥ ext[k]` and
+  verifies it with the full bidirectional check.
 
 ---
 
 ## Architecture
 
 ```
-src/llvm_utils/llvm_wrap.rs        LLVM C API wrapper (debug info, opcodes, operands)
-src/llvm_utils/program_graph.rs    raw instruction-level FunctionGraph
-src/common/formula.rs              terms, predicates, memory arrays, SMT model types
-src/common/abstract_cfg.rs         abstract CFG nodes/edges, transfer effects, WP
-src/common/adapter.rs              FunctionGraph → AdaptedProcedure lowering
-src/common/oracle.rs               SMT feasibility / implication (Z3 boundary)
+src/common/llvm_utils/llvm_wrap.rs     LLVM C API wrapper (types, opcodes, debug info,
+                                        TargetData for struct layout)
+src/common/llvm_utils/program_graph.rs raw instruction-level FunctionGraph builder
+src/common/source.rs                   SourceLocation type (file, line, column)
+src/common/formula.rs                  terms, predicates, memory arrays, SMT model types
+src/common/abstract_cfg.rs             abstract CFG, TransferEffect variants, WP/SP
+src/common/adapter.rs                  FunctionGraph → AdaptedProcedure lowering
+                                        (GEP offsets, per-field struct regions,
+                                         pointer environment resolution,
+                                         return summary injection, memcpy unrolling)
+src/common/oracle.rs                   SMT feasibility / implication (Z3 boundary)
 src/may_must_analysis/node_summary.rs  per-node (reach, state) summaries
-src/may_must_analysis/rules.rs         local propagation rules, RuleEngine
-src/may_must_analysis/backward.rs      assertion checking, loop invariant search
-src/may_must_analysis/loops.rs         loop detection, invariant checking
-src/may_must_analysis/driver.rs        module orchestration, summary caching
+src/may_must_analysis/rules.rs         local backward propagation rules, RuleEngine
+src/may_must_analysis/loops.rs         loop detection, invariant checking (initiation,
+                                        inductiveness, exit closure), Houdini candidates,
+                                        CHC candidates, algorithmic candidates
+src/may_must_analysis/chc.rs           Constrained Horn Clause encoding and Z3 SPACER
+                                        solver integration for loop invariants
+src/may_must_analysis/backward.rs      assertion checking, loop invariant synthesis
+                                        (algorithmic → CHC → Houdini → LLM CEGIS)
+src/may_must_analysis/driver.rs        module orchestration, bottom-up summary
+                                        accumulation, observer-invariant synthesis
+src/may_must_analysis/summaries.rs     SummaryTables and MustSummary data structures
 src/may_must_analysis/providers.rs     external/manual summary provider seam
-src/may_must_analysis/summaries.rs     summary table data structures
-src/smt/solver.rs                  raw Z3 lowering
+src/may_must_analysis/llm_provider.rs  LLM-guided CEGIS candidate generation
+src/common/smt/solver.rs               raw Z3 term/formula lowering
 ```
 
 ---
@@ -185,21 +196,32 @@ src/smt/solver.rs                  raw Z3 lowering
 |---|---|
 | Integer and boolean scalar reasoning | ✅ |
 | Integer-array memory (`alloca` / `load` / `store` / `gep`) | ✅ |
+| Struct field access — stack allocated (`alloca %Foo`) | ✅ |
+| Struct field access — C++ stack objects via `*this` | ✅ |
+| Type-aware GEP offsets (mixed-width structs, non-i32 arrays) | ✅ |
 | `phi` lowering on incoming edges | ✅ |
 | Branch-guard lowering | ✅ |
 | Acyclic procedure verification | ✅ |
 | Cyclic procedures with loop invariant synthesis | ✅ |
+| Loop invariants via algorithmic pattern matching | ✅ |
+| Loop invariants via CHC / Z3 SPACER | ✅ |
+| Loop invariants via Houdini weakening | ✅ |
+| Loop invariants via LLM-guided CEGIS | ✅ (requires LLM provider) |
 | Interprocedural return-summary inference (acyclic callees) | ✅ |
 | Cyclic callee return-summary inference (observer-invariant) | ✅ |
 | `llvm.memcpy` / `llvm.memset` unrolling | ✅ |
 | Source locations in assertion reports (requires `-g`) | ✅ |
 | Readable counterexamples grouped by function | ✅ |
 | Floating-point lowering | ❌ |
+| Heap-allocated struct reasoning (`malloc` / `new`) | ❌ (Step 4) |
 | General cyclic callee summaries (non-observer patterns) | ❌ |
-| Source-coordinate reporting without `-g` | ❌ |
+| Alias analysis | ❌ (Step 4 prerequisite) |
+| Virtual dispatch | ❌ (Step 5) |
 | Broader cast / instruction coverage | partial |
 
 Unsupported procedures return `UNKNOWN` rather than terminating the run.
+
+See `MEMORY_MODEL.md` for the full roadmap and `REFERENCES.md` for citations.
 
 ---
 
@@ -210,5 +232,10 @@ After code changes, always run:
 ```sh
 cargo fmt
 cargo test
+```
+
+Also run when touching CLI behaviour, lowering, or smoke assumptions:
+
+```sh
 make -C tests smoke
 ```
