@@ -61,7 +61,7 @@ The `TargetData` is built once per module from the module's data-layout string
 (stored in `FunctionGraph::data_layout_str`) and threaded through the lowering
 pipeline.
 
-### Per-field struct regions (Step 2 — planned)
+### Per-field struct regions (Step 2 — done)
 
 Currently a struct `alloca` maps to a single integer-array region.  To reason
 about individual fields without array-theory, each struct alloca will be split

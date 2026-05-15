@@ -32,22 +32,16 @@ normalised to i32 units.  `TargetData` is built once per module from
 What this unlocks: C structs with scalar fields, C++ POD classes,
 mixed-width structs (e.g. `{i32, i64}`), nested structs.
 
-### Step 2 — Per-field memory regions
+### Step 2 — Per-field memory regions (done)
 
-Currently one `alloca` maps to one integer-array region. For a struct with
-`n` fields the SMT solver must reason about array indices to distinguish fields,
-which is imprecise.
+`TransferEffect::StructFieldGep { target, base, field_index }` is emitted when
+`lower_gep` detects a pure struct-field access (source element type = Struct,
+two indices [0, N]). `resolve_memory_effects` binds the result pointer to
+`{base_region}$f{N}` at offset 0, so loads and stores to different fields land
+in separate SMT arrays — no array-theory reasoning needed.
 
-Plan: in `resolve_memory_effects`, split a struct alloca into one named region
-per field:
-  `alloca %Foo` → regions `fn$s$x`, `fn$s$y`, ...
-
-A `store` to `s.x` becomes `MemoryStore { region: "fn$s$x", offset: 0, value }`,
-leaving `fn$s$y` completely untouched. This makes field-level invariants
-expressible without array-theory reasoning.
-
-Changes: `adapter.rs` (`resolve_memory_effects`), the `PointerEnv` binding
-structure (needs to track field splits), and `abstract_cfg.rs` WP rules.
+A test (`struct_fields.c`) verifies `p.x == 3`, `p.y == 7`, `p.x + p.y == 10`
+with cross-field non-interference checked by the solver.
 
 ### Step 3 — Stack-allocated C++ objects
 

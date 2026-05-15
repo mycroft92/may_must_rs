@@ -1384,6 +1384,17 @@ mod tests {
     }
 
     #[test]
+    fn struct_fields_verified_with_per_field_regions() {
+        with_bc_graphs("struct_fields", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            // 3 assertions: p.x == 3, p.y == 7, p.x + p.y == 10
+            assert_all_verified(procedure(&report, "main"), 3);
+        });
+    }
+
+    #[test]
     fn array_max_5_verified_with_cyclic_callee_summary() {
         with_bc_graphs("array_max_5", |graphs| {
             let oracle = Oracle::new();
