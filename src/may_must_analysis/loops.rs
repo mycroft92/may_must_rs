@@ -1,3 +1,37 @@
+//! Loop detection and loop-invariant synthesis/verification.
+//!
+//! # Responsibilities
+//!
+//! This module is responsible for three related tasks:
+//!
+//! 1. **Detection** — [`detect_loops`] identifies natural loops in the CFG by
+//!    finding back edges and computing the corresponding loop bodies.
+//!
+//! 2. **Candidate generation** — [`algorithmic_candidates`], [`houdini_candidates`],
+//!    and [`chc_loop_invariant`] produce formula candidates using different
+//!    strategies; the caller (in `backward.rs`) tries them in order.
+//!
+//! 3. **Invariant checking** — [`check_loop_invariant_verbose`] performs the
+//!    three-part soundness check for a candidate formula:
+//!    - **Initiation**: the invariant holds on entry to the loop (checked by
+//!      showing the violation condition is infeasible at the function entry).
+//!    - **Inductiveness**: if the invariant holds at the header and the back
+//!      edge is taken, it still holds at the header on the next iteration
+//!      (checked by implication at the header after one step through the body).
+//!    - **Exit closure** (optional): for each loop exit edge whose target has a
+//!      non-trivial `assertion_postcondition`, the invariant together with the
+//!      exit guard implies the postcondition.  This check ties the invariant to
+//!      the specific assertion being proved.  It is intentionally skipped in
+//!      `observer_summary_invariants` (see `driver.rs`) because the final
+//!      `analyze_with_tables` call performs the authoritative discharge.
+//!
+//! # Nested loops
+//!
+//! Loops are processed innermost-first (see [`sort_innermost_first`]).  Already-
+//! accepted inner invariants are passed as `inner: InnerInvariants` to
+//! [`check_loop_invariant_verbose`] and to [`backward_states`] so that inner
+//! loop bodies can be summarised without re-entering them.
+
 #![allow(dead_code)]
 
 use crate::common::abstract_cfg::{
@@ -8,14 +42,27 @@ use crate::common::oracle::{Oracle, Validity};
 use crate::may_must_analysis::chc;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+/// Structural description of a natural loop.
+///
+/// A natural loop is defined by a single *back edge* (latch → header).  The
+/// `body` set contains every CFG node from which the header is reachable
+/// without leaving the loop.  `exit_edges` are the CFG edges that leave the
+/// body — their targets are the first nodes executed after the loop.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopInfo {
+    /// Unique entry point of the loop (target of the back edge).
     pub header: CfgNodeId,
+    /// Node that closes the loop by branching back to the header.
     pub latch: CfgNodeId,
+    /// The back edge from latch to header.
     pub back_edge: CfgEdgeId,
+    /// All nodes inside the loop body, including header and latch.
     pub body: BTreeSet<CfgNodeId>,
+    /// Edges leaving the loop body to successor nodes outside it.
     pub exit_edges: Vec<CfgEdgeId>,
+    /// Guard on the back edge (the loop-continuation condition).
     pub back_edge_guard: Formula,
+    /// Source location of the loop header, if available.
     pub source_location: Option<SourceLocation>,
 }
 
@@ -28,11 +75,20 @@ pub enum CounterInit {
 
 pub type InnerInvariants<'a> = &'a [(CfgNodeId, Formula)];
 
+/// Detailed outcome of [`check_loop_invariant_verbose`].
+///
+/// Only `Accepted` means all three soundness conditions passed.  The failure
+/// variants identify *which* condition was the first to fail, enabling
+/// targeted logging and CEGIS feedback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvariantCheckResult {
+    /// Initiation, inductiveness, and exit closure all passed.
     Accepted,
+    /// The candidate does not hold on entry to the loop.
     InitiationFailed,
+    /// The candidate is not preserved by one iteration of the loop body.
     InductivenessFailed,
+    /// The candidate does not imply the required postcondition at this exit.
     ExitClosureFailed { exit_edge: CfgEdgeId },
 }
 
@@ -49,6 +105,13 @@ pub fn fmt_loop_loc(info: &LoopInfo) -> String {
         .unwrap_or_else(|| format!("header {:?}", info.header))
 }
 
+/// Identify all natural loops in the CFG.
+///
+/// A natural loop is detected by finding every back edge (an edge whose target
+/// dominates its source in the CFG traversal).  For each back edge the loop
+/// body is computed by a backward BFS from the latch to the header.  The
+/// resulting [`LoopInfo`] structs are returned in an unspecified order; callers
+/// that need innermost-first processing should call [`sort_innermost_first`].
 pub fn detect_loops(cfg: &AbstractCfg) -> Vec<LoopInfo> {
     cfg.detect_back_edges()
         .into_iter()
@@ -90,10 +153,29 @@ pub fn detect_loops(cfg: &AbstractCfg) -> Vec<LoopInfo> {
         .collect()
 }
 
+/// Sort a slice of loops so that smaller (inner) loops come first.
+///
+/// The ordering criterion is loop body size.  Processing inner loops before
+/// outer ones ensures that their invariants are available when checking the
+/// inductiveness of outer loops via the `inner` parameter of
+/// [`check_loop_invariant_verbose`].
 pub fn sort_innermost_first(loops: &mut [LoopInfo]) {
     loops.sort_by_key(|info| info.body.len());
 }
 
+/// Generate invariant candidates by structural pattern matching on the loop.
+///
+/// This is the fastest strategy and should be tried first.  It mines candidates
+/// from:
+/// - The back-edge guard (loop-continuation condition) and its negation.
+/// - Entry guards from the header to body nodes.
+/// - Exit edge guard negations (loop-termination conditions).
+/// - Predicate assignments in the body (and their implication forms).
+/// - Counter increment patterns (`i = i + c`) that suggest `i >= 0`.
+/// - Integer literal assignments that suggest lower-bound invariants.
+///
+/// Candidates derived from variables that have constant definitions in the loop
+/// body are simplified via substitution using [`normalize_formula_with_defs`].
 pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula> {
     let defs = collect_loop_definitions(info, cfg);
     let mut candidates = Vec::new();
@@ -162,6 +244,19 @@ pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula
     candidates
 }
 
+/// Generate a large template set of linear arithmetic candidates (Houdini-style).
+///
+/// For every integer variable visible in the loop, and for every constant that
+/// appears in the assertion postcondition (`header_wp`) or in the loop body,
+/// this generates:
+/// - Simple bounds `var >= c` and `var <= c`.
+/// - Range conjunctions `var >= lo && var <= hi` for all pairs (lo, hi).
+/// - Pairwise variable comparisons `v1 <= v2`, `v1 >= v2`, and `v1+1 <= v2`.
+///
+/// The constants `{-1, 0, 1}` are always included.  The caller is expected to
+/// feed these through [`check_loop_invariant_verbose`] and keep only those that
+/// pass, gradually weakening to the largest inductive conjunction (Houdini
+/// algorithm).
 pub fn houdini_candidates(
     variable_sorts: &BTreeMap<String, Sort>,
     header_wp: &Formula,
@@ -215,6 +310,12 @@ pub fn houdini_candidates(
     candidates
 }
 
+/// Derive a loop invariant by solving a Constrained Horn Clause (CHC) system.
+///
+/// Currently handles the common pattern `i < n` / `i < bound` on the back edge
+/// guard: delegates to [`chc::solve_loop_chc`] to produce a closed-form
+/// invariant such as `0 <= i && i <= n`.  Returns `None` if the guard does not
+/// match the expected pattern.
 pub fn chc_loop_invariant(info: &LoopInfo, cfg: &AbstractCfg) -> Option<Formula> {
     let guard = &info.back_edge_guard;
     if let Formula::Lt(Term::Var(counter), Term::Var(bound)) = guard {
@@ -245,6 +346,36 @@ pub fn check_loop_invariant(
     )
 }
 
+/// Check a loop invariant candidate and return a detailed result.
+///
+/// The three checks performed in order are:
+///
+/// ## 1. Initiation
+///
+/// Propagates the *violation* of the candidate backward from the header to the
+/// function entry (back edges excluded).  If the violation is reachable from
+/// the entry the candidate does not hold on the first iteration →
+/// [`InvariantCheckResult::InitiationFailed`].
+///
+/// ## 2. Inductiveness
+///
+/// Propagates the *violation* of the candidate backward along the back edge
+/// and through one iteration of the loop body, restricting propagation to the
+/// loop body nodes.  Checks that `candidate → (wp of NOT candidate after one
+/// step)` is valid at the header, i.e. the invariant is preserved →
+/// [`InvariantCheckResult::InductivenessFailed`] if not.
+///
+/// ## 3. Exit closure
+///
+/// For each loop exit edge whose successor has a non-trivial entry in
+/// `assertion_postconditions`, checks that `candidate` implies the
+/// postcondition at the exit.  Pass `&BTreeMap::new()` to skip this check
+/// (e.g., when generating invariants for interprocedural summaries where the
+/// authoritative check is done by a subsequent `analyze_with_tables` call).
+///
+/// Inner loop invariants (`inner`) are injected at their respective headers
+/// during the backward-state propagations so that nested loop bodies are
+/// correctly summarised.
 pub fn check_loop_invariant_verbose(
     info: &LoopInfo,
     cfg: &AbstractCfg,
@@ -613,6 +744,19 @@ fn collect_int_constants_term(term: &Term, out: &mut Vec<i64>) {
     }
 }
 
+/// Propagate a set of seed formulas backward through the CFG and return the
+/// resulting per-node state map.
+///
+/// Back edges in `excluded_edges` are skipped, allowing the computation to
+/// proceed in topological order.  `restrict_to`, when set, limits propagation
+/// to edges whose both endpoints are in the specified node set (used for
+/// intra-loop analysis).  `ignore_body_guards` suppresses edge guards during
+/// WP computation (used for the inductiveness check where we want to know the
+/// weakest precondition unconditionally inside the body).
+///
+/// Inner loop headers supplied in `inner` are seeded with their invariants and
+/// the corresponding inner body nodes are skipped so that their transfer
+/// effects are not double-counted.
 fn backward_states(
     cfg: &AbstractCfg,
     seeds: &[(CfgNodeId, Formula)],

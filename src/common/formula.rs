@@ -1,3 +1,26 @@
+//! Symbolic vocabulary for the may/must assertion checker.
+//!
+//! This module defines the core formula language that every analysis pass
+//! speaks: sorts, variables, arithmetic terms, memory expressions, and
+//! first-order Boolean formulas. All SMT queries ultimately reduce to values
+//! from this module before being lowered to Z3 in [`crate::smt::solver`].
+//!
+//! # Design principles
+//!
+//! * **No solver coupling** — types here are pure Rust data structures with no
+//!   Z3 handles. Conversion to solver objects happens exclusively in
+//!   `smt/solver.rs`.
+//! * **Flat n-ary `And`/`Or`** — conjunctions and disjunctions use `Vec`
+//!   rather than binary trees so that `simplify` can flatten nested clauses
+//!   in one pass and so that the solver can pass them as multi-argument
+//!   `and`/`or` calls without extra wrapping.
+//! * **Eager but cheap simplification** — `Formula::and`, `or`, and `implies`
+//!   call `simplify` at construction time. This keeps formulas compact during
+//!   WP propagation without requiring a separate normalization phase.
+//! * **Memory is a separate layer** — array-of-integers memory is modelled
+//!   with a dedicated [`Memory`] type rather than encoding it as an integer
+//!   term, keeping the sort system simple and matching Z3's `Array Int Int`.
+
 #![allow(dead_code)]
 
 use std::cmp::Ordering;
@@ -5,18 +28,41 @@ use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
 
+/// The three value domains supported by the formula language.
+///
+/// All variables, terms, and sub-expressions carry an explicit sort. The
+/// type-checker in [`Term::sort`] and [`Formula::validate`] uses these to
+/// reject ill-sorted expressions before they reach the solver.
+///
+/// `Bool` is only valid as a formula position or as the argument of
+/// [`Term::BoolToInt`]; it cannot appear as a numeric operand.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Sort {
+    /// Boolean — valid in formula positions and as the source sort of `BoolToInt`.
     Bool,
+    /// Unbounded mathematical integer — the default sort for program scalars.
     Int,
+    /// Exact rational (used for loop-invariant coefficients and Z3 model values).
     Real,
 }
 
+/// A concrete value extracted from an SMT model (a satisfying assignment).
+///
+/// After a SAT query the solver returns a model mapping variables to
+/// `ModelValue`s. These are used only for diagnostics and counterexample
+/// display; they never feed back into analysis logic.
+///
+/// `ArrayDefault` represents a constant array `(as const (Array Int Int) v)`
+/// — the simplest model Z3 produces for unconstrained memory regions.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ModelValue {
+    /// A concrete integer value.
     Int(i64),
+    /// A concrete Boolean value.
     Bool(bool),
+    /// A concrete rational value (appears for `Real`-sorted variables).
     Real(Rational),
+    /// A constant array whose every cell holds the wrapped default value.
     ArrayDefault(Box<ModelValue>),
 }
 
@@ -31,9 +77,17 @@ impl fmt::Display for ModelValue {
     }
 }
 
+/// A full satisfying assignment returned by the SMT solver.
+///
+/// Scalar entries bind program variables to their concrete values. Memory
+/// entries bind region names (e.g. `stack0`, `fn$__ext_0`) to array
+/// constants. The display format is valid SMT-LIB2 so the model can be
+/// pasted directly into an interactive solver session for debugging.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SmtModel {
+    /// Scalar variable bindings (Bool, Int, or Real).
     pub scalar: Vec<(Var, ModelValue)>,
+    /// Memory region bindings (`Array Int Int` arrays).
     pub memory: Vec<(String, ModelValue)>,
 }
 
@@ -65,6 +119,13 @@ impl fmt::Display for Sort {
     }
 }
 
+/// An exact rational number stored in reduced form with a positive denominator.
+///
+/// Used for loop-invariant template coefficients and for `Real`-sorted model
+/// values returned by Z3. The denominator is always positive after
+/// construction; negation is carried in the numerator. The value is kept in
+/// lowest terms via GCD reduction in [`Rational::new`] so that equality and
+/// ordering are unambiguous.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Rational {
     num: i64,
@@ -122,6 +183,16 @@ impl fmt::Display for Rational {
     }
 }
 
+/// A named, sorted symbolic variable.
+///
+/// Variables are the leaves of both [`Term`] and [`Formula`] expressions.
+/// The sort is carried intrinsically so that type errors can be caught
+/// during formula construction rather than only at solver time.
+///
+/// Names follow the LLVM IR naming convention (`%0`, `%ret`, `fn$__ext_0`,
+/// etc.) after the lowering in `adapter.rs`. The name alone does not
+/// determine uniqueness — two variables with the same name but different
+/// sorts are distinct and represent genuinely different things.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct Var {
     name: String,
@@ -163,9 +234,22 @@ impl fmt::Display for Var {
     }
 }
 
+/// An array-of-integers memory expression (SMT `Array Int Int`).
+///
+/// Memory is modelled as a flat, named, integer-indexed array. Multiple
+/// disjoint regions (e.g. `stack0`, `fn$__ext_0`) are represented as
+/// separate `Memory::Var` roots; they never alias unless the analysis
+/// explicitly equates them.
+///
+/// Both the index and value sorts of a `Store` must be `Int` — this is
+/// checked by [`Memory::validate`].
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Memory {
+    /// A named memory region — the base variable of an SMT `Array Int Int`.
     Var(String),
+    /// A functional update: `(store mem idx val)` — produces a new array
+    /// identical to `mem` except that cell `idx` now holds `val`. Used to
+    /// encode store instructions without mutation.
     Store(Box<Memory>, Box<Term>, Box<Term>),
 }
 
@@ -192,18 +276,40 @@ impl fmt::Display for Memory {
     }
 }
 
+/// An arithmetic or memory-read expression that evaluates to a numeric value.
+///
+/// `Term`s are used wherever the analysis needs a numeric quantity: as the
+/// right-hand side of an assignment, as an index into memory, or as an operand
+/// of a comparison inside a [`Formula`].
+///
+/// The sort of a `Term` can always be computed from its structure — see
+/// [`Term::sort`] — and arithmetic operations require both sides to share a
+/// sort (Int or Real; never Bool).
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Term {
+    /// A named variable (must have `Sort::Int` or `Sort::Real`).
     Var(Var),
+    /// A literal integer constant.
     Int(i64),
+    /// A literal rational constant (used in Real-sorted arithmetic).
     Real(Rational),
+    /// Coerces a Boolean formula to an integer (0 or 1). Useful for encoding
+    /// indicator variables from conditional branches into arithmetic contexts.
     BoolToInt(Box<Formula>),
+    /// Array read: `(select mem idx)` — reads cell `idx` of region `mem`.
+    /// Both the index and the resulting value have sort `Int`.
     Select(Box<Memory>, Box<Term>),
+    /// Integer/real addition.
     Add(Box<Term>, Box<Term>),
+    /// Integer/real subtraction.
     Sub(Box<Term>, Box<Term>),
+    /// Integer/real multiplication.
     Mul(Box<Term>, Box<Term>),
+    /// Integer/real division (truncating for integers, exact for reals).
     Div(Box<Term>, Box<Term>),
+    /// Integer remainder. Operands must be `Int`-sorted.
     Rem(Box<Term>, Box<Term>),
+    /// Arithmetic negation.
     Neg(Box<Term>),
 }
 
@@ -315,20 +421,50 @@ impl fmt::Display for Term {
     }
 }
 
+/// A first-order Boolean formula over scalar variables and memory.
+///
+/// Formulas appear in three roles in the analysis:
+/// 1. **Reach predicates** — overapproximations of reachable states (forward
+///    direction). Loop invariants are injected here at loop headers.
+/// 2. **State predicates** — the WP of `NOT obligation`, propagated backward
+///    through the CFG to capture violation conditions.
+/// 3. **Guards and obligations** — edge guards and `Obligation` effects
+///    inside [`TransferFn`](crate::common::abstract_cfg::TransferFn).
+///
+/// The `And` and `Or` variants are n-ary (backed by a `Vec`) rather than
+/// binary so that `simplify` can flatten nested conjunctions or disjunctions
+/// cheaply and the solver can receive them as variadic calls. Constructors
+/// like [`Formula::and`] and [`Formula::or`] always call `simplify`, so
+/// `And([])` (vacuous true) and `Or([])` (vacuous false) only appear
+/// transiently inside `simplify` itself.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Formula {
+    /// The tautology — absorber for conjunction, identity for disjunction.
     True,
+    /// The contradiction — identity for conjunction, absorber for disjunction.
     False,
+    /// A Boolean-sorted variable (sort must be `Sort::Bool`; checked by `validate`).
     Var(Var),
+    /// Logical negation.
     Not(Box<Formula>),
+    /// N-ary conjunction. Empty = `True`; singleton is simplified away by constructors.
     And(Vec<Formula>),
+    /// N-ary disjunction. Empty = `False`; singleton is simplified away by constructors.
     Or(Vec<Formula>),
+    /// Material implication `lhs => rhs`.
     Implies(Box<Formula>, Box<Formula>),
+    /// Numeric (or memory-indirect) equality of two same-sorted terms.
+    /// `Bool`-sorted `Eq` is rejected by `validate` — use `Var` or `Implies` instead.
     Eq(Term, Term),
+    /// Array equality between two memory expressions (`mem1 == mem2`).
     MemoryEq(Memory, Memory),
+    /// Strict numeric less-than.
     Lt(Term, Term),
+    /// Numeric less-than-or-equal.
     Le(Term, Term),
+    /// Strict numeric greater-than.
     Gt(Term, Term),
+    /// Numeric greater-than-or-equal.
     Ge(Term, Term),
 }
 
@@ -693,6 +829,13 @@ fn substitute_memory_vars(memory: &Memory, mapping: &HashMap<Var, Var>) -> Memor
     }
 }
 
+/// Collect all integer literal indices used in `(select mem idx)` expressions
+/// inside `formula`, deduplicated and sorted.
+///
+/// Used during quantifier-free array reasoning to enumerate the concrete
+/// offsets that must be "instantiated" when checking memory-related invariants.
+/// Non-literal index expressions are silently skipped — only `Term::Int`
+/// constants are returned.
 pub fn collect_select_indices(formula: &Formula) -> Vec<i64> {
     let mut indices = Vec::new();
     collect_select_indices_formula(formula, &mut indices);
@@ -763,6 +906,10 @@ fn collect_select_indices_memory(memory: &Memory, indices: &mut Vec<i64>) {
     }
 }
 
+/// Errors produced by formula sort-checking ([`Formula::validate`], [`Term::sort`]).
+///
+/// These errors indicate a programming mistake in formula construction — they
+/// should not arise at runtime on well-typed LLVM IR after lowering.
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum FormulaError {
     #[error("expected Boolean sort, found {found}")]

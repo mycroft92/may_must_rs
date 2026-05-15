@@ -23,6 +23,17 @@ use std::fs;
 
 const NOISE_CALLS: &[&str] = &["printf", "putchar"];
 
+/// One vertex in the instruction-level CFG.
+///
+/// `instr` is the LLVM instruction this node represents.
+/// `predecessors` and `successors` are the direct control-flow neighbours at
+/// instruction granularity — not at basic-block granularity. Within a block,
+/// consecutive visible instructions are linked in sequence; across blocks, the
+/// last visible instruction of a predecessor block is linked to the first
+/// visible instruction of each successor block.
+///
+/// Predecessors and successors are stored as `BTreeSet` to give a
+/// deterministic iteration order (which matters for formula generation).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
     pub predecessors: BTreeSet<Instruction>,
@@ -30,6 +41,23 @@ pub struct Node {
     pub successors: BTreeSet<Instruction>,
 }
 
+/// A `may_assert` call site extracted from the LLVM IR.
+///
+/// The `may_assert` call itself is **not** inserted as a graph node — it is
+/// stripped from the visible-instruction list. Instead, each call site is
+/// recorded here so that the backward analysis knows what to verify and where
+/// to anchor it in the CFG.
+///
+/// Fields:
+/// - `asserted_value`: the first argument to `may_assert(cond)` — the `i1`
+///   value that must be non-zero on all reachable executions.
+/// - `predecessor`: the last visible instruction before the `may_assert` call
+///   in the same basic block, if any. Used to attach the obligation at the
+///   right program point.
+/// - `successor`: the first visible instruction after the `may_assert` call
+///   in the same basic block, if any.
+/// - `source_location`: file/line/column from DWARF debug info, used in
+///   human-readable diagnostic output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssertSite {
     pub asserted_value: Instruction,
@@ -38,16 +66,47 @@ pub struct AssertSite {
     pub source_location: SourceLocation,
 }
 
+/// The instruction-level control-flow graph for a single LLVM function.
+///
+/// This is the raw graph that the adapter (`adapter.rs`) further lowers into
+/// the abstract CFG used by the backward analysis. It operates at instruction
+/// granularity rather than basic-block granularity, which simplifies reasoning
+/// about individual data-flow steps.
+///
+/// Key design choices:
+/// - `may_assert` calls are **removed** from `vertices`/`edges` and recorded
+///   separately in `asserts`. This prevents them from interfering with
+///   control-flow edge construction while still capturing the obligation.
+/// - "Noise" calls (e.g. `printf`) are also stripped from the graph; they
+///   have no effect on the verification properties of interest.
+/// - `vars` maps SSA names to their defining instructions, providing a fast
+///   lookup used during formula construction.
+/// - `pointer_param_indices` records which parameters have pointer type; the
+///   adapter uses this to distinguish `ext_region` parameters from scalar ones.
 #[derive(Clone, Debug)]
 pub struct FunctionGraph {
+    /// The function name as it appears in the LLVM IR (e.g. `"foo"`, `"bar"`).
     pub name: String,
+    /// Display names of the formal parameters, in declaration order.
     pub params: Vec<String>,
+    /// Indices into `params` that have pointer type; these become `ext_region`
+    /// symbols in the lowered abstract CFG.
     pub pointer_param_indices: Vec<usize>,
+    /// All visible instructions in program order (may_assert and noise calls
+    /// excluded).
     pub vertices: Vec<Instruction>,
+    /// Adjacency map: each visible instruction → its [`Node`] (predecessors
+    /// and successors).
     pub edges: HashMap<Instruction, Node>,
+    /// First visible instruction of the function entry block, i.e. the graph
+    /// entry point.
     pub start: Option<Instruction>,
+    /// All `ret` instructions in the function; these are the graph exit points.
     pub end: Vec<Instruction>,
+    /// Maps SSA variable names (without `%`) to their defining instructions.
+    /// Used by the adapter to resolve operand references during lowering.
     pub vars: HashMap<String, Instruction>,
+    /// All `may_assert` call sites found in the function, in source order.
     pub asserts: Vec<AssertSite>,
 }
 
@@ -95,6 +154,30 @@ impl<'a> dot::GraphWalk<'a, Instruction, (Instruction, Instruction)> for Functio
 }
 
 impl FunctionGraph {
+    /// Build the instruction-level CFG for `function`.
+    ///
+    /// Returns `Err(ProgError::NoDefinitionForGraph)` for declaration-only
+    /// functions (no basic blocks). All other errors are propagated up.
+    ///
+    /// Construction proceeds in two passes:
+    ///
+    /// 1. **Intra-block pass** — for each basic block, the full instruction
+    ///    list is scanned to:
+    ///    - record `may_assert` call sites in `asserts` (with their visible
+    ///      predecessor/successor),
+    ///    - compute the *visible* instruction list by filtering with
+    ///      [`should_skip_instruction`],
+    ///    - populate `vars` and `end`,
+    ///    - call [`add_instruction`](FunctionGraph::add_instruction) for each
+    ///      visible instruction.
+    ///
+    /// 2. **Inter-block pass** — for each block's visible list, consecutive
+    ///    pairs are linked with [`add_edge`](FunctionGraph::add_edge), and the
+    ///    block's visible terminator is linked to the first visible instruction
+    ///    of each successor block.
+    ///
+    /// `start` is set to the first visible instruction of the entry block
+    /// (the first basic block in LLVM's block list).
     pub fn new(function: Function) -> Result<FunctionGraph> {
         if function.get_basic_block_count() == 0 {
             return Err(ProgError::NoDefinitionForGraph(function.get_name()));
@@ -207,6 +290,12 @@ impl FunctionGraph {
         Ok(graph)
     }
 
+    /// Insert `instruction` into the graph as an isolated vertex (no edges).
+    ///
+    /// If `instruction` is already present the call is a no-op, preserving
+    /// existing predecessor/successor sets. This idempotency means callers
+    /// can unconditionally call `add_instruction` before `add_edge` without
+    /// worrying about duplicate nodes.
     pub fn add_instruction(&mut self, instruction: Instruction) {
         if self.vertices.contains(&instruction) {
             return;
@@ -222,6 +311,13 @@ impl FunctionGraph {
         );
     }
 
+    /// Add a directed CFG edge `from → to`, inserting both endpoints as
+    /// isolated vertices first if they are not already present.
+    ///
+    /// Updates both `from`'s successor set and `to`'s predecessor set
+    /// atomically (both must succeed). Returns an error if either node is
+    /// missing after insertion, which should only happen if the graph is in
+    /// an inconsistent state.
     pub fn add_edge(&mut self, from: Instruction, to: Instruction) -> Result<()> {
         self.add_instruction(from);
         self.add_instruction(to);
@@ -253,6 +349,14 @@ impl FunctionGraph {
     }
 }
 
+/// Build instruction-level CFGs for all function definitions in `module`.
+///
+/// Declaration-only functions (no body) are silently skipped. Any other error
+/// during graph construction is propagated immediately, aborting processing of
+/// the remaining functions.
+///
+/// The returned vector contains one [`FunctionGraph`] per function definition,
+/// in the order functions appear in the module.
 pub fn generate_program_graph(module: &Module) -> Result<Vec<FunctionGraph>> {
     let mut graphs = Vec::new();
     for function in module.get_all_functions() {
@@ -271,10 +375,26 @@ pub fn dump_graphs(graphs: &[FunctionGraph], outdir: &str) {
     }
 }
 
+/// Return `true` if `instruction` should be excluded from the visible-
+/// instruction graph.
+///
+/// Instructions are skipped when they carry no semantic information relevant
+/// to the assertion being verified:
+/// - `may_assert` calls are handled separately via `AssertSite` recording.
+/// - "Noise" calls (currently `printf`, `putchar`) are I/O side-effects with
+///   no effect on program state as modelled by the analysis.
+///
+/// **Invariant**: any instruction skipped here must not appear in `vertices`
+/// or `edges`, but it MAY appear as a callee name in `asserts`.
 fn should_skip_instruction(instruction: Instruction) -> bool {
     is_may_assert_call(instruction) || is_noise_call(instruction)
 }
 
+/// Return `true` if `instruction` is a direct call to `may_assert`.
+///
+/// `may_assert` is the sentinel function that marks assertion sites. Its
+/// single argument is the `i1` condition that must hold. The call is stripped
+/// from the CFG but recorded as an [`AssertSite`].
 fn is_may_assert_call(instruction: Instruction) -> bool {
     instruction.get_called_function().as_deref() == Some("may_assert")
 }
@@ -286,6 +406,15 @@ fn is_noise_call(instruction: Instruction) -> bool {
     NOISE_CALLS.iter().any(|noise| *noise == callee)
 }
 
+/// Return the nearest visible instruction that precedes `instructions[index]`
+/// within the same basic block.
+///
+/// Searches backwards from `index - 1`, skipping any instructions that
+/// [`should_skip_instruction`] would filter out. Returns `None` if no visible
+/// instruction exists before `index` in the block.
+///
+/// Used to populate `AssertSite::predecessor` so the backward analysis knows
+/// the last real program point before an assertion.
 fn previous_visible_instruction(instructions: &[Instruction], index: usize) -> Option<Instruction> {
     instructions[..index]
         .iter()
@@ -294,6 +423,15 @@ fn previous_visible_instruction(instructions: &[Instruction], index: usize) -> O
         .find(|instruction| !should_skip_instruction(*instruction))
 }
 
+/// Return the nearest visible instruction that follows `instructions[index]`
+/// within the same basic block.
+///
+/// Searches forwards from `index + 1`, skipping any instructions that
+/// [`should_skip_instruction`] would filter out. Returns `None` if no visible
+/// instruction exists after `index` in the block.
+///
+/// Used to populate `AssertSite::successor` so the backward analysis can
+/// resume propagation past the assertion site.
 fn next_visible_instruction(instructions: &[Instruction], index: usize) -> Option<Instruction> {
     instructions[index + 1..]
         .iter()

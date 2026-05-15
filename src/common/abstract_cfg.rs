@@ -1,3 +1,38 @@
+//! Abstract control-flow graph, transfer functions, and WP computation.
+//!
+//! This module is the shared representation that sits between the LLVM
+//! lowering layer (`adapter.rs`) and the analysis passes (`backward.rs`,
+//! `loops.rs`). It provides three things:
+//!
+//! 1. **[`AbstractCfg`]** — a directed graph of [`AbstractNode`]s connected
+//!    by [`AbstractEdge`]s. Each node carries a [`TransferFn`] (the semantics
+//!    of the basic block), and each edge carries a guard and optional
+//!    additional effects (typically the branch condition).
+//!
+//! 2. **[`TransferEffect`]** / **[`TransferFn`]** — a structured, first-order
+//!    description of what a basic block *does*: variable assignments, memory
+//!    stores, pointer arithmetic, assumptions, and obligations. `TransferFn`
+//!    exposes both a weakest-precondition transformer ([`TransferFn::wp`])
+//!    for backward propagation and a strongest-postcondition transformer
+//!    ([`TransferFn::sp`]) for forward propagation.
+//!
+//! 3. **Substitution helpers** — public functions that perform capture-free
+//!    variable and memory-region substitution inside [`Formula`] and [`Term`]
+//!    expressions, used by the WP engine and the backward analysis.
+//!
+//! # Node and edge ids
+//!
+//! [`CfgNodeId`] and [`CfgEdgeId`] are opaque integer wrappers allocated
+//! monotonically by [`AbstractCfg`]. They are stable for the lifetime of the
+//! CFG and safe to store in external maps.
+//!
+//! # Single-exit invariant
+//!
+//! The backward analysis requires exactly one exit node. Call
+//! [`AbstractCfg::ensure_single_exit`] after construction to enforce this; it
+//! inserts a synthetic merge node if multiple concrete `Return` exits were
+//! recorded via [`AbstractCfg::mark_exit`].
+
 #![allow(dead_code)]
 
 use crate::common::formula::{Formula, Memory, Term, Var};
@@ -5,9 +40,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use thiserror::Error;
 
+/// An opaque, copy-cheaply handle for a node in an [`AbstractCfg`].
+///
+/// Ids are allocated sequentially starting at 0 (the entry) and are stable
+/// for the lifetime of the CFG. They implement `Ord` so they can be used as
+/// `BTreeMap` keys without additional hashing overhead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
 pub struct CfgNodeId(pub usize);
 
+/// An opaque, copy-cheaply handle for an edge in an [`AbstractCfg`].
+///
+/// Like [`CfgNodeId`], ids are allocated sequentially and are stable for the
+/// lifetime of the CFG. Storing an edge id is cheaper than cloning the full
+/// [`AbstractEdge`] when only the identity (e.g. back-edge detection) matters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
 pub struct CfgEdgeId(pub usize);
 
@@ -56,67 +101,134 @@ impl From<SourceLocation> for crate::common::source::SourceLocation {
     }
 }
 
+/// Describes how a call site affects the symbolic memory regions.
+///
+/// When a callee's full summary is not yet available (or the callee is an
+/// external function), the analysis must choose a conservative approximation:
+/// - `PreservesMemory` — the callee is side-effect free with respect to the
+///   memory regions tracked by the caller. WP treats it as a no-op for memory.
+/// - `HavocMemory` — the callee may write any memory cell. WP forgets all
+///   memory facts across this call site. This is the sound default for unknown
+///   callees.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CallMemoryEffect {
+    /// The call does not modify any symbolically-tracked memory region.
     PreservesMemory,
+    /// The call may modify any memory region; all memory knowledge is discarded.
     HavocMemory,
 }
 
+/// The right-hand side of a [`TransferEffect::Assign`].
+///
+/// Separating numeric terms from Boolean predicates avoids forcing the WP
+/// engine to guess the sort of an assignment target — it can dispatch directly
+/// on the variant and call the appropriate substitution helper.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum AssignValue {
+    /// The target is assigned a numeric (Int or Real) value.
     Term(Term),
+    /// The target (a Bool-sorted variable) is assigned a Boolean formula.
     Predicate(Formula),
 }
 
+/// A single atomic effect inside a basic-block transfer function.
+///
+/// Effects are listed in program order inside [`TransferFn::effects`]. The WP
+/// transformer in [`TransferFn::wp`] processes them in *reverse* order (last
+/// effect first), while `sp` processes them in forward order.
+///
+/// # WP semantics summary
+///
+/// | Variant | WP rule |
+/// |---|---|
+/// | `Assign` | standard substitution: `post[target := value]` |
+/// | `Assume(c)` | `c => post` (path condition) |
+/// | `Obligation(c)` | `c AND post` (assertion site) |
+/// | `MemoryStore` | memory substitution: `post[region := store(region, off, val)]` |
+/// | All pointer / alloca / load / store / call variants | `post` (transparent — memory modelled elsewhere or havoced by `HavocMemory`) |
+/// | `Nop` | `post` |
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TransferEffect {
-    Assign {
-        target: Var,
-        value: AssignValue,
-    },
-    Alloca {
-        target: String,
-        region: String,
-    },
+    /// Assign a scalar value to a variable. WP performs capture-free
+    /// substitution of `target` by `value` inside the postcondition.
+    Assign { target: Var, value: AssignValue },
+    /// Record that `target` (an LLVM `alloca` SSA name) points to `region`
+    /// at offset 0. Used by [`TransferFn::pointer_resolution`] to build a
+    /// [`PointerEnv`]; WP treats this as a no-op.
+    Alloca { target: String, region: String },
+    /// Record a GEP (pointer offset): `target = base + offset`. Used by
+    /// [`TransferFn::pointer_resolution`] to propagate pointer bindings;
+    /// WP treats this as a no-op.
     GetElementPtr {
         target: String,
         base: String,
         offset: Term,
     },
-    Load {
-        target: Var,
-        source: String,
-    },
-    Store {
-        target: String,
-        value: Term,
-    },
+    /// An LLVM `load` instruction that the adapter could not fully resolve to
+    /// a symbolic `MemoryStore` + `Select`. WP treats it as a no-op (the
+    /// loaded variable remains free/unbound). Where possible the adapter
+    /// emits `MemoryStore` + `Assign` instead.
+    Load { target: Var, source: String },
+    /// An LLVM `store` instruction that the adapter could not resolve to a
+    /// symbolic `MemoryStore`. WP treats it as a no-op; the caller may apply
+    /// `HavocMemory` if unsoundness is a concern.
+    Store { target: String, value: Term },
+    /// A memory write that the adapter *has* resolved to a concrete region and
+    /// offset. WP performs array-update substitution:
+    /// `post[region := store(region, offset, value)]`.
+    ///
+    /// This is the primary way pointer-based writes enter the formula.
     MemoryStore {
         region: String,
         offset: Term,
         value: Term,
     },
+    /// Store a pointer value into a pointer-typed slot. Used only for
+    /// pointer-environment propagation; WP treats it as transparent.
     PointerStore {
         target_slot: String,
         value_ptr: String,
     },
+    /// Load a pointer value from a pointer-typed slot. Used only for
+    /// pointer-environment propagation; WP treats it as transparent.
     PointerLoad {
         target_ptr: String,
         source_slot: String,
     },
-    PointerAlias {
-        target: String,
-        source: String,
-    },
+    /// Declare that two pointer names alias. Used only for
+    /// pointer-environment propagation; WP treats it as transparent.
+    PointerAlias { target: String, source: String },
+    /// A path condition that must hold for execution to reach this point.
+    /// WP: `condition => post`.
     Assume(Formula),
+    /// An assertion or verification obligation. The analysis must prove
+    /// `condition` holds whenever this effect is reached.
+    /// WP: `condition AND post` (both the obligation and the continuation
+    /// must hold).
     Obligation(Formula),
+    /// A no-op placeholder. WP: identity on `post`.
     Nop,
+    /// An opaque call whose memory effect is captured by [`CallMemoryEffect`].
+    /// `PreservesMemory` → WP is transparent; `HavocMemory` → caller
+    /// should havoce memory before applying WP (currently handled at the
+    /// driver level, not here).
     Call {
         callee: String,
         memory_effect: CallMemoryEffect,
     },
 }
 
+/// An ordered sequence of [`TransferEffect`]s that models the semantics of a
+/// basic block (or an edge's side effects).
+///
+/// The two key operations are:
+/// - [`TransferFn::wp`] — weakest precondition, used by the backward analysis
+///   to propagate violation conditions from post to pre.
+/// - [`TransferFn::sp`] — strongest postcondition, used by the forward
+///   direction to propagate reach predicates through loop bodies.
+///
+/// An empty `TransferFn` is the identity transformer for both WP and SP (see
+/// [`TransferFn::identity`]).
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub struct TransferFn {
     pub effects: Vec<TransferEffect>,
@@ -135,6 +247,13 @@ impl TransferFn {
         self.effects.is_empty()
     }
 
+    /// Compute the weakest precondition of `post` through this transfer function.
+    ///
+    /// Effects are processed in reverse program order (right-to-left
+    /// composition). Each effect applies the rule documented on
+    /// [`TransferEffect`]: assignments substitute, assumes add implications,
+    /// obligations conjoin, memory stores perform array-update substitution,
+    /// and all other effects are transparent.
     pub fn wp(&self, post: &Formula) -> Formula {
         self.effects
             .iter()
@@ -142,12 +261,26 @@ impl TransferFn {
             .fold(post.clone(), |acc, effect| wp_one(effect, &acc))
     }
 
+    /// Compute the strongest postcondition of `pre` through this transfer function.
+    ///
+    /// Effects are processed in forward program order. Assignments add
+    /// equalities to the current predicate; assumes and obligations conjoin
+    /// their conditions; memory effects and pointer bookkeeping are currently
+    /// transparent (the forward direction is used only for reach
+    /// overapproximation, where memory details are handled separately via
+    /// loop invariants).
     pub fn sp(&self, pre: &Formula) -> Formula {
         self.effects
             .iter()
             .fold(pre.clone(), |acc, effect| sp_one(effect, &acc))
     }
 
+    /// Build a [`PointerEnv`] by replaying only the `Alloca` and
+    /// `GetElementPtr` effects in this transfer function.
+    ///
+    /// The resulting environment maps SSA pointer names to `(region, offset)`
+    /// pairs and is used by the adapter to resolve load/store targets before
+    /// lowering them to `MemoryStore` or `Select` effects.
     pub fn pointer_resolution(&self) -> PointerEnv {
         let mut env = PointerEnv::default();
         for effect in &self.effects {
@@ -175,53 +308,105 @@ impl TransferFn {
     }
 }
 
+/// A partial map from LLVM SSA pointer names to their resolved memory region
+/// and integer offset.
+///
+/// Built incrementally by [`TransferFn::pointer_resolution`] as `Alloca` and
+/// `GetElementPtr` effects are replayed. The adapter uses this to resolve
+/// `load`/`store` targets to `(region, offset)` pairs before emitting
+/// `MemoryStore` / `Select` effects into the abstract transfer function.
+///
+/// Pointer names that cannot be resolved (e.g. function arguments, GEP bases
+/// that are themselves unresolved) are simply absent from the map; callers
+/// must handle the `None` case conservatively.
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct PointerEnv {
     bindings: HashMap<String, PointerBinding>,
 }
 
 impl PointerEnv {
+    /// Record that the pointer `pointer` points to `region` at integer `offset`.
     pub fn bind(&mut self, pointer: String, region: String, offset: Term) {
         self.bindings
             .insert(pointer, PointerBinding { region, offset });
     }
 
+    /// Look up the resolved binding for `pointer`, returning `None` if it
+    /// was never bound (e.g. it is a function argument or unresolved GEP).
     pub fn get(&self, pointer: &str) -> Option<&PointerBinding> {
         self.bindings.get(pointer)
     }
 }
 
+/// A resolved pointer target: the name of the memory region and the integer
+/// term giving the offset within that region.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PointerBinding {
+    /// The logical memory region name (e.g. `stack0`, `fn$__ext_0`).
     pub region: String,
+    /// The offset within the region as an integer term (often a constant,
+    /// but may involve variables after GEP arithmetic).
     pub offset: Term,
 }
 
+/// Classifies the role of a node in the CFG.
+///
+/// The backward analysis uses this to locate the unique exit point; the
+/// forward analysis seeds the entry. `SyntheticExit` nodes are inserted by
+/// [`AbstractCfg::ensure_single_exit`] and carry no transfer effects of their
+/// own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum NodeKind {
+    /// The unique function entry point, always `CfgNodeId(0)`.
     Entry,
+    /// An ordinary basic block with no special structural role.
     Normal,
+    /// A concrete function return (one of potentially many before
+    /// `ensure_single_exit` is called).
     Exit,
+    /// A merge node inserted by `ensure_single_exit` to unify multiple
+    /// `Exit` nodes into a single exit. Has no transfer effects.
     SyntheticExit,
 }
 
+/// A node in the abstract CFG, corresponding to a basic block.
+///
+/// `pre` and `post` are scratch fields used by analysis passes to annotate
+/// nodes with their computed reach/state predicates; they are initialised to
+/// `True` and updated in-place during the analysis.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AbstractNode {
+    /// Stable id within the parent [`AbstractCfg`].
     pub id: CfgNodeId,
+    /// Human-readable label, typically the LLVM basic-block name.
     pub label: String,
     pub kind: NodeKind,
+    /// Optional source location extracted from LLVM debug metadata.
     pub source_location: Option<SourceLocation>,
+    /// The semantics of this block as a sequence of [`TransferEffect`]s.
     pub transfer: TransferFn,
+    /// Scratch field: precondition computed by the analysis (reach or WP).
     pub pre: Formula,
+    /// Scratch field: postcondition computed by the analysis.
     pub post: Formula,
 }
 
+/// A directed edge in the abstract CFG, corresponding to a control-flow
+/// transition between basic blocks.
+///
+/// An edge carries a `guard` (the branch condition that must hold to take
+/// this edge) and an optional list of `effects` (e.g. the `phi`-node
+/// assignments lowered at the target's incoming edge). The full transfer
+/// function for the edge can be obtained with [`AbstractEdge::transfer`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AbstractEdge {
     pub id: CfgEdgeId,
     pub source: CfgNodeId,
     pub target: CfgNodeId,
+    /// The Boolean condition that must be satisfied to take this edge.
+    /// `Formula::True` for unconditional jumps.
     pub guard: Formula,
+    /// Effects executed when this edge is taken (e.g. phi assignments).
     pub effects: Vec<TransferEffect>,
 }
 
@@ -231,12 +416,28 @@ impl AbstractEdge {
     }
 }
 
+/// A mutable, directed abstract control-flow graph for one function.
+///
+/// Nodes represent basic blocks; edges represent control-flow transitions.
+/// Construction is incremental: call [`AbstractCfg::new`] to create the entry
+/// node, then [`add_node`](AbstractCfg::add_node) /
+/// [`add_edge`](AbstractCfg::add_edge) to build the graph, and finally
+/// [`ensure_single_exit`](AbstractCfg::ensure_single_exit) to guarantee a
+/// unique exit point before handing the CFG to the analysis.
+///
+/// The struct also exposes graph-structural queries needed by the analysis:
+/// [`detect_back_edges`](AbstractCfg::detect_back_edges) for loop detection and
+/// [`topological_order`](AbstractCfg::topological_order) /
+/// [`topological_order_excluding`](AbstractCfg::topological_order_excluding)
+/// for DAG-order traversal once back edges are removed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AbstractCfg {
     nodes: BTreeMap<CfgNodeId, AbstractNode>,
     edges: BTreeMap<CfgEdgeId, AbstractEdge>,
     entry: CfgNodeId,
+    /// All nodes marked as concrete function returns via `mark_exit`.
     concrete_exits: BTreeSet<CfgNodeId>,
+    /// The unique exit after `ensure_single_exit` has run; `None` until then.
     exit: Option<CfgNodeId>,
     next_node: usize,
     next_edge: usize,
@@ -267,10 +468,14 @@ impl AbstractCfg {
         }
     }
 
+    /// Return the id of the unique entry node (always `CfgNodeId(0)`).
     pub fn entry(&self) -> CfgNodeId {
         self.entry
     }
 
+    /// Return the unique exit node id, or `None` if
+    /// [`ensure_single_exit`](AbstractCfg::ensure_single_exit) has not yet
+    /// been called.
     pub fn exit(&self) -> Option<CfgNodeId> {
         self.exit
     }
@@ -303,6 +508,10 @@ impl AbstractCfg {
         self.edges.keys().copied()
     }
 
+    /// Add a new `Normal`-kind node with the given label and transfer function.
+    ///
+    /// Returns the freshly allocated [`CfgNodeId`]. The node's `pre` and
+    /// `post` are initialised to `True`; analysis passes overwrite them.
     pub fn add_node(&mut self, label: impl Into<String>, transfer: TransferFn) -> CfgNodeId {
         let id = CfgNodeId(self.next_node);
         self.next_node += 1;
@@ -336,6 +545,13 @@ impl AbstractCfg {
         Ok(())
     }
 
+    /// Mark node `id` as a concrete function return point.
+    ///
+    /// Calling this multiple times (once per `ret` instruction) is normal;
+    /// [`ensure_single_exit`](AbstractCfg::ensure_single_exit) will merge them
+    /// later. Marking the entry node as an exit is silently ignored because a
+    /// zero-instruction function is a degenerate case the analysis doesn't
+    /// need to handle.
     pub fn mark_exit(&mut self, id: CfgNodeId) -> Result<(), CfgError> {
         if id != self.entry {
             self.node_mut(id)?.kind = NodeKind::Exit;
@@ -345,6 +561,12 @@ impl AbstractCfg {
         Ok(())
     }
 
+    /// Add a directed edge from `source` to `target` with the given guard and
+    /// edge-level effects.
+    ///
+    /// Returns `Err` if either node id is unknown. Parallel edges (same source
+    /// and target) are allowed and represent multiple branch arms with
+    /// different guards.
     pub fn add_edge(
         &mut self,
         source: CfgNodeId,
@@ -414,6 +636,18 @@ impl AbstractCfg {
             .collect()
     }
 
+    /// Ensure the CFG has exactly one exit node, creating a synthetic merge
+    /// node if necessary.
+    ///
+    /// The backward analysis requires a unique exit to seed WP propagation.
+    /// This method:
+    /// - Returns the existing exit immediately if already resolved.
+    /// - Promotes the single concrete exit if there is exactly one.
+    /// - Inserts a `SyntheticExit` node and connects all concrete exits to it
+    ///   with unconditional `True`-guarded edges if there are multiple exits.
+    ///
+    /// Returns `Err(CfgError::MissingExit)` if no exit node was ever
+    /// registered via [`mark_exit`](AbstractCfg::mark_exit).
     pub fn ensure_single_exit(&mut self) -> Result<CfgNodeId, CfgError> {
         if let Some(exit) = self.exit {
             return Ok(exit);
@@ -438,6 +672,18 @@ impl AbstractCfg {
         }
     }
 
+    /// Return a topological ordering of all nodes, or `None` if the graph
+    /// contains a cycle.
+    ///
+    /// Uses Kahn's algorithm (in-degree queue). The ordering is not unique for
+    /// DAGs with multiple source nodes, but is deterministic because the
+    /// in-degree map is backed by a `BTreeMap`.
+    ///
+    /// Returns `None` for any CFG with loops. Use
+    /// [`topological_order_excluding`](AbstractCfg::topological_order_excluding)
+    /// with the back edges identified by
+    /// [`detect_back_edges`](AbstractCfg::detect_back_edges) to obtain an
+    /// order over the loop-reduced DAG.
     pub fn topological_order(&self) -> Option<Vec<CfgNodeId>> {
         let mut indegree = self
             .nodes
@@ -476,6 +722,14 @@ impl AbstractCfg {
         }
     }
 
+    /// Return a topological ordering of all nodes after treating the `excluded`
+    /// edges as absent, or `None` if removing those edges does not break all
+    /// cycles.
+    ///
+    /// Intended use: pass the back edges returned by
+    /// [`detect_back_edges`](AbstractCfg::detect_back_edges) as `excluded` to
+    /// obtain a DAG order for the loop-reduced CFG, which is then processed by
+    /// the backward WP pass with loop headers treated as cut points.
     pub fn topological_order_excluding(
         &self,
         excluded: &BTreeSet<CfgEdgeId>,
@@ -524,6 +778,17 @@ impl AbstractCfg {
         }
     }
 
+    /// Identify back edges using a DFS from the entry node.
+    ///
+    /// An edge `(u, v)` is a back edge if `v` is an ancestor of `u` in the
+    /// DFS tree, i.e. `v` is currently on the DFS recursion stack when the
+    /// edge is first visited. Back edges correspond to loop back-jumps in the
+    /// original LLVM IR.
+    ///
+    /// The returned edge ids are used by the loop analysis in `loops.rs` to
+    /// identify loop headers (the targets of back edges) and by
+    /// [`topological_order_excluding`](AbstractCfg::topological_order_excluding)
+    /// to break cycles for the WP pass.
     pub fn detect_back_edges(&self) -> Vec<CfgEdgeId> {
         let mut visited = BTreeSet::new();
         let mut stack = BTreeSet::new();
@@ -559,12 +824,18 @@ impl AbstractCfg {
     }
 }
 
+/// Errors produced by [`AbstractCfg`] mutation and structural query methods.
+///
+/// These indicate programming mistakes (using a stale id from a different CFG
+/// or forgetting to call `mark_exit`) rather than expected analysis outcomes.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CfgError {
     #[error("unknown node id: {id:?}")]
     UnknownNode { id: CfgNodeId },
     #[error("unknown edge id: {id:?}")]
     UnknownEdge { id: CfgEdgeId },
+    /// Returned by [`AbstractCfg::ensure_single_exit`] when no node has been
+    /// registered as an exit via [`AbstractCfg::mark_exit`].
     #[error("missing CFG exit")]
     MissingExit,
 }

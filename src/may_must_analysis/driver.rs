@@ -1,3 +1,38 @@
+//! Module-level orchestration of the may/must analysis.
+//!
+//! # Responsibilities
+//!
+//! This module drives the full interprocedural analysis of an LLVM module:
+//!
+//! 1. **Return-summary inference** — for each function, a [`ReturnSummary`]
+//!    relating the return value to the formal parameters is computed.  Acyclic
+//!    functions are handled directly by `compute_return_summary`; looping
+//!    functions that observe an array argument are handled by the *observer
+//!    pattern* ([`infer_cyclic_observer_summary`]).
+//!
+//! 2. **Call order / recursion detection** — [`recursive_functions`] identifies
+//!    mutually recursive functions so their summaries can be flagged.
+//!
+//! 3. **Loop invariant pre-computation** — before the per-assertion backward
+//!    pass, [`discover_loop_invariants`] is called for each looping function.
+//!    The results are cached in [`SummaryTables`] and reused across multiple
+//!    assertions in the same function.
+//!
+//! 4. **Per-function verification** — [`analyze_with_summaries`] lowers a
+//!    [`FunctionGraph`] via the adapter, retrieves or synthesises loop
+//!    invariants, and calls [`analyze_with_tables`] for each [`AssertionSite`].
+//!
+//! # Observer pattern for cyclic callees
+//!
+//! When a looping callee reads an array parameter and returns a summary value
+//! (e.g. a maximum or sum), [`infer_cyclic_observer_summary`] synthesises an
+//! invariant by examining which array indices the function accesses, then
+//! verifying a candidate relation `retval >= array[i]` via the full
+//! bidirectional check.  The invariant synthesis step
+//! ([`observer_summary_invariants`]) intentionally skips the exit-closure check
+//! because the authoritative proof is delegated to the subsequent
+//! `analyze_with_tables` call.
+
 #![allow(dead_code)]
 
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, SourceLocation};
@@ -114,6 +149,19 @@ pub fn analyze_function_graph(
     )
 }
 
+/// Analyse every function in an LLVM module and return a [`ModuleReport`].
+///
+/// This is the primary entry point for whole-module verification.  It
+/// orchestrates the following passes in order:
+///
+/// 1. Collect external callee names and load any manually-provided summaries
+///    from the [`CandidateProvider`].
+/// 2. Iteratively infer return summaries for all in-module functions (up to
+///    `graphs.len()` rounds to handle mutual calls).
+/// 3. Convert return summaries to must/not-may entries in [`SummaryTables`].
+/// 4. Pre-compute and cache loop invariants for every looping function via
+///    [`discover_loop_invariants`].
+/// 5. Run [`analyze_with_summaries`] for each function and collect reports.
 pub fn analyze_module(
     graphs: &[FunctionGraph],
     memory_pure: &BTreeSet<String>,
@@ -320,6 +368,23 @@ fn infer_return_summary(
         .or_else(|| infer_cyclic_observer_summary(graph, adapted, oracle))
 }
 
+/// Infer a return summary for a looping function that observes an array argument.
+///
+/// This implements the *observer pattern*: if a function iterates over an array
+/// pointer parameter and returns a value derived from the array elements, this
+/// function attempts to prove relations of the form
+/// `retval >= array[i]` for each candidate index `i`.
+///
+/// The approach:
+/// 1. Skip acyclic functions and functions without pointer parameters.
+/// 2. For each pointer parameter, scan the CFG for accessed indices
+///    ([`observer_candidate_indices`]).
+/// 3. For each index, construct a synthetic assertion site at the function exit
+///    and call [`observer_summary_invariants`] to get a loop invariant.
+/// 4. Run the full [`analyze_with_tables`] bidirectional check to verify the
+///    obligation.
+/// 5. Collect all verified relations into a conjunction forming the
+///    [`ReturnSummary`].
 fn infer_cyclic_observer_summary(
     graph: &FunctionGraph,
     adapted: &AdaptedProcedure,
@@ -683,6 +748,26 @@ fn const_int_value(term: &Term) -> Option<i64> {
     }
 }
 
+/// Synthesise loop invariants needed to discharge an observer-pattern obligation.
+///
+/// For each detected loop the function examines the preliminary backward state
+/// at the header (the state propagated backward from the synthetic exit
+/// assertion with back edges cut).  It expects the header state to contain a
+/// conjunct of the form `counter >= exit_value` (exit condition) and a
+/// comparison `accumulator < observed_value` (the potential violation), and
+/// constructs the disjunctive invariant:
+///
+/// ```text
+/// counter <= observed_index  OR  accumulator >= observed_value
+/// ```
+///
+/// The invariant is checked for initiation and inductiveness via
+/// [`check_loop_invariant_verbose`] with `assertion_postconditions` set to
+/// `&BTreeMap::new()` — the exit-closure check is **intentionally skipped**
+/// here.  The rationale: this invariant only needs to be inductive; the actual
+/// obligation (`retval >= array[observed_index]`) is verified by the
+/// [`analyze_with_tables`] call in [`infer_cyclic_observer_summary`], which is
+/// the authoritative discharge step.
 fn observer_summary_invariants(
     cfg: &AbstractCfg,
     site: &AssertionSite,
@@ -816,6 +901,16 @@ fn summary_observed_term(cfg: &AbstractCfg, site: &AssertionSite) -> Option<Term
     }
 }
 
+/// Extract `(counter_term, accumulator_term, observed_term)` from a header
+/// backward state formula.
+///
+/// The formula is expected to be a conjunction containing:
+/// - One conjunct matching [`extract_exit_counter`] — the loop exit condition
+///   (e.g. `i >= n`).
+/// - One conjunct matching [`extract_lt_pair`] — the potential violation
+///   (e.g. `acc < array[i]`).
+///
+/// Returns `None` if either component is missing.
 fn extract_counter_acc_obs(formula: &Formula) -> Option<(Term, Term, Term)> {
     let conjuncts: Vec<&Formula> = match formula {
         Formula::And(items) => items.iter().collect(),
@@ -841,6 +936,11 @@ fn extract_counter_acc_obs(formula: &Formula) -> Option<(Term, Term, Term)> {
     Some((counter, acc, obs))
 }
 
+/// Extract the left-hand side of a loop exit condition of the form
+/// `lhs >= rhs`, `lhs > rhs`, `NOT (lhs < rhs)`, or `NOT (lhs <= rhs)`.
+///
+/// This is used by [`extract_counter_acc_obs`] to identify the counter
+/// variable after the loop has terminated.
 fn extract_exit_counter(formula: &Formula) -> Option<Term> {
     match formula {
         Formula::Ge(lhs, _) | Formula::Gt(lhs, _) => Some(lhs.clone()),
@@ -852,6 +952,11 @@ fn extract_exit_counter(formula: &Formula) -> Option<Term> {
     }
 }
 
+/// Extract `(lhs, rhs)` from a formula expressing `lhs < rhs`, `lhs <= rhs`,
+/// `NOT (lhs >= rhs)`, or `NOT (lhs > rhs)`.
+///
+/// Used by [`extract_counter_acc_obs`] to identify the accumulator and the
+/// observed value (array element) in the violation condition.
 fn extract_lt_pair(formula: &Formula) -> Option<(Term, Term)> {
     match formula {
         Formula::Lt(lhs, rhs) | Formula::Le(lhs, rhs) => Some((lhs.clone(), rhs.clone())),
@@ -863,6 +968,12 @@ fn extract_lt_pair(formula: &Formula) -> Option<(Term, Term)> {
     }
 }
 
+/// Compute the set of functions that are (mutually) recursive.
+///
+/// A function is considered recursive if it can reach itself through the
+/// intra-module call graph (direct or indirect).  The result is used to tag
+/// [`ProcedureReport::recursive`] and may be used in the future to skip or
+/// specialise summary inference for recursive callees.
 fn recursive_functions(graphs: &[FunctionGraph]) -> BTreeSet<String> {
     let in_graph = graphs
         .iter()

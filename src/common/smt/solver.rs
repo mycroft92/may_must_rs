@@ -1,17 +1,40 @@
 #![allow(dead_code)]
 
-//! Minimal SMT wrapper for the reconstructed milestone.
+//! Raw Z3 lowering layer — the only place in the codebase that touches Z3 ASTs
+//! directly.
 //!
-//! This module owns the raw Z3 interaction needed to lower `analysis::formula`
-//! values into solver constraints. It is intentionally small:
+//! # Design
 //!
-//! - variable and array caches live here;
-//! - model rendering lives here;
-//! - integer-array memory equalities are lowered here;
-//! - paper-level decisions about when to ask SAT/validity questions do not.
+//! This module owns the mechanical translation from the analysis formula types
+//! ([`Formula`], [`Term`], [`Memory`]) to Z3 AST nodes.  It is intentionally
+//! kept small and policy-free:
 //!
-//! That policy split keeps `analysis::oracle` in charge of the proof/search
-//! logic while `solver.rs` stays a mechanical lowering layer.
+//! - Variable and array declarations are cached inside [`SmtScope`] so that
+//!   the same Z3 variable is reused for every occurrence of a name.
+//! - Model extraction and rendering live here so that callers never need to
+//!   touch Z3's `Model` type.
+//! - Memory regions are modelled as Z3 `Array(Int, Int)` — every named region
+//!   gets its own array constant.  Array equality is expressed via Z3's
+//!   built-in array equality.
+//! - Decisions about *when* to ask satisfiability or validity questions are
+//!   **not** made here; they belong in `oracle.rs`.
+//!
+//! # Scope / stack model
+//!
+//! [`SmtScope`] wraps a single Z3 `Solver` instance together with maps from
+//! variable names to their cached Z3 AST nodes.  Because Z3's solver is
+//! stateful (it accumulates asserted formulas), callers must call [`SmtScope::reset`]
+//! to clear all assertions between independent queries.  There is no push/pop
+//! mechanism — each query is performed in a fresh logical context by resetting
+//! the solver and re-asserting from scratch.  The variable caches persist
+//! across resets so that Z3 constant declarations are not duplicated.
+//!
+//! # Memory regions
+//!
+//! The adapter introduces named memory regions (`stack0`, `stack1`, `fn$__ext_N`,
+//! …).  Each region is a `Memory::Var(name)` in the formula layer and becomes
+//! a Z3 `Array(Int, Int)` constant here.  Store operations are modelled with
+//! Z3's functional-update `store(array, index, value)` term.
 
 use crate::common::formula::{
     Formula, FormulaError, Memory, ModelValue, Rational, SmtModel, Sort, Term, Var,
@@ -20,7 +43,16 @@ use std::collections::BTreeMap;
 use z3::ast::{Array, Bool, Int, Real};
 use z3::{SatResult, Solver, Sort as Z3Sort};
 
-/// One reusable Z3 scope plus cached variable declarations for the paper terms.
+/// A Z3 solver instance together with cached variable declarations.
+///
+/// All variables are declared lazily on first use and stored in type-segregated
+/// maps so that the same Z3 AST constant is returned for every reference to a
+/// given name.  This is required by Z3: each call to `Bool::new_const(name)`
+/// creates a *fresh* constant even if `name` matches an existing one, which
+/// would silently produce incorrect results.
+///
+/// Use [`SmtScope::reset`] between logically independent queries.  The solver
+/// state is cleared but the variable caches are retained.
 #[derive(Debug, Default)]
 pub struct SmtScope {
     solver: Solver,
@@ -35,6 +67,11 @@ impl SmtScope {
         Self::default()
     }
 
+    /// Lower `formula` to a Z3 Bool and assert it into the solver.
+    ///
+    /// The formula is validated (sort-checking) before lowering.  Returns an
+    /// error if validation or lowering fails; the solver state is not modified
+    /// in that case.
     pub fn assert_formula(&mut self, formula: &Formula) -> Result<(), FormulaError> {
         formula.validate()?;
         let lowered = self.lower_formula(formula)?;
@@ -42,14 +79,33 @@ impl SmtScope {
         Ok(())
     }
 
+    /// Run the satisfiability check on all currently asserted formulas.
+    ///
+    /// Returns `SatResult::Sat`, `SatResult::Unsat`, or `SatResult::Unknown`.
+    /// A `Sat` result makes the model accessible via [`model_bindings`] and
+    /// [`model_string`].
     pub fn check(&self) -> SatResult {
         self.solver.check()
     }
 
+    /// Return the raw Z3 model as a string, or `None` if no model is available.
+    ///
+    /// This is a low-level diagnostic accessor; callers that need structured
+    /// values should use [`model_bindings`] instead.
     pub fn model_string(&self) -> Option<String> {
         self.solver.get_model().map(|model| model.to_string())
     }
 
+    /// Extract a structured model from the solver after a `Sat` result.
+    ///
+    /// Concrete values are collected for all cached bool, int, and real
+    /// variables.  Memory arrays are sampled at index `0` and any indices
+    /// listed in `extra_indices`.  If all sampled values are equal the array is
+    /// summarised as `ArrayDefault(value)`; otherwise individual `name[index]`
+    /// bindings are emitted.
+    ///
+    /// Returns `None` if no model is available (e.g., the last [`check`] was
+    /// `Unsat` or has not been called yet).
     pub fn model_bindings(&self, extra_indices: &[i64]) -> Option<SmtModel> {
         let model = self.solver.get_model()?;
         let mut result = SmtModel::default();
@@ -109,14 +165,24 @@ impl SmtScope {
         Some(result)
     }
 
+    /// Clear all asserted formulas, preparing the solver for a new independent
+    /// query.  Variable caches are retained.
     pub fn reset(&mut self) {
         self.solver.reset();
     }
 
+    /// Lower a [`Formula`] to a Z3 [`Bool`] AST without asserting it.
+    ///
+    /// Useful when the caller needs to combine several formula results before
+    /// asserting (e.g., building an implication for a validity check in
+    /// `oracle.rs`).
     pub fn formula_to_z3(&mut self, formula: &Formula) -> Result<Bool, FormulaError> {
         self.lower_formula(formula)
     }
 
+    /// Lower a [`Term`] that is expected to have integer sort to a Z3 [`Int`] AST.
+    ///
+    /// Returns an error if the term lowers to a real sort.
     pub fn term_to_z3_int(&mut self, term: &Term) -> Result<Int, FormulaError> {
         match self.lower_term(term)? {
             EncodedTerm::Int(value) => Ok(value),
@@ -390,14 +456,27 @@ fn compare_terms(
     }
 }
 
+/// Convenience wrapper: lower `formula` using `scope`.
+///
+/// Delegates to [`SmtScope::formula_to_z3`].  Exists so that callers holding a
+/// mutable reference to `scope` can call this as a free function.
 pub fn formula_to_z3(scope: &mut SmtScope, formula: &Formula) -> Result<Bool, FormulaError> {
     scope.formula_to_z3(formula)
 }
 
+/// Convenience wrapper: lower `term` to a Z3 integer using `scope`.
+///
+/// Delegates to [`SmtScope::term_to_z3_int`].
 pub fn term_to_z3_int(scope: &mut SmtScope, term: &Term) -> Result<Int, FormulaError> {
     scope.term_to_z3_int(term)
 }
 
+/// Create a temporary single-use solver and check whether `condition` is
+/// satisfiable.
+///
+/// Unlike [`SmtScope::check`] this does not accumulate state — the solver is
+/// created and immediately discarded.  Suitable for one-off checks that do not
+/// need model extraction.
 pub fn quick_sat_check(condition: Bool) -> SatResult {
     let solver = Solver::new();
     solver.assert(&condition);

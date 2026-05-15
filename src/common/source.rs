@@ -1,7 +1,27 @@
+//! Source location tracking for diagnostic and error reporting.
+//!
+//! This module provides [`SourceLocation`], a lightweight, hashable coordinate
+//! that associates analysis results (assertion failures, verification outcomes)
+//! with positions in the original source file. Locations are extracted from
+//! LLVM debug metadata during lowering and threaded through the CFG nodes so
+//! that the driver can report findings against the original source rather than
+//! LLVM IR labels.
+
 #![allow(dead_code)]
 
 use std::fmt;
 
+/// A source-level position (file, line, column) attached to CFG nodes and
+/// assertion sites.
+///
+/// Column zero is treated as "line-level precision only" — the [`Display`]
+/// implementation omits the column in that case so diagnostics stay readable
+/// when column information is absent from the LLVM debug info.
+///
+/// The type is fully ordered and hashable so it can be used as a map key or
+/// stored in sorted collections.
+///
+/// [`Display`]: std::fmt::Display
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
 pub struct SourceLocation {
     pub file: String,

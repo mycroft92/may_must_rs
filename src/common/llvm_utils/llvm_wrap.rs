@@ -31,89 +31,182 @@ use llvm_sys::{LLVMIntPredicate, LLVMOpcode, LLVMRealPredicate, LLVMTypeKind};
 use std::ffi::{CStr, CString};
 use std::ptr;
 
+/// A Rust-friendly mirror of `LLVMOpcode`, covering the subset of LLVM IR
+/// opcodes that the analyzer cares about.
+///
+/// The conversion from `LLVMOpcode` is exhaustive for all opcodes present in
+/// the version of `llvm-sys` in use; any opcode not listed maps to [`Unknown`].
+/// Analysis code should match on concrete variants rather than relying on the
+/// printed IR text, so that lowering stays independent of LLVM's textual format.
+///
+/// Variants are grouped by the LLVM IR Reference categories:
+/// terminators, unary/binary arithmetic, logical, memory, cast, and other.
+///
+/// [`Unknown`]: InstructionOpcode::Unknown
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstructionOpcode {
     // Terminator Instructions
+    /// `ret` — returns control (and optionally a value) to the caller.
     Ret,
+    /// `br` — conditional or unconditional branch; examined by the CFG builder
+    /// to wire successor edges between basic blocks.
     Br,
+    /// `switch` — multi-way branch on an integer value.
     Switch,
+    /// `indirectbr` — branch to an address stored in a register (e.g. computed
+    /// goto). The analyzer does not fully model indirect control flow.
     IndirectBr,
+    /// `invoke` — call with an associated unwind destination; treated like a
+    /// regular call for purposes of the current analysis.
     Invoke,
+    /// `resume` — resumes propagation of an in-flight exception.
     Resume,
+    /// `unreachable` — tells LLVM (and the analyzer) that this point is
+    /// unreachable; the backward analysis treats it as a trivially-verified
+    /// sink.
     Unreachable,
+    /// `cleanupret` — returns from a cleanup pad (C++ EH).
     CleanupRet,
+    /// `catchret` — returns from a catch pad (C++ EH).
     CatchRet,
+    /// `catchswitch` — dispatches to catch handlers (C++ EH).
     CatchSwitch,
+    /// `callbr` — call that may also branch to inline-asm labels (used by GCC
+    /// `asm goto`). The analyzer treats this as an unknown terminator.
     CallBr,
 
     // Standard Unary Operators
+    /// `fneg` — floating-point negation.
     FNeg,
 
     // Standard Binary Operators
+    /// `add` — integer addition (wraps on overflow in two's-complement).
     Add,
+    /// `fadd` — floating-point addition.
     FAdd,
+    /// `sub` — integer subtraction.
     Sub,
+    /// `fsub` — floating-point subtraction.
     FSub,
+    /// `mul` — integer multiplication.
     Mul,
+    /// `fmul` — floating-point multiplication.
     FMul,
+    /// `udiv` — unsigned integer division.
     UDiv,
+    /// `sdiv` — signed integer division.
     SDiv,
+    /// `fdiv` — floating-point division.
     FDiv,
+    /// `urem` — unsigned integer remainder.
     URem,
+    /// `srem` — signed integer remainder.
     SRem,
+    /// `frem` — floating-point remainder.
     FRem,
 
     // Logical Operators
+    /// `shl` — left shift.
     Shl,
+    /// `lshr` — logical (unsigned) right shift.
     LShr,
+    /// `ashr` — arithmetic (signed) right shift.
     AShr,
+    /// `and` — bitwise AND.
     And,
+    /// `or` — bitwise OR.
     Or,
+    /// `xor` — bitwise XOR; `xor x, -1` is the canonical LLVM `not`.
     Xor,
 
     // Memory Operators
+    /// `alloca` — stack allocation; lowered to a named `stack_N` region in
+    /// `adapter.rs`.
     Alloca,
+    /// `load` — read from memory; lowered to an SMT `select` expression.
     Load,
+    /// `store` — write to memory; lowered to a `MemoryStore` effect.
     Store,
+    /// `getelementptr` — pointer arithmetic / struct-field offset computation.
     GetElementPtr,
+    /// `fence` — memory ordering barrier; not modelled by the current analysis.
     Fence,
+    /// `cmpxchg` — atomic compare-and-swap; not modelled.
     AtomicCmpXchg,
+    /// `atomicrmw` — atomic read-modify-write; not modelled.
     AtomicRMW,
 
     // Cast Operators
+    /// `trunc` — truncate integer to a narrower type.
     Trunc,
+    /// `zext` — zero-extend integer to a wider type.
     ZExt,
+    /// `sext` — sign-extend integer to a wider type.
     SExt,
+    /// `fptoui` — floating-point to unsigned integer conversion.
     FPToUI,
+    /// `fptosi` — floating-point to signed integer conversion.
     FPToSI,
+    /// `uitofp` — unsigned integer to floating-point conversion.
     UIToFP,
+    /// `sitofp` — signed integer to floating-point conversion.
     SIToFP,
+    /// `fptrunc` — floating-point narrowing conversion.
     FPTrunc,
+    /// `fpext` — floating-point widening conversion.
     FPExt,
+    /// `ptrtoint` — pointer to integer cast.
     PtrToInt,
+    /// `inttoptr` — integer to pointer cast.
     IntToPtr,
+    /// `bitcast` — reinterpret cast (no-op at the bit level).
     BitCast,
+    /// `addrspacecast` — cast between address spaces.
     AddrSpaceCast,
 
     // Other Operators
+    /// `icmp` — integer comparison; the predicate is retrieved with
+    /// [`Instruction::get_icmp_predicate`].
     ICmp,
+    /// `fcmp` — floating-point comparison; predicate via
+    /// [`Instruction::get_fcmp_predicate`].
     FCmp,
+    /// `phi` — SSA φ-node; incoming (block, value) pairs are enumerated by
+    /// [`Instruction::get_phi_incomings`].
     PHI,
+    /// `call` — direct or indirect function call; the callee name (if
+    /// statically known) is available via [`Instruction::get_called_function`].
     Call,
+    /// `select` — ternary conditional `(cond ? a : b)`, does not create a new
+    /// basic block.
     Select,
+    /// Reserved for use by LLVM front-ends; not generated by standard Clang.
     UserOp1,
+    /// Reserved for use by LLVM front-ends; not generated by standard Clang.
     UserOp2,
+    /// `va_arg` — variadic argument extraction.
     VAArg,
+    /// `extractelement` — extract a lane from a vector.
     ExtractElement,
+    /// `insertelement` — insert a lane into a vector.
     InsertElement,
+    /// `shufflevector` — permute or combine vectors.
     ShuffleVector,
+    /// `extractvalue` — extract a field from an aggregate (struct/array).
     ExtractValue,
+    /// `insertvalue` — insert a field into an aggregate.
     InsertValue,
+    /// `landingpad` — marks the entry of an EH landing pad.
     LandingPad,
+    /// `cleanuppad` — marks the entry of a cleanup pad (C++ EH).
     CleanupPad,
+    /// `catchpad` — marks the entry of a catch pad (C++ EH).
     CatchPad,
+    /// `freeze` — converts `undef`/`poison` to a fixed but unspecified value.
     Freeze,
 
+    /// Catch-all for any opcode not explicitly listed above, or for opcodes
+    /// introduced in a newer LLVM version than this binding was written for.
     Unknown,
 }
 
@@ -201,6 +294,13 @@ pub fn initialize_target() {
     }
 }
 
+/// An owned LLVM context.
+///
+/// A context holds the global state for one compilation unit: interned types,
+/// the IR memory pool, and diagnostic handlers. The analyzer creates one
+/// context per analysis run and disposes it on drop.
+///
+/// LLVM contexts are not thread-safe — do not share a `Context` across threads.
 pub struct Context(LLVMContextRef);
 
 impl Drop for Context {
@@ -216,6 +316,10 @@ impl Context {
         unsafe { Context(LLVMContextCreate()) }
     }
 
+    /// Create a new, empty module owned by this context.
+    ///
+    /// The `name` is used only for display and debug output; it does not need
+    /// to match a file path.
     pub fn create_module(&self, name: &str) -> Module {
         unsafe {
             Module(LLVMModuleCreateWithNameInContext(
@@ -225,6 +329,12 @@ impl Context {
         }
     }
 
+    /// Parse an LLVM bitcode file (`.bc`) into a module owned by this context.
+    ///
+    /// Returns `None` and prints an error to stdout if the file cannot be read
+    /// or the bitcode is malformed. The caller must keep `self` alive for the
+    /// lifetime of the returned `Module` — LLVM modules hold a back-pointer to
+    /// their owning context.
     pub fn parse_bc_file(&self, name: &str) -> Option<Module> {
         unsafe {
             let mut mem_buffer = ptr::null_mut();
@@ -251,6 +361,13 @@ impl Context {
         }
     }
 
+    /// Parse a textual LLVM IR string into a module owned by this context.
+    ///
+    /// `ir` must be valid LLVM IR text (`.ll` format). `name` is used as the
+    /// buffer label for diagnostics only. This is the main entry point for
+    /// unit tests that supply inline IR.
+    ///
+    /// Returns `None` and prints a diagnostic to stderr if parsing fails.
     pub fn parse_ir_str(&self, ir: &str, name: &str) -> Option<Module> {
         unsafe {
             let name = CString::new(name).unwrap();
@@ -275,6 +392,16 @@ impl Context {
     }
 }
 
+/// An owned LLVM module.
+///
+/// A module is the top-level container for LLVM IR: it holds the list of
+/// global variables, function declarations, and function definitions.
+/// `Module` disposes the underlying `LLVMModuleRef` on drop.
+///
+/// Note that the context used to create this module must outlive it; LLVM does
+/// not enforce this in C but the `Context` / `Module` pair in this file keeps
+/// the lifetimes aligned by convention (both are created together and dropped
+/// at the end of one analysis run).
 pub struct Module(LLVMModuleRef);
 
 impl Drop for Module {
@@ -286,6 +413,12 @@ impl Drop for Module {
 }
 
 impl Module {
+    /// Return all function definitions and declarations in the module, in
+    /// their textual order.
+    ///
+    /// Declaration-only functions (no basic blocks) are included; callers
+    /// that only want definitions should filter on
+    /// [`Function::get_basic_block_count`]` > 0`.
     pub fn get_all_functions(&self) -> Vec<Function> {
         unsafe {
             let first_func = LLVMGetFirstFunction(self.0);
@@ -362,14 +495,29 @@ impl FunctionType {
     }
 }
 
+/// A lightweight handle to an LLVM function value.
+///
+/// Copyable and hashable via pointer identity; two `Function` values are equal
+/// if and only if they refer to the same `LLVMValueRef`. Equality does NOT
+/// compare function bodies.
+///
+/// This type covers both function definitions (with basic blocks) and
+/// declarations (no body). Use [`Function::get_basic_block_count`] to
+/// distinguish them.
 #[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct Function(LLVMValueRef);
 
 impl Function {
+    /// Number of basic blocks in the function body.
+    ///
+    /// Returns `0` for declaration-only functions (no body). The graph builder
+    /// rejects such functions via `ProgError::NoDefinitionForGraph`.
     pub fn get_basic_block_count(&self) -> u32 {
         unsafe { LLVMCountBasicBlocks(self.0) }
     }
 
+    /// Return the basic block that immediately follows `basic_block` in the
+    /// function's block list, or `None` if `basic_block` is the last block.
     pub fn get_next_basic_block(&self, basic_block: BasicBlock) -> Option<BasicBlock> {
         let next_bb = unsafe { BasicBlock(LLVMGetNextBasicBlock(basic_block.0)) };
         if next_bb.0.is_null() {
@@ -391,6 +539,12 @@ impl Function {
         }
     }
 
+    /// Return the formal parameters of the function as `Instruction` handles.
+    ///
+    /// LLVM represents parameters as `LLVMValueRef`s — the same underlying
+    /// pointer type used for instructions — so the `Instruction` wrapper is
+    /// reused here. Callers can query names with [`Instruction::get_name`] or
+    /// types with [`Instruction::get_type`].
     pub fn get_params(&self) -> Vec<Instruction> {
         unsafe {
             let count = LLVMCountParams(self.0);
@@ -405,6 +559,11 @@ impl Function {
         }
     }
 
+    /// Return all basic blocks in the function, in their LLVM-internal order
+    /// (which matches the textual IR order).
+    ///
+    /// The first block in the returned list is the function entry block.
+    /// An empty vector is returned for declaration-only functions.
     pub fn get_all_basic_blocks(&self) -> Vec<BasicBlock> {
         unsafe {
             let first_bb = LLVMGetFirstBasicBlock(self.0);
@@ -424,10 +583,17 @@ impl Function {
     }
 }
 
+/// A lightweight handle to an LLVM basic block.
+///
+/// Copyable and hashable by pointer identity. A basic block is a maximal
+/// straight-line sequence of instructions ending in exactly one terminator.
+/// Control can only enter at the top and exit at the terminator.
 #[derive(Hash, Eq, PartialEq, Copy, Clone)]
 pub struct BasicBlock(LLVMBasicBlockRef);
 
 impl BasicBlock {
+    /// Return all instructions in this block in program order, including the
+    /// terminator.
     pub fn get_all_instructions(&self) -> Vec<Instruction> {
         //panic!("Unimplemented get all instructions");
         unsafe {
@@ -447,6 +613,8 @@ impl BasicBlock {
         }
     }
 
+    /// Return the first instruction in the block, or `None` if the block is
+    /// empty (which LLVM IR normally disallows but guards against defensively).
     pub fn get_front(&self) -> Option<Instruction> {
         unsafe {
             let instr = LLVMGetFirstInstruction(self.0);
@@ -457,6 +625,11 @@ impl BasicBlock {
         }
     }
 
+    /// Return the terminator instruction of the block (the last instruction),
+    /// or `None` if the block has no terminator.
+    ///
+    /// Every well-formed basic block has exactly one terminator, so `None`
+    /// indicates malformed IR.
     pub fn get_back(&self) -> Option<Instruction> {
         unsafe {
             let instr = LLVMGetBasicBlockTerminator(self.0);
@@ -467,6 +640,8 @@ impl BasicBlock {
         }
     }
 
+    /// Return the LLVM label name of this block (e.g. `"entry"`, `"loop.body"`),
+    /// or `None` if the block is anonymous (unnamed in the IR).
     pub fn get_name(&self) -> Option<String> {
         unsafe {
             let value = LLVMBasicBlockAsValue(self.0);
@@ -479,6 +654,11 @@ impl BasicBlock {
         }
     }
 
+    /// Return a stable, human-readable label for this block.
+    ///
+    /// Uses the IR label name if present; otherwise falls back to a hex
+    /// pointer address (`bb_0x…`). This ensures every block has a unique
+    /// printable token regardless of how the IR was compiled.
     pub fn label_token(&self) -> String {
         self.get_name()
             .filter(|name| !name.is_empty())
@@ -486,10 +666,34 @@ impl BasicBlock {
     }
 }
 
+/// A lightweight handle to an LLVM value — an instruction, a function
+/// parameter, a constant, or any other `LLVMValueRef`.
+///
+/// Despite the name, this wrapper is used for all `LLVMValueRef`s in the
+/// codebase (parameters, constants, globals) because LLVM's C API represents
+/// them all with the same pointer type. The name reflects the primary use-case:
+/// most values the analyzer inspects are instructions inside function bodies.
+///
+/// Copyable and hashable by pointer identity. Two `Instruction` values are
+/// equal if and only if they wrap the same LLVM value pointer — this makes
+/// `Instruction` suitable as a graph node key in `HashMap`/`BTreeMap`.
+///
+/// Deriving `Ord` on a raw pointer gives a deterministic but arbitrary
+/// ordering; it is used only to satisfy `BTreeSet` requirements in graph data
+/// structures, not to imply any semantic ordering.
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
 pub struct Instruction(LLVMValueRef);
 
 impl Instruction {
+    /// Extract the SSA destination variable name from the printed IR text.
+    ///
+    /// Returns the bare name (without the leading `%`) if the instruction
+    /// defines an SSA value, e.g. `%tmp` → `"tmp"`. Returns `None` for
+    /// instructions that do not produce a result (stores, branches, `ret`).
+    ///
+    /// This is a textual heuristic: it parses the first token of the printed
+    /// instruction and checks for the `%` sigil. It is used to populate the
+    /// `vars` table in `FunctionGraph`.
     pub fn get_assignment_var(&self) -> Option<String> {
         let instr = self.print();
         if let Some((name, _rest)) = instr.trim().split_once(' ') {
@@ -499,6 +703,12 @@ impl Instruction {
         }
         None
     }
+    /// Render this value as its LLVM IR text representation.
+    ///
+    /// This calls `LLVMPrintValueToString` and disposes the returned C string.
+    /// The result is the same text you would see in a `.ll` file, e.g.
+    /// `"  %add = add i32 %a, %b"`. Useful for debugging and for the DOT
+    /// graph renderer.
     pub fn print(&self) -> String {
         unsafe {
             let inst_str = LLVMPrintValueToString(self.0);
@@ -511,6 +721,13 @@ impl Instruction {
         }
     }
 
+    /// Return the LLVM value name if one is present.
+    ///
+    /// For instructions this is the SSA name without `%` (e.g. `"add"` for
+    /// `%add = add i32 ...`). For function parameters it is the parameter
+    /// name. Returns `None` for unnamed values (temporaries that LLVM numbers
+    /// automatically) and for values that have no name slot (constants, void
+    /// instructions).
     pub fn get_name(&self) -> Option<String> {
         unsafe {
             let mut len = 0;
@@ -522,6 +739,17 @@ impl Instruction {
         }
     }
 
+    /// Return the best available human-readable name for this value, suitable
+    /// for embedding in formula variable names and diagnostic output.
+    ///
+    /// Resolution order:
+    /// 1. LLVM value name (prefixed with `%` / `@` if not already).
+    /// 2. Constant integer literal (e.g. `"42"`).
+    /// 3. LHS of the printed assignment, if the printed form contains `=`.
+    /// 4. First `%`/`@`-prefixed token found anywhere in the printed text.
+    /// 5. The full printed IR text as a last resort.
+    ///
+    /// This never returns an empty string.
     pub fn display_name(&self) -> String {
         if let Some(name) = self.get_name() {
             if name.starts_with('%') || name.starts_with('@') {
@@ -553,6 +781,8 @@ impl Instruction {
             .map(ToString::to_string)
     }
 
+    /// Return the opcode of this instruction as the local [`InstructionOpcode`]
+    /// enum, converting from the raw `LLVMOpcode` via the `From` impl.
     pub fn get_opcode(&self) -> InstructionOpcode {
         unsafe {
             let op = LLVMGetInstructionOpcode(self.0);
@@ -566,6 +796,8 @@ impl Instruction {
     //format!("{:?}", op)
     //}
     //}
+    /// Return `true` if this instruction is a branch (`br`), including both
+    /// conditional and unconditional variants.
     pub fn is_branch_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsABranchInst(self.0);
@@ -573,6 +805,13 @@ impl Instruction {
         }
     }
 
+    /// Return the LLVM type of the value produced by this instruction, or
+    /// `None` if the type ref is null.
+    ///
+    /// For instructions that produce no result (e.g. `store`, `ret`, `br`)
+    /// this returns a `Void` type rather than `None`. `None` only occurs when
+    /// the LLVM API returns a null type pointer, which should not happen for
+    /// well-formed IR.
     pub fn get_ret_type(&self) -> Option<Type> {
         unsafe {
             let type_ref = LLVMTypeOf(self.0);
@@ -587,6 +826,7 @@ impl Instruction {
         self.get_ret_type()
     }
 
+    /// Return `true` if this instruction is a `ret`.
     pub fn is_return_instruction(&self) -> bool {
         unsafe {
             let res = LLVMIsAReturnInst(self.0);
@@ -594,6 +834,11 @@ impl Instruction {
         }
     }
 
+    /// Return `true` if this instruction is a block terminator (`ret`, `br`,
+    /// `switch`, `invoke`, `unreachable`, etc.).
+    ///
+    /// The graph builder uses this to determine which instruction provides
+    /// successor-block edges.
     pub fn is_terminator_instruction(&self) -> bool {
         unsafe {
             let resp = LLVMIsATerminatorInst(self.0);
@@ -601,6 +846,13 @@ impl Instruction {
         }
     }
 
+    /// For a `call` instruction, return the name of the statically-known
+    /// callee, or `None` if the call is indirect or the instruction is not
+    /// a call.
+    ///
+    /// This is used throughout the analysis to identify `may_assert` sites and
+    /// to look up per-function summaries. Indirect calls (function pointers)
+    /// are not currently modelled.
     pub fn get_called_function(&self) -> Option<String> {
         if self.get_opcode() != InstructionOpcode::Call {
             return None;
@@ -616,6 +868,12 @@ impl Instruction {
         }
     }
 
+    /// Return the actual arguments passed to a `call` instruction, in order.
+    ///
+    /// Returns an empty vector for non-call instructions. The returned
+    /// `Instruction` handles may be constants, SSA values, or parameters —
+    /// use [`Instruction::display_name`] or [`Instruction::as_constant_int`]
+    /// to inspect them.
     pub fn get_call_args(&self) -> Vec<Instruction> {
         if self.get_opcode() != InstructionOpcode::Call {
             return vec![];
@@ -633,10 +891,18 @@ impl Instruction {
         }
     }
 
+    /// Return the number of operands of this instruction.
+    ///
+    /// For a `call`, this includes the callee value as the last operand —
+    /// prefer [`get_call_args`](Instruction::get_call_args) when you want only
+    /// the actual arguments. For a binary instruction the count is 2; for PHI
+    /// nodes it is the number of incoming (block, value) pairs.
     pub fn get_operand_count(&self) -> usize {
         unsafe { LLVMGetNumOperands(self.0).max(0) as usize }
     }
 
+    /// Return the `index`-th operand of this instruction, or `None` if
+    /// `index` is out of bounds or the operand pointer is null.
     pub fn get_operand(&self, index: usize) -> Option<Instruction> {
         unsafe {
             if index >= self.get_operand_count() {
@@ -657,6 +923,12 @@ impl Instruction {
             .collect()
     }
 
+    /// Return the condition value of a conditional branch instruction, or
+    /// `None` if this is not a branch or if the branch is unconditional.
+    ///
+    /// The returned value is typically an `i1` produced by a preceding `icmp`
+    /// or `fcmp`. The graph builder uses this when emitting branch-edge guards
+    /// in the abstract CFG.
     pub fn get_branch_condition(&self) -> Option<Instruction> {
         if !self.is_branch_instruction() {
             return None;
@@ -671,6 +943,13 @@ impl Instruction {
         }
     }
 
+    /// If this value is a constant integer, return its sign-extended `i64`
+    /// value; otherwise return `None`.
+    ///
+    /// Sign-extension means a constant `u64` bit pattern whose high bit is 1
+    /// will appear as a negative `i64`. This matches LLVM's
+    /// `LLVMConstIntGetSExtValue` semantics. Callers that care about unsigned
+    /// semantics should reinterpret via `as u64`.
     pub fn as_constant_int(&self) -> Option<i64> {
         unsafe {
             if LLVMIsAConstantInt(self.0).is_null() {
@@ -681,6 +960,11 @@ impl Instruction {
         }
     }
 
+    /// If this value is a constant floating-point value, return it as an
+    /// `f64`; otherwise return `None`.
+    ///
+    /// The LLVM API may lose precision when converting half or `float` values
+    /// to `f64` (`loses_info` flag is queried but silently ignored here).
     pub fn as_constant_real(&self) -> Option<f64> {
         unsafe {
             if LLVMIsAConstantFP(self.0).is_null() {
@@ -692,10 +976,23 @@ impl Instruction {
         }
     }
 
+    /// Return `true` if this value is a reference to a global variable (as
+    /// opposed to a local SSA value or function parameter).
     pub fn is_global_variable_ref(&self) -> bool {
         unsafe { !LLVMIsAGlobalVariable(self.0).is_null() }
     }
 
+    /// Attempt to read this value as a flat array of constant integers.
+    ///
+    /// This handles two cases:
+    /// - The value itself is a `ConstantArray` or `ConstantDataArray`.
+    /// - The value is a `GlobalVariable` whose initializer is such an array,
+    ///   or a `bitcast` / `getelementptr` of one (operand 0 is tried as a
+    ///   fallback).
+    ///
+    /// Returns `None` if the array is empty, if any element is not a constant
+    /// integer, or if the value is none of the recognised forms. This is used
+    /// by the adapter to extract constant lookup tables embedded in globals.
     pub fn constant_int_elements(&self) -> Option<Vec<i64>> {
         self.constant_int_elements_inner()
             .or_else(|| self.get_operand(0)?.constant_int_elements_inner())
@@ -737,6 +1034,14 @@ impl Instruction {
         }
     }
 
+    /// Return the comparison operator of an `icmp` instruction as a symbolic
+    /// string (`"=="`, `"!="`, `"<"`, `"<="`, `">"`, `">="`), or `None` if
+    /// this is not an `icmp`.
+    ///
+    /// Signed and unsigned variants of `<`, `<=`, `>`, `>=` are collapsed to
+    /// the same symbol because the formula layer currently uses a single
+    /// integer sort. Callers that need to distinguish signedness must inspect
+    /// the raw LLVM predicate themselves.
     pub fn get_icmp_predicate(&self) -> Option<&'static str> {
         if self.get_opcode() != InstructionOpcode::ICmp {
             return None;
@@ -753,6 +1058,12 @@ impl Instruction {
         }
     }
 
+    /// Return the comparison operator of an `fcmp` instruction as a symbolic
+    /// string, or `None` if this is not an `fcmp` or if the predicate cannot
+    /// be mapped (e.g. `uno`, `ord`, `true`, `false` predicates).
+    ///
+    /// Ordered and unordered variants of the same relation are collapsed to
+    /// the same symbol, matching the behaviour of [`get_icmp_predicate`](Instruction::get_icmp_predicate).
     pub fn get_fcmp_predicate(&self) -> Option<&'static str> {
         if self.get_opcode() != InstructionOpcode::FCmp {
             return None;
@@ -770,6 +1081,8 @@ impl Instruction {
         }
     }
 
+    /// Return the basic block that contains this instruction, or `None` if the
+    /// value is not an instruction (e.g. a constant or parameter).
     pub fn get_parent_basic_block(&self) -> Option<BasicBlock> {
         unsafe {
             let parent = LLVMGetInstructionParent(self.0);
@@ -781,6 +1094,13 @@ impl Instruction {
         }
     }
 
+    /// Return the basic blocks that this terminator instruction may transfer
+    /// control to, or an empty vector if this is not a terminator.
+    ///
+    /// For an unconditional `br` the result has one element; for a conditional
+    /// `br` it has two (true-target first, then false-target); for `switch` it
+    /// may have arbitrarily many. The `FunctionGraph` builder uses this to
+    /// connect visible-instruction ranges across block boundaries.
     pub fn get_successor_blocks(&self) -> Vec<BasicBlock> {
         unsafe {
             if !self.is_terminator_instruction() {
@@ -797,6 +1117,17 @@ impl Instruction {
         }
     }
 
+    /// Return the first instruction of each successor basic block.
+    ///
+    /// Unlike [`get_successor_blocks`](Instruction::get_successor_blocks) this
+    /// dereferences into instructions rather than returning block handles. Used
+    /// by the raw graph walk in certain older code paths; prefer
+    /// `get_successor_blocks` in new code.
+    ///
+    /// # Safety caveat
+    /// This does not check whether the first instruction in a successor block
+    /// is null; malformed IR with an empty block would cause undefined
+    /// behaviour here.
     pub fn get_successors(&self) -> Vec<Instruction> {
         unsafe {
             if !self.is_terminator_instruction() {
@@ -812,6 +1143,12 @@ impl Instruction {
         }
     }
 
+    /// Return the (predecessor block, incoming value) pairs for a PHI node, in
+    /// the order LLVM stores them.
+    ///
+    /// Returns an empty vector for non-PHI instructions. The adapter uses
+    /// these pairs to emit per-predecessor SSA merge points when lowering the
+    /// CFG to the formula layer.
     pub fn get_phi_incomings(&self) -> Vec<(BasicBlock, Instruction)> {
         if self.get_opcode() != InstructionOpcode::PHI {
             return vec![];

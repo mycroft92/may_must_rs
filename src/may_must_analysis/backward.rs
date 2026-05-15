@@ -1,3 +1,45 @@
+//! Assertion checker — the top-level entry for the bidirectional may/must analysis.
+//!
+//! # Algorithm overview
+//!
+//! Given an [`AbstractCfg`] and an [`AssertionSite`] this module proves (or
+//! refutes) that the assertion condition always holds on every reachable
+//! execution.  The check is *bidirectional*:
+//!
+//! * **Forward (reach / must)** — loop invariants are injected into the `reach`
+//!   component at loop headers, overapproximating the set of reachable states.
+//! * **Backward (state / may)** — the weakest precondition of `NOT obligation`
+//!   is propagated backward through `state`, encoding the conditions under which
+//!   a violation could occur.
+//! * **Combined decision** — at the function entry, if `reach AND state` is
+//!   unsatisfiable, no reachable execution can violate the assertion →
+//!   [`Judgement::Verified`].  If `reach AND state` is satisfiable, a
+//!   concrete counterexample is extracted → [`Judgement::BugFound`].
+//!
+//! # Acyclic vs. cyclic CFGs
+//!
+//! For acyclic (loop-free) CFGs [`run_backward`] is called directly.  For
+//! cyclic CFGs a set of loop invariants must be obtained first.  The entry
+//! point [`analyze_with_tables`] accepts *precomputed* invariants (from a
+//! previous interprocedural pass) and falls back to [`synthesize_loop_invariants`]
+//! when none are available.  [`discover_loop_invariants`] is a lighter
+//! invariant-only path used by the interprocedural driver before full analysis.
+//!
+//! # Invariant synthesis
+//!
+//! Three algorithmic strategies are tried in order before an optional LLM-guided
+//! CEGIS loop:
+//!
+//! 1. **Algorithmic** — pattern-matched candidates derived from loop guards and
+//!    transfer effects (counter bounds, predicate assignments, …).
+//! 2. **CHC** — Constrained Horn Clause solving for simple counter patterns.
+//! 3. **Houdini** — weakening a large template set until an inductive subset
+//!    remains.
+//!
+//! Each candidate is checked with [`check_loop_invariant_verbose`] from
+//! [`loops`].  Loops are processed innermost-first so that inner invariants are
+//! available when checking outer ones.
+
 #![allow(dead_code)]
 
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId};
@@ -20,6 +62,11 @@ use crate::may_must_analysis::rules::{Judgement, RuleEngine, RuleError};
 use crate::may_must_analysis::summaries::SummaryTables;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Final outcome of one assertion check together with supporting witness data.
+///
+/// The `entry_summary` and `assertion_summary` fields capture the [`NodeSummary`]
+/// computed at the function entry and at the assertion site respectively, which
+/// is useful for diagnostics and for building caller-facing summaries.
 #[derive(Clone, Debug)]
 pub struct AssertionResult {
     pub site_id: usize,
@@ -30,6 +77,12 @@ pub struct AssertionResult {
     pub assertion_summary: NodeSummary,
 }
 
+/// Errors that can occur during the backward (or combined) analysis pass.
+///
+/// `CyclicCfgUnsupported` is returned when the CFG contains a back edge but no
+/// loop invariant candidate was accepted by the three-part check (initiation,
+/// inductiveness, exit closure).  Callers should treat this as `UNKNOWN` rather
+/// than `Verified`.
 #[derive(Debug, thiserror::Error)]
 pub enum BackwardError {
     #[error("CFG has a cycle and no loop invariant was accepted")]
@@ -40,6 +93,11 @@ pub enum BackwardError {
     Oracle(#[from] OracleError),
 }
 
+/// Enumeration of the invariant-synthesis strategies available to
+/// [`synthesize_loop_invariants`].
+///
+/// Strategies are tried in the order listed in [`InvariantConfig::methods`].
+/// When the list is empty the default ordering is `Chc → Houdini → Template`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum InvariantMethod {
     Chc,
@@ -47,6 +105,13 @@ pub enum InvariantMethod {
     Template,
 }
 
+/// Runtime configuration for the loop-invariant synthesis pass.
+///
+/// An empty `methods` list enables the full default strategy sequence.
+/// `skip_algorithmic` suppresses the fast pattern-based candidates even when
+/// `methods` includes them — used when callers know the patterns will not match.
+/// When `llm` is `Some` and `force` is set, LLM-guided CEGIS is attempted
+/// before (or instead of) algorithmic strategies.
 pub struct InvariantConfig {
     pub methods: Vec<InvariantMethod>,
     pub llm: Option<LlmInvariantConfig>,
@@ -78,6 +143,30 @@ pub fn analyze(
     analyze_with_tables(cfg, "", site, oracle, &SummaryTables::new(), None, None)
 }
 
+/// Top-level entry point for checking one assertion inside a (possibly cyclic) CFG.
+///
+/// # Acyclic path
+///
+/// When the CFG has a topological order (no back edges) this calls
+/// [`run_backward`] directly — no invariant synthesis is required.
+///
+/// # Cyclic path
+///
+/// 1. Back edges are detected and excluded from the topological order.
+/// 2. If `precomputed` invariants are supplied and non-empty they are used as-is
+///    (unless `force_llm` overrides them).
+/// 3. Otherwise [`synthesize_loop_invariants`] is called, which tries
+///    algorithmic, CHC, Houdini, Template, and LLM strategies in sequence.
+/// 4. The accepted invariants are injected into `reach` at loop headers before
+///    the final [`run_backward`] call.
+///
+/// # Parameters
+///
+/// * `tables` — interprocedural must/not-may summaries and cached loop
+///   invariants produced by a prior module-level pass.
+/// * `config` — controls which synthesis strategies are enabled.
+/// * `precomputed` — invariants computed ahead of time by the driver's
+///   [`discover_loop_invariants`] pass; avoids redundant synthesis work.
 pub fn analyze_with_tables(
     cfg: &AbstractCfg,
     function: &str,
@@ -112,6 +201,28 @@ pub fn analyze_with_tables(
     run_backward(cfg, site, oracle, &excluded, &invariants, tables)
 }
 
+/// Core bidirectional analysis pass.
+///
+/// This function implements the combined may/must check described in the paper:
+///
+/// 1. **Forward reach injection** — for each loop header `h` the accepted loop
+///    invariant is conjuncted into `summary.reach` at `h`, establishing the
+///    forward overapproximation of reachable states.  Back edges are blocked so
+///    the [`RuleEngine`] can run in topological order.
+///
+/// 2. **Backward state seeding** — the weakest precondition of `NOT obligation`
+///    is computed at the assertion node and stored as its initial `state`.  This
+///    encodes the condition under which the assertion could be violated.
+///
+/// 3. **Fixpoint** — [`RuleEngine::run_to_fixpoint`] propagates both `reach`
+///    (forward) and `state` (backward) simultaneously using the transfer
+///    functions and edge guards of the CFG.
+///
+/// 4. **Decision** at the function entry node:
+///    - `reach AND state` satisfiable → [`Judgement::BugFound`] with a concrete
+///      model.
+///    - `reach AND state` unsatisfiable → [`Judgement::Verified`].
+///    - Neither can be determined → [`Judgement::Unknown`].
 fn run_backward(
     cfg: &AbstractCfg,
     site: &AssertionSite,
@@ -168,6 +279,16 @@ fn run_backward(
     })
 }
 
+/// Lightweight invariant-only pass used by the interprocedural driver.
+///
+/// Unlike [`synthesize_loop_invariants`] this function does not take an
+/// assertion site — it only uses the *algorithmic* candidate strategy and
+/// returns `None` if any loop cannot be handled.  The resulting invariants are
+/// cached in [`SummaryTables`] and reused across multiple assertion checks in
+/// the same function, avoiding redundant synthesis work.
+///
+/// Returns `None` if the CFG is acyclic (no invariants needed) or if any loop
+/// yields no accepted algorithmic candidate.
 pub fn discover_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
@@ -218,6 +339,19 @@ pub fn discover_loop_invariants(
     Some(accepted)
 }
 
+/// Full invariant synthesis pipeline for a cyclic CFG with a concrete assertion.
+///
+/// For each detected loop (processed innermost-first) the function tries the
+/// enabled candidate strategies in order.  Preliminary backward states (WP of
+/// `NOT obligation` propagated backward with back edges blocked) are computed
+/// once upfront and passed to [`check_loop_invariant_verbose`] as the
+/// `assertion_postconditions` argument, enabling the exit-closure check to
+/// verify that the invariant is strong enough to discharge the obligation at
+/// loop exits.
+///
+/// When all strategies fail for any loop the function returns
+/// [`BackwardError::CyclicCfgUnsupported`].  On success, the returned vector
+/// contains one `(header, invariant)` pair per loop, innermost first.
 fn synthesize_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
@@ -564,6 +698,10 @@ fn format_candidates(candidates: &[Formula]) -> String {
     }
 }
 
+/// Format an [`AssertionResult`] for human-readable output.
+///
+/// The rendered string includes the assertion location, the judgement, and —
+/// for `BugFound` — a formatted counterexample grouped by function.
 pub fn render_result(result: &AssertionResult) -> String {
     let location = if !result.source_location.file.is_empty() {
         result.source_location.to_string()
@@ -593,6 +731,11 @@ pub fn render_result(result: &AssertionResult) -> String {
     lines.join("\n")
 }
 
+/// Format an [`SmtModel`] as a grouped counterexample trace.
+///
+/// Variables are grouped by their owning function (the prefix before the first
+/// `$` in the SMT name).  Synthetic names such as call-site temporaries and the
+/// internal `__retval` carrier are filtered out by [`parse_model_var_name`].
 fn render_counterexample(model: &SmtModel) -> String {
     use std::collections::BTreeMap;
     let mut by_function: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -629,7 +772,13 @@ fn render_counterexample(model: &SmtModel) -> String {
     lines.join("\n")
 }
 
-/// Split `fn$local` into `(fn, display_local)`, filtering out synthetic names.
+/// Parse a namespaced SMT variable name into `(function, display_name)`.
+///
+/// The convention used by the adapter is `function$local`, e.g. `main$%x` or
+/// `find_max$__ext_0`.  This function:
+/// - returns `None` for call-site intermediates (`callN$...`);
+/// - returns `None` for the internal return-value carrier `__retval`;
+/// - maps `__ext_N` to the display string `param[N]`.
 fn parse_model_var_name(name: &str) -> Option<(String, String)> {
     let dollar = name.find('$')?;
     let func = name[..dollar].to_string();
@@ -653,6 +802,10 @@ fn parse_model_var_name(name: &str) -> Option<(String, String)> {
     Some((func, display))
 }
 
+/// Render a [`ModelValue`] that may represent a memory array.
+///
+/// `ArrayDefault` values are printed as `all elements = <default>` rather than
+/// enumerating every index, keeping counterexample output concise.
 fn format_array_value(value: &ModelValue) -> String {
     match value {
         ModelValue::ArrayDefault(v) => format!("all elements = {}", v),
@@ -660,6 +813,11 @@ fn format_array_value(value: &ModelValue) -> String {
     }
 }
 
+/// Pretty-print a [`Formula`] with soft line-wrapping at conjunction boundaries.
+///
+/// Short formulas (≤ 100 characters) are returned as-is.  Longer formulas have
+/// their `&&` conjuncts broken onto separate indented lines so that log output
+/// remains readable without truncation.
 pub fn pretty_formula(formula: &Formula) -> String {
     const WRAP_WIDTH: usize = 100;
     let rendered = formula.to_string();
