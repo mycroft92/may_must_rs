@@ -8,9 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Link against the LLVM shared library instead of individual static libs.
-  # This avoids needing separate packages for every LLVM component (e.g. Polly).
-  LLVM_LINK_LLVM_DYLIB: 1
 
 jobs:
   build-and-test:
@@ -25,7 +22,7 @@ jobs:
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" \
             | sudo tee /etc/apt/sources.list.d/llvm-20.list
           sudo apt-get update -q
-          sudo apt-get install -y llvm-20 llvm-20-dev libclang-20-dev clang-20
+          sudo apt-get install -y llvm-20 llvm-20-dev libclang-20-dev clang-20 libpolly-20-dev
           echo "LLVM_SYS_201_PREFIX=/usr/lib/llvm-20" >> "$GITHUB_ENV"
 
       - name: Install Z3
