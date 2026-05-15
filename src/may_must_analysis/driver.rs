@@ -162,6 +162,19 @@ pub fn analyze_function_graph(
 /// 4. Pre-compute and cache loop invariants for every looping function via
 ///    [`discover_loop_invariants`].
 /// 5. Run [`analyze_with_summaries`] for each function and collect reports.
+/// Analyse every function in an LLVM module and return a [`ModuleReport`].
+///
+/// This is the primary entry point for whole-module verification.  It
+/// orchestrates the following passes in order:
+///
+/// 1. Collect external callee names and load any manually-provided summaries
+///    from the [`CandidateProvider`].
+/// 2. Iteratively infer return summaries for all in-module functions (up to
+///    `graphs.len()` rounds to handle mutual calls).
+/// 3. Convert return summaries to must/not-may entries in [`SummaryTables`].
+/// 4. Pre-compute and cache loop invariants for every looping function via
+///    [`discover_loop_invariants`].
+/// 5. Run [`analyze_with_summaries`] for each function and collect reports.
 pub fn analyze_module(
     graphs: &[FunctionGraph],
     memory_pure: &BTreeSet<String>,
@@ -385,6 +398,11 @@ fn infer_return_summary(
 ///    obligation.
 /// 5. Collect all verified relations into a conjunction forming the
 ///    [`ReturnSummary`].
+///
+/// # Example
+///
+/// For a function `find_max(array, n)` that returns the maximum element,
+/// this synthesises the summary: `retval >= array[0] && retval >= array[1] && ...`
 fn infer_cyclic_observer_summary(
     graph: &FunctionGraph,
     adapted: &AdaptedProcedure,
@@ -491,6 +509,11 @@ fn observer_candidate_indices(cfg: &AbstractCfg, function: &str, param_index: us
     indices.into_iter().collect()
 }
 
+/// Collect array access indices from a transfer effect.
+///
+/// Extracts constant indices from `select` operations on the given `ext_region`;
+/// when dynamic indices are encountered, records that and marks up to the
+/// maximum non-negative constant as accessed.
 fn collect_observer_indices_effect(
     effect: &crate::common::abstract_cfg::TransferEffect,
     ext_region: &str,
@@ -768,6 +791,13 @@ fn const_int_value(term: &Term) -> Option<i64> {
 /// obligation (`retval >= array[observed_index]`) is verified by the
 /// [`analyze_with_tables`] call in [`infer_cyclic_observer_summary`], which is
 /// the authoritative discharge step.
+///
+/// # Design note
+///
+/// Exit closure is skipped here because the final proof is delegated to
+/// [`analyze_with_tables`] with the full assertion context.  This avoids
+/// building a separate exit-closure check that may differ from the authoritative
+/// verification in [`analyze_with_tables`].
 fn observer_summary_invariants(
     cfg: &AbstractCfg,
     site: &AssertionSite,
@@ -911,6 +941,11 @@ fn summary_observed_term(cfg: &AbstractCfg, site: &AssertionSite) -> Option<Term
 ///   (e.g. `acc < array[i]`).
 ///
 /// Returns `None` if either component is missing.
+///
+/// # Purpose
+///
+/// Used by [`observer_summary_invariants`] to decompose the backward state
+/// into components for building the observer-pattern invariant.
 fn extract_counter_acc_obs(formula: &Formula) -> Option<(Term, Term, Term)> {
     let conjuncts: Vec<&Formula> = match formula {
         Formula::And(items) => items.iter().collect(),
@@ -941,6 +976,12 @@ fn extract_counter_acc_obs(formula: &Formula) -> Option<(Term, Term, Term)> {
 ///
 /// This is used by [`extract_counter_acc_obs`] to identify the counter
 /// variable after the loop has terminated.
+///
+/// # Examples
+///
+/// - `i >= n` → `Some(i)`
+/// - `NOT (i < n)` → `Some(i)`
+/// - `i < n` → `None` (not an exit condition)
 fn extract_exit_counter(formula: &Formula) -> Option<Term> {
     match formula {
         Formula::Ge(lhs, _) | Formula::Gt(lhs, _) => Some(lhs.clone()),
@@ -957,6 +998,12 @@ fn extract_exit_counter(formula: &Formula) -> Option<Term> {
 ///
 /// Used by [`extract_counter_acc_obs`] to identify the accumulator and the
 /// observed value (array element) in the violation condition.
+///
+/// # Examples
+///
+/// - `acc < array[i]` → `Some((acc, array[i]))`
+/// - `NOT (acc >= array[i])` → `Some((acc, array[i]))`
+/// - `acc >= array[i]` → `None`
 fn extract_lt_pair(formula: &Formula) -> Option<(Term, Term)> {
     match formula {
         Formula::Lt(lhs, rhs) | Formula::Le(lhs, rhs) => Some((lhs.clone(), rhs.clone())),
@@ -974,6 +1021,11 @@ fn extract_lt_pair(formula: &Formula) -> Option<(Term, Term)> {
 /// intra-module call graph (direct or indirect).  The result is used to tag
 /// [`ProcedureReport::recursive`] and may be used in the future to skip or
 /// specialise summary inference for recursive callees.
+///
+/// # Algorithm
+///
+/// Build the call graph from all `FunctionGraph` vertices, then test each
+/// function for reachability to itself via depth-first search.
 fn recursive_functions(graphs: &[FunctionGraph]) -> BTreeSet<String> {
     let in_graph = graphs
         .iter()

@@ -67,6 +67,17 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The `entry_summary` and `assertion_summary` fields capture the [`NodeSummary`]
 /// computed at the function entry and at the assertion site respectively, which
 /// is useful for diagnostics and for building caller-facing summaries.
+///
+/// # Fields
+///
+/// * `site_id` — unique identifier of this assertion.
+/// * `site_label` — human-readable description of the assertion location.
+/// * `source_location` — file, line, and column information.
+/// * `judgement` — the verification result: [`Judgement::Verified`],
+///   [`Judgement::BugFound`], or [`Judgement::Unknown`].
+/// * `entry_summary` — the combined reach and state at function entry,
+///   useful for understanding why Unknown verdicts occur.
+/// * `assertion_summary` — the combined reach and state at the assertion site.
 #[derive(Clone, Debug)]
 pub struct AssertionResult {
     pub site_id: usize,
@@ -83,6 +94,12 @@ pub struct AssertionResult {
 /// loop invariant candidate was accepted by the three-part check (initiation,
 /// inductiveness, exit closure).  Callers should treat this as `UNKNOWN` rather
 /// than `Verified`.
+///
+/// # Variants
+///
+/// * `CyclicCfgUnsupported` — no accepted loop invariant was found for a cyclic CFG.
+/// * `Rule` — a [`RuleError`] occurred during forward reach or backward state propagation.
+/// * `Oracle` — an [`OracleError`] occurred during SMT feasibility or validity checking.
 #[derive(Debug, thiserror::Error)]
 pub enum BackwardError {
     #[error("CFG has a cycle and no loop invariant was accepted")]
@@ -98,6 +115,12 @@ pub enum BackwardError {
 ///
 /// Strategies are tried in the order listed in [`InvariantConfig::methods`].
 /// When the list is empty the default ordering is `Chc → Houdini → Template`.
+///
+/// # Variants
+///
+/// * `Chc` — Constrained Horn Clause solving for simple counter patterns (fast, specific).
+/// * `Houdini` — weakening a large template set until an inductive subset remains (slower, general).
+/// * `Template` — reserved for custom user-provided invariants (currently unused).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum InvariantMethod {
     Chc,
@@ -112,6 +135,12 @@ pub enum InvariantMethod {
 /// `methods` includes them — used when callers know the patterns will not match.
 /// When `llm` is `Some` and `force` is set, LLM-guided CEGIS is attempted
 /// before (or instead of) algorithmic strategies.
+///
+/// # Fields
+///
+/// * `methods` — strategies to try in order; empty means use default sequence.
+/// * `llm` — optional configuration for LLM-guided CEGIS candidate generation.
+/// * `skip_algorithmic` — if true, skip the fast pattern-matching phase.
 pub struct InvariantConfig {
     pub methods: Vec<InvariantMethod>,
     pub llm: Option<LlmInvariantConfig>,
@@ -223,6 +252,28 @@ pub fn analyze_with_tables(
 ///      model.
 ///    - `reach AND state` unsatisfiable → [`Judgement::Verified`].
 ///    - Neither can be determined → [`Judgement::Unknown`].
+/// Core bidirectional analysis pass.
+///
+/// This function implements the combined may/must check described in the paper:
+///
+/// 1. **Forward reach injection** — for each loop header `h` the accepted loop
+///    invariant is conjuncted into `summary.reach` at `h`, establishing the
+///    forward overapproximation of reachable states.  Back edges are blocked so
+///    the [`RuleEngine`] can run in topological order.
+///
+/// 2. **Backward state seeding** — the weakest precondition of `NOT obligation`
+///    is computed at the assertion node and stored as its initial `state`.  This
+///    encodes the condition under which the assertion could be violated.
+///
+/// 3. **Fixpoint** — [`RuleEngine::run_to_fixpoint`] propagates both `reach`
+///    (forward) and `state` (backward) simultaneously using the transfer
+///    functions and edge guards of the CFG.
+///
+/// 4. **Decision** at the function entry node:
+///    - `reach AND state` satisfiable → [`Judgement::BugFound`] with a concrete
+///      model.
+///    - `reach AND state` unsatisfiable → [`Judgement::Verified`].
+///    - Neither can be determined → [`Judgement::Unknown`].
 fn run_backward(
     cfg: &AbstractCfg,
     site: &AssertionSite,
@@ -289,6 +340,11 @@ fn run_backward(
 ///
 /// Returns `None` if the CFG is acyclic (no invariants needed) or if any loop
 /// yields no accepted algorithmic candidate.
+///
+/// # Purpose
+///
+/// This is called once per function before all assertion checks (in `driver.rs`)
+/// to avoid repeatedly synthesising invariants for each assertion.
 pub fn discover_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
@@ -352,6 +408,15 @@ pub fn discover_loop_invariants(
 /// When all strategies fail for any loop the function returns
 /// [`BackwardError::CyclicCfgUnsupported`].  On success, the returned vector
 /// contains one `(header, invariant)` pair per loop, innermost first.
+///
+/// # Strategy sequence
+///
+/// The function tries strategies in this order (if enabled in `config`):
+/// 1. Algorithmic (unless `skip_algorithmic` is set).
+/// 2. CHC solving.
+/// 3. Houdini template weakening.
+/// 4. Template (currently unsupported).
+/// 5. LLM-guided CEGIS (if `llm` is configured).
 fn synthesize_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
@@ -702,6 +767,14 @@ fn format_candidates(candidates: &[Formula]) -> String {
 ///
 /// The rendered string includes the assertion location, the judgement, and —
 /// for `BugFound` — a formatted counterexample grouped by function.
+///
+/// # Output format
+///
+/// ```text
+/// assertion #<id>  <location>
+///   judgement: <Verified|UNSAFE|Unknown>
+///   [counterexample or reach/state summary if Unknown]
+/// ```
 pub fn render_result(result: &AssertionResult) -> String {
     let location = if !result.source_location.file.is_empty() {
         result.source_location.to_string()
@@ -736,6 +809,16 @@ pub fn render_result(result: &AssertionResult) -> String {
 /// Variables are grouped by their owning function (the prefix before the first
 /// `$` in the SMT name).  Synthetic names such as call-site temporaries and the
 /// internal `__retval` carrier are filtered out by [`parse_model_var_name`].
+///
+/// # Output format
+///
+/// ```text
+/// [function1]
+///   var1 = value1
+///   var2 = value2
+/// [function2]
+///   var3 = value3
+/// ```
 fn render_counterexample(model: &SmtModel) -> String {
     use std::collections::BTreeMap;
     let mut by_function: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -779,6 +862,13 @@ fn render_counterexample(model: &SmtModel) -> String {
 /// - returns `None` for call-site intermediates (`callN$...`);
 /// - returns `None` for the internal return-value carrier `__retval`;
 /// - maps `__ext_N` to the display string `param[N]`.
+///
+/// # Examples
+///
+/// - `main$%x` → `Some(("main", "%x"))`
+/// - `find_max$__ext_0` → `Some(("find_max", "param[0]"))`
+/// - `__retval` → `None`
+/// - `call1$temp` → `None`
 fn parse_model_var_name(name: &str) -> Option<(String, String)> {
     let dollar = name.find('$')?;
     let func = name[..dollar].to_string();
@@ -806,6 +896,12 @@ fn parse_model_var_name(name: &str) -> Option<(String, String)> {
 ///
 /// `ArrayDefault` values are printed as `all elements = <default>` rather than
 /// enumerating every index, keeping counterexample output concise.
+///
+/// # Examples
+///
+/// - `ArrayDefault(5)` → `"all elements = 5"`
+/// - `Int(42)` → `"42"`
+/// - `Bool(true)` → `"true"`
 fn format_array_value(value: &ModelValue) -> String {
     match value {
         ModelValue::ArrayDefault(v) => format!("all elements = {}", v),
@@ -818,6 +914,11 @@ fn format_array_value(value: &ModelValue) -> String {
 /// Short formulas (≤ 100 characters) are returned as-is.  Longer formulas have
 /// their `&&` conjuncts broken onto separate indented lines so that log output
 /// remains readable without truncation.
+///
+/// # Purpose
+///
+/// Used in invariant debugging logs to keep output concise and readable.  The
+/// wrapping threshold is 100 characters.
 pub fn pretty_formula(formula: &Formula) -> String {
     const WRAP_WIDTH: usize = 100;
     let rendered = formula.to_string();

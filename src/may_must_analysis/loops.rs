@@ -48,6 +48,23 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 /// `body` set contains every CFG node from which the header is reachable
 /// without leaving the loop.  `exit_edges` are the CFG edges that leave the
 /// body — their targets are the first nodes executed after the loop.
+///
+/// # Natural loop properties
+///
+/// - **Header**: the unique entry point; invariants are asserted at the header.
+/// - **Latch**: the node that closes the loop; back_edge goes from latch to header.
+/// - **Body**: all nodes inside the loop; used to restrict backward propagation.
+/// - **Exit edges**: edges leaving the body; used for exit-closure checks.
+///
+/// # Example structure
+///
+/// ```text
+/// entry → header → body1 → body2 ↓
+///          ↑                       ↓
+///          └─────── latch ←────────┘
+///                     ↓
+///                   exit
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopInfo {
     /// Unique entry point of the loop (target of the back edge).
@@ -80,6 +97,12 @@ pub type InnerInvariants<'a> = &'a [(CfgNodeId, Formula)];
 /// Only `Accepted` means all three soundness conditions passed.  The failure
 /// variants identify *which* condition was the first to fail, enabling
 /// targeted logging and CEGIS feedback.
+///
+/// # Soundness checks
+///
+/// - **Initiation**: the candidate holds on entry (reach at header is empty).
+/// - **Inductiveness**: the candidate is preserved by one iteration (holds after).
+/// - **Exit closure**: the candidate implies the assertion postcondition at exits.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvariantCheckResult {
     /// Initiation, inductiveness, and exit closure all passed.
@@ -112,6 +135,13 @@ pub fn fmt_loop_loc(info: &LoopInfo) -> String {
 /// body is computed by a backward BFS from the latch to the header.  The
 /// resulting [`LoopInfo`] structs are returned in an unspecified order; callers
 /// that need innermost-first processing should call [`sort_innermost_first`].
+///
+/// # Algorithm
+///
+/// 1. Detect back edges via the CFG.
+/// 2. For each back edge (source → target), target becomes the header.
+/// 3. Backward BFS from source to target to compute the loop body.
+/// 4. Collect all edges exiting the body (targets outside body).
 pub fn detect_loops(cfg: &AbstractCfg) -> Vec<LoopInfo> {
     cfg.detect_back_edges()
         .into_iter()
@@ -159,6 +189,12 @@ pub fn detect_loops(cfg: &AbstractCfg) -> Vec<LoopInfo> {
 /// outer ones ensures that their invariants are available when checking the
 /// inductiveness of outer loops via the `inner` parameter of
 /// [`check_loop_invariant_verbose`].
+///
+/// # Motivation
+///
+/// Nested loops can be summarised by their invariants (passed as `inner`) rather
+/// than re-entering them during backward propagation.  This requires inner
+/// invariants to be computed before outer ones.
 pub fn sort_innermost_first(loops: &mut [LoopInfo]) {
     loops.sort_by_key(|info| info.body.len());
 }
@@ -176,6 +212,12 @@ pub fn sort_innermost_first(loops: &mut [LoopInfo]) {
 ///
 /// Candidates derived from variables that have constant definitions in the loop
 /// body are simplified via substitution using [`normalize_formula_with_defs`].
+///
+/// # Strategy characteristics
+///
+/// - **Speed**: O(CFG size) — no solver queries.
+/// - **Specificity**: targets counter loops and guards.
+/// - **Limitations**: misses non-syntactic invariants.
 pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula> {
     let defs = collect_loop_definitions(info, cfg);
     let mut candidates = Vec::new();
@@ -257,6 +299,12 @@ pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula
 /// feed these through [`check_loop_invariant_verbose`] and keep only those that
 /// pass, gradually weakening to the largest inductive conjunction (Houdini
 /// algorithm).
+///
+/// # Strategy characteristics
+///
+/// - **Generality**: covers linear arithmetic patterns; generates O(vars^2 * constants^2).
+/// - **Cost**: expensive; each candidate requires a solver query.
+/// - **Applicability**: works well for loops with counter patterns and linear bounds.
 pub fn houdini_candidates(
     variable_sorts: &BTreeMap<String, Sort>,
     header_wp: &Formula,
@@ -316,6 +364,12 @@ pub fn houdini_candidates(
 /// guard: delegates to [`chc::solve_loop_chc`] to produce a closed-form
 /// invariant such as `0 <= i && i <= n`.  Returns `None` if the guard does not
 /// match the expected pattern.
+///
+/// # Strategy characteristics
+///
+/// - **Speed**: fast; delegates to a dedicated CHC solver.
+/// - **Specificity**: targets counter-loop patterns (i < bound).
+/// - **Limitations**: only handles counter patterns; generic loops get `None`.
 pub fn chc_loop_invariant(info: &LoopInfo, cfg: &AbstractCfg) -> Option<Formula> {
     let guard = &info.back_edge_guard;
     if let Formula::Lt(Term::Var(counter), Term::Var(bound)) = guard {
@@ -757,6 +811,14 @@ fn collect_int_constants_term(term: &Term, out: &mut Vec<i64>) {
 /// Inner loop headers supplied in `inner` are seeded with their invariants and
 /// the corresponding inner body nodes are skipped so that their transfer
 /// effects are not double-counted.
+///
+/// # Parameters
+///
+/// * `seeds` — initial state at given nodes (e.g., violation conditions).
+/// * `excluded_edges` — back edges to skip (enables topological propagation).
+/// * `restrict_to` — limit to edges within a subgraph (intra-loop analysis).
+/// * `ignore_body_guards` — suppress guards (unconditional WP for inductiveness).
+/// * `inner` — inner loop invariants (summarise their bodies).
 fn backward_states(
     cfg: &AbstractCfg,
     seeds: &[(CfgNodeId, Formula)],
@@ -857,6 +919,10 @@ fn summarize_inner_loops(
     (headers, blocked_nodes)
 }
 
+/// Collect all integer literal constants from the loop body.
+///
+/// Scans all assignment targets and memory stores for integer literals, which
+/// are used by [`houdini_candidates`] to construct bound templates.
 pub fn collect_loop_body_int_constants(info: &LoopInfo, cfg: &AbstractCfg) -> BTreeSet<i64> {
     let mut constants = BTreeSet::new();
     for node_id in &info.body {

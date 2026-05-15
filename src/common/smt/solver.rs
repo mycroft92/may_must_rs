@@ -53,6 +53,19 @@ use z3::{SatResult, Solver, Sort as Z3Sort};
 ///
 /// Use [`SmtScope::reset`] between logically independent queries.  The solver
 /// state is cleared but the variable caches are retained.
+///
+/// # Scope / stack model
+///
+/// There is no explicit push/pop mechanism here. Instead:
+/// - Each query calls [`SmtScope::reset`] to clear all assertions.
+/// - Variable declarations (caches) persist across resets.
+/// - Policy decisions about when to query belong in `oracle.rs`.
+///
+/// # Fields
+///
+/// * `solver` — the Z3 `Solver` instance (stateful, must be reset between queries).
+/// * `bool_vars`, `int_vars`, `real_vars` — caches for scalar variables.
+/// * `memory_vars` — caches for memory regions (`Array(Int, Int)`).
 #[derive(Debug, Default)]
 pub struct SmtScope {
     solver: Solver,
@@ -67,11 +80,16 @@ impl SmtScope {
         Self::default()
     }
 
-    /// Lower `formula` to a Z3 Bool and assert it into the solver.
+    /// Lower and assert a formula into the solver.
     ///
     /// The formula is validated (sort-checking) before lowering.  Returns an
     /// error if validation or lowering fails; the solver state is not modified
     /// in that case.
+    ///
+    /// # Idempotence
+    ///
+    /// Calling this multiple times with the same formula adds the formula
+    /// multiple times to the solver (no de-duplication).
     pub fn assert_formula(&mut self, formula: &Formula) -> Result<(), FormulaError> {
         formula.validate()?;
         let lowered = self.lower_formula(formula)?;
@@ -82,8 +100,13 @@ impl SmtScope {
     /// Run the satisfiability check on all currently asserted formulas.
     ///
     /// Returns `SatResult::Sat`, `SatResult::Unsat`, or `SatResult::Unknown`.
-    /// A `Sat` result makes the model accessible via [`model_bindings`] and
-    /// [`model_string`].
+    /// A `Sat` result makes the model accessible via [`SmtScope::model_bindings`]
+    /// and [`SmtScope::model_string`].
+    ///
+    /// # Note
+    ///
+    /// This can be called multiple times on the same solver state; later calls
+    /// may return different results if formulas are asserted between calls.
     pub fn check(&self) -> SatResult {
         self.solver.check()
     }
@@ -91,7 +114,11 @@ impl SmtScope {
     /// Return the raw Z3 model as a string, or `None` if no model is available.
     ///
     /// This is a low-level diagnostic accessor; callers that need structured
-    /// values should use [`model_bindings`] instead.
+    /// values should use [`SmtScope::model_bindings`] instead.
+    ///
+    /// # Availability
+    ///
+    /// Only available after a `Sat` result from [`SmtScope::check`].
     pub fn model_string(&self) -> Option<String> {
         self.solver.get_model().map(|model| model.to_string())
     }
@@ -104,8 +131,18 @@ impl SmtScope {
     /// summarised as `ArrayDefault(value)`; otherwise individual `name[index]`
     /// bindings are emitted.
     ///
-    /// Returns `None` if no model is available (e.g., the last [`check`] was
-    /// `Unsat` or has not been called yet).
+    /// Returns `None` if no model is available (e.g., the last [`SmtScope::check`]
+    /// was `Unsat` or has not been called yet).
+    ///
+    /// # Parameters
+    ///
+    /// * `extra_indices` — memory array indices to sample (in addition to index 0).
+    ///
+    /// # Output
+    ///
+    /// An [`SmtModel`] with:
+    /// - `scalar` — concrete values for all variables.
+    /// - `memory` — summarised array values (default or individual indices).
     pub fn model_bindings(&self, extra_indices: &[i64]) -> Option<SmtModel> {
         let model = self.solver.get_model()?;
         let mut result = SmtModel::default();
@@ -165,8 +202,16 @@ impl SmtScope {
         Some(result)
     }
 
-    /// Clear all asserted formulas, preparing the solver for a new independent
-    /// query.  Variable caches are retained.
+    /// Clear all asserted formulas and the model, preparing the solver for a
+    /// new independent query.  Variable caches are retained.
+    ///
+    /// # Semantics
+    ///
+    /// After reset:
+    /// - All assertions are cleared.
+    /// - The model (if any) becomes unavailable.
+    /// - Variable declarations remain cached for reuse.
+    /// - The solver is ready for a fresh set of assertions.
     pub fn reset(&mut self) {
         self.solver.reset();
     }
@@ -176,6 +221,11 @@ impl SmtScope {
     /// Useful when the caller needs to combine several formula results before
     /// asserting (e.g., building an implication for a validity check in
     /// `oracle.rs`).
+    ///
+    /// # Use case
+    ///
+    /// This is the building block for constructing complex formulas such as
+    /// `formula1.implies(formula2)` before asserting them.
     pub fn formula_to_z3(&mut self, formula: &Formula) -> Result<Bool, FormulaError> {
         self.lower_formula(formula)
     }
@@ -183,6 +233,11 @@ impl SmtScope {
     /// Lower a [`Term`] that is expected to have integer sort to a Z3 [`Int`] AST.
     ///
     /// Returns an error if the term lowers to a real sort.
+    ///
+    /// # Purpose
+    ///
+    /// Used by callers (e.g., `oracle.rs`) that construct compound formulas
+    /// and need access to Z3 integer terms before building comparisons.
     pub fn term_to_z3_int(&mut self, term: &Term) -> Result<Int, FormulaError> {
         match self.lower_term(term)? {
             EncodedTerm::Int(value) => Ok(value),
@@ -456,27 +511,38 @@ fn compare_terms(
     }
 }
 
-/// Convenience wrapper: lower `formula` using `scope`.
+/// Convenience wrapper: lower a formula using `scope`.
 ///
 /// Delegates to [`SmtScope::formula_to_z3`].  Exists so that callers holding a
-/// mutable reference to `scope` can call this as a free function.
+/// mutable reference to `scope` can call this as a free function rather than
+/// dereferencing `scope.formula_to_z3(...)`.
 pub fn formula_to_z3(scope: &mut SmtScope, formula: &Formula) -> Result<Bool, FormulaError> {
     scope.formula_to_z3(formula)
 }
 
-/// Convenience wrapper: lower `term` to a Z3 integer using `scope`.
+/// Convenience wrapper: lower a term to a Z3 integer using `scope`.
 ///
-/// Delegates to [`SmtScope::term_to_z3_int`].
+/// Delegates to [`SmtScope::term_to_z3_int`].  Exists for the same reasons as
+/// [`formula_to_z3`].
 pub fn term_to_z3_int(scope: &mut SmtScope, term: &Term) -> Result<Int, FormulaError> {
     scope.term_to_z3_int(term)
 }
 
-/// Create a temporary single-use solver and check whether `condition` is
-/// satisfiable.
+/// Create a temporary single-use solver and check whether a condition is satisfiable.
 ///
 /// Unlike [`SmtScope::check`] this does not accumulate state — the solver is
 /// created and immediately discarded.  Suitable for one-off checks that do not
 /// need model extraction.
+///
+/// # Use case
+///
+/// For lightweight feasibility checks where the overhead of managing a solver
+/// instance is acceptable (e.g., in early filters before full analysis).
+///
+/// # Note
+///
+/// The passed [`Bool`] must have been lowered by a [`SmtScope`] instance
+/// (or contain only literals and operations on globally-valid Z3 constants).
 pub fn quick_sat_check(condition: Bool) -> SatResult {
     let solver = Solver::new();
     solver.assert(&condition);
