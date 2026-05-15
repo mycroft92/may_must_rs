@@ -829,7 +829,7 @@ fn lower_assertions(
         sites.push(AssertionSite {
             id: index + 1,
             node,
-            source_location: SourceLocation::default(),
+            source_location: site.source_location.clone().into(),
             location: assertion_location(site),
             obligation,
         });

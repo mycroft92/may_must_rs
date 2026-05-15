@@ -20,8 +20,10 @@
 //! reasoning should be implemented here; this file exists only to query LLVM
 //! safely enough for the raw graph builder and later loop/call lowering.
 
+use crate::common::source::SourceLocation;
 use llvm_sys::bit_reader::*;
 use llvm_sys::core::*;
+use llvm_sys::debuginfo::*;
 use llvm_sys::ir_reader::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
@@ -825,6 +827,38 @@ impl Instruction {
                 }
             }
             res
+        }
+    }
+
+    /// Extract LLVM debug location (file, line, column) for this instruction.
+    /// Returns `None` if the bitcode was compiled without `-g` or if the
+    /// instruction has no debug metadata attached.
+    pub fn get_debug_location(&self) -> Option<SourceLocation> {
+        unsafe {
+            let loc = LLVMInstructionGetDebugLoc(self.0);
+            if loc.is_null() {
+                return None;
+            }
+            let line = LLVMDILocationGetLine(loc);
+            let column = LLVMDILocationGetColumn(loc);
+            let scope = LLVMDILocationGetScope(loc);
+            if scope.is_null() {
+                return Some(SourceLocation::new("", line, column));
+            }
+            let file = LLVMDIScopeGetFile(scope);
+            if file.is_null() {
+                return Some(SourceLocation::new("", line, column));
+            }
+            let mut filename_len = 0u32;
+            let filename_ptr = LLVMDIFileGetFilename(file, &mut filename_len);
+            let filename = if filename_ptr.is_null() || filename_len == 0 {
+                String::new()
+            } else {
+                let bytes =
+                    std::slice::from_raw_parts(filename_ptr as *const u8, filename_len as usize);
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+            Some(SourceLocation::new(filename, line, column))
         }
     }
 }

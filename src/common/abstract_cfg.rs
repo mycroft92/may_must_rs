@@ -50,6 +50,12 @@ impl From<crate::common::source::SourceLocation> for SourceLocation {
     }
 }
 
+impl From<SourceLocation> for crate::common::source::SourceLocation {
+    fn from(value: SourceLocation) -> Self {
+        crate::common::source::SourceLocation::new(value.file, value.line, value.column)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CallMemoryEffect {
     PreservesMemory,

@@ -15,6 +15,7 @@
 
 use crate::common::errors::*;
 use crate::common::llvm_utils::llvm_wrap::*;
+use crate::common::source::SourceLocation;
 use dot::Labeller;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -34,6 +35,7 @@ pub struct AssertSite {
     pub asserted_value: Instruction,
     pub predecessor: Option<Instruction>,
     pub successor: Option<Instruction>,
+    pub source_location: SourceLocation,
 }
 
 #[derive(Clone, Debug)]
@@ -142,10 +144,12 @@ impl FunctionGraph {
                         .into_iter()
                         .next()
                         .unwrap_or(instruction);
+                    let source_location = instruction.get_debug_location().unwrap_or_default();
                     graph.asserts.push(AssertSite {
                         asserted_value,
                         predecessor: previous_visible_instruction(&instructions, index),
                         successor: next_visible_instruction(&instructions, index),
+                        source_location,
                     });
                 }
             }

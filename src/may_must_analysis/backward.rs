@@ -2,8 +2,9 @@
 
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId};
 use crate::common::adapter::AssertionSite;
-use crate::common::formula::Formula;
+use crate::common::formula::{Formula, ModelValue, SmtModel};
 use crate::common::oracle::{Oracle, OracleError};
+use crate::common::source::SourceLocation;
 use crate::may_must_analysis::llm_provider::{
     build_full_loop_context, build_loop_invariant_prompt, collect_variable_sorts, parse_candidate,
     CegisAttempt, LlmBackend,
@@ -23,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct AssertionResult {
     pub site_id: usize,
     pub site_label: String,
+    pub source_location: SourceLocation,
     pub judgement: Judgement,
     pub entry_summary: NodeSummary,
     pub assertion_summary: NodeSummary,
@@ -159,6 +161,7 @@ fn run_backward(
     Ok(AssertionResult {
         site_id: site.id,
         site_label: site.location.clone(),
+        source_location: site.source_location.clone().into(),
         judgement,
         entry_summary: engine.summary(cfg.entry())?.clone(),
         assertion_summary: engine.summary(site.node)?.clone(),
@@ -562,26 +565,99 @@ fn format_candidates(candidates: &[Formula]) -> String {
 }
 
 pub fn render_result(result: &AssertionResult) -> String {
-    let mut lines = vec![format!(
-        "  assertion #{} ({})",
-        result.site_id, result.site_label
-    )];
-    lines.push(format!("    reach: {}", result.entry_summary.reach));
-    lines.push(format!("    state: {}", result.entry_summary.state));
+    let location = if !result.source_location.file.is_empty() {
+        result.source_location.to_string()
+    } else if result.source_location.line > 0 {
+        result.source_location.to_string()
+    } else {
+        result.site_label.clone()
+    };
+    let mut lines = vec![format!("  assertion #{}  {}", result.site_id, location)];
     match &result.judgement {
         Judgement::Verified => lines.push("    judgement: Verified".to_string()),
-        Judgement::Unknown => lines.push("    judgement: Unknown".to_string()),
+        Judgement::Unknown => {
+            lines.push("    judgement: Unknown".to_string());
+            lines.push(format!("    reach: {}", result.entry_summary.reach));
+            lines.push(format!("    state: {}", result.entry_summary.state));
+        }
         Judgement::BugFound { model } => {
-            lines.push("    judgement: BugFound".to_string());
+            lines.push("    judgement: UNSAFE".to_string());
             if let Some(model) = model.as_ref() {
-                lines.push("    counterexample:".to_string());
-                for line in model.to_string().lines() {
-                    lines.push(format!("      {line}"));
+                if !model.is_empty() {
+                    lines.push("    counterexample:".to_string());
+                    lines.push(render_counterexample(model));
                 }
             }
         }
     }
     lines.join("\n")
+}
+
+fn render_counterexample(model: &SmtModel) -> String {
+    use std::collections::BTreeMap;
+    let mut by_function: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for (var, value) in &model.scalar {
+        if let Some((func, local)) = parse_model_var_name(var.name()) {
+            by_function
+                .entry(func)
+                .or_default()
+                .push(format!("      {} = {}", local, value));
+        }
+    }
+    for (name, value) in &model.memory {
+        if let Some((func, local)) = parse_model_var_name(name) {
+            by_function.entry(func).or_default().push(format!(
+                "      {}: {}",
+                local,
+                format_array_value(value)
+            ));
+        }
+    }
+
+    if by_function.is_empty() {
+        return "      (no concrete values)".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for (func, mut entries) in by_function {
+        entries.sort();
+        entries.dedup();
+        lines.push(format!("      [{}]", func));
+        lines.extend(entries);
+    }
+    lines.join("\n")
+}
+
+/// Split `fn$local` into `(fn, display_local)`, filtering out synthetic names.
+fn parse_model_var_name(name: &str) -> Option<(String, String)> {
+    let dollar = name.find('$')?;
+    let func = name[..dollar].to_string();
+    let local = &name[dollar + 1..];
+
+    // Skip call-site intermediate renames (callN$...)
+    if local.starts_with("call") && local.contains('$') {
+        return None;
+    }
+    // Skip synthetic return-value carrier
+    if local == "__retval" {
+        return None;
+    }
+
+    let display = if let Some(n) = local.strip_prefix("__ext_") {
+        format!("param[{}]", n)
+    } else {
+        local.to_string()
+    };
+
+    Some((func, display))
+}
+
+fn format_array_value(value: &ModelValue) -> String {
+    match value {
+        ModelValue::ArrayDefault(v) => format!("all elements = {}", v),
+        other => other.to_string(),
+    }
 }
 
 pub fn pretty_formula(formula: &Formula) -> String {

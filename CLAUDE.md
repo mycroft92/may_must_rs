@@ -68,7 +68,8 @@ by `analyze_with_tables`.
 
 - **`adapter.rs`**: the lowering boundary. Pointer parameters → `ext_region`
   (`fn$__ext_N`). Local allocas → `stack0`, `stack1`, ... Memory ops →
-  `select`/`MemoryStore` on named regions.
+  `select`/`MemoryStore` on named regions. Source locations propagated from
+  LLVM debug metadata (`-g` required at compile time).
 - **`oracle.rs`**: all SMT queries go through here. Do not add raw solver calls
   elsewhere.
 - **`backward.rs`**: `analyze_with_tables` is the top-level entry for checking
