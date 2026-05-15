@@ -221,7 +221,7 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 
 Unsupported procedures return `UNKNOWN` rather than terminating the run.
 
-See `MEMORY_MODEL.md` for the full roadmap and `REFERENCES.md` for citations.
+See [MEMORY_MODEL.md](MEMORY_MODEL.md) for the full roadmap and [REFERENCES.md](REFERENCES.md) for citations.
 
 ---
 
