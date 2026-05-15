@@ -17,7 +17,22 @@ counterexample.
 ### Prerequisites
 
 - Rust (stable)
-- LLVM 20/21 with `llvm-config` on `PATH` (the `llvm-sys` crate links against it)
+- LLVM 20 with `llvm-config` on `PATH` — including the Polly component:
+  ```sh
+  # Ubuntu/Debian (via apt.llvm.org)
+  sudo apt-get install llvm-20 llvm-20-dev libclang-20-dev libpolly-20-dev clang-20
+
+  # macOS (Homebrew)
+  brew install llvm@20
+  ```
+- Z3 development libraries (used by the SMT oracle):
+  ```sh
+  # Ubuntu/Debian
+  sudo apt-get install libz3-dev
+
+  # macOS (Homebrew)
+  brew install z3
+  ```
 - A C compiler (clang) for recompiling the test fixtures
 
 ### Build
