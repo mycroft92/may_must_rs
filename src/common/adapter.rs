@@ -37,7 +37,7 @@ use crate::common::abstract_cfg::{
     TransferEffect, TransferFn,
 };
 use crate::common::formula::{Formula, Memory, Rational, Sort, Term, Var};
-use crate::common::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TypeKind};
+use crate::common::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TargetData, TypeKind};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -220,6 +220,7 @@ pub fn adapt_with_purity_and_summaries(
 ) -> Result<AdaptedProcedure, AdapterError> {
     let function_name = &graph.name;
     let start = graph.start.ok_or(AdapterError::MissingStart)?;
+    let layout = TargetData::from_str(&graph.data_layout_str);
 
     let mut allocation_regions = HashMap::<Instruction, String>::new();
     let mut stack_index = 0usize;
@@ -236,6 +237,7 @@ pub fn adapt_with_purity_and_summaries(
         start,
         memory_pure,
         &allocation_regions,
+        &layout,
     )?);
     let mut instruction_nodes = HashMap::new();
     instruction_nodes.insert(start, cfg.entry());
@@ -249,6 +251,7 @@ pub fn adapt_with_purity_and_summaries(
             *instruction,
             memory_pure,
             &allocation_regions,
+            &layout,
         )?;
         let node_id = cfg.add_node(instruction.print(), transfer);
         instruction_nodes.insert(*instruction, node_id);
@@ -595,7 +598,89 @@ fn pointer_name(function_name: &str, value: Instruction) -> String {
     local_name(function_name, value)
 }
 
-fn lower_gep_offset(function_name: &str, instruction: Instruction) -> Result<Term, AdapterError> {
+/// Computes the abstract integer offset for a GEP instruction, normalised to
+/// i32 units (divide all byte offsets by 4).
+///
+/// Walks the GEP index chain using LLVM type information from `layout`:
+/// - **Pointer dereference** (first index): stride = `store_size_of_type(pointee) / 4`
+/// - **Array element** (index into `[N x T]`): stride = `store_size_of_type(T) / 4`
+/// - **Struct field** (constant index into a struct): offset = `offset_of_element(...) / 4`
+///
+/// Normalising to i32 units preserves backward compatibility: existing integer
+/// array tests use i32 elements (stride = 4/4 = 1), so their element indices
+/// are unchanged.  Mixed-width structs and non-i32 arrays now produce correct
+/// distinct offsets.
+///
+/// Falls back to plain index summation (the old behaviour) when type
+/// information is unavailable.
+fn lower_gep_offset(
+    function_name: &str,
+    instruction: Instruction,
+    layout: &TargetData,
+) -> Result<Term, AdapterError> {
+    // Try to walk the GEP type chain for a precise byte-based offset.
+    let operands: Vec<Instruction> = instruction.get_operands().into_iter().collect();
+    // operands[0] = base pointer; operands[1..] = indices
+    if operands.is_empty() {
+        return Ok(Term::int(0));
+    }
+
+    let Some(mut current_type) = instruction.get_gep_source_element_type() else {
+        // No type info available; fall back to plain summation.
+        return lower_gep_offset_fallback(function_name, instruction);
+    };
+
+    let mut offset = Term::int(0);
+
+    for (step, index_instr) in operands.iter().skip(1).enumerate() {
+        match current_type.kind() {
+            TypeKind::Struct => {
+                // Struct field index must be a compile-time constant.
+                if let Some(field_idx) = index_instr.as_constant_int() {
+                    let byte_off = layout.offset_of_element(current_type, field_idx as u32);
+                    offset = Term::add(offset, Term::int((byte_off / 4) as i64));
+                    if let Some(field_ty) =
+                        current_type.get_struct_element_type_at(field_idx as u32)
+                    {
+                        current_type = field_ty;
+                    }
+                } else {
+                    // Non-constant struct index is undefined behaviour in C/C++;
+                    // treat as zero offset and stop walking.
+                    break;
+                }
+            }
+            TypeKind::Array => {
+                let elem_ty = current_type.get_element_type().unwrap_or(current_type);
+                let stride = layout.store_size_of_type(elem_ty).max(4) / 4;
+                let idx = lower_integer_value(function_name, *index_instr)?;
+                offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
+                current_type = elem_ty;
+            }
+            _ => {
+                // Pointer dereference (step 0) or scalar: stride by element size.
+                let stride = layout.store_size_of_type(current_type).max(4) / 4;
+                if step == 0 {
+                    let idx = lower_integer_value(function_name, *index_instr)?;
+                    offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
+                } else {
+                    let idx = lower_integer_value(function_name, *index_instr)?;
+                    offset = Term::add(offset, Term::mul(idx, Term::int(stride as i64)));
+                }
+                // No further type to walk into for scalar types.
+            }
+        }
+    }
+
+    Ok(offset)
+}
+
+/// Fallback used when no GEP source element type is available.
+/// Sums all indices as plain integers (original behaviour, correct for i32 arrays).
+fn lower_gep_offset_fallback(
+    function_name: &str,
+    instruction: Instruction,
+) -> Result<Term, AdapterError> {
     let mut offset = Term::int(0);
     for operand in instruction.get_operands().into_iter().skip(1) {
         let term = lower_integer_value(function_name, operand)?;
@@ -644,6 +729,7 @@ fn lower_node_transfer(
     instruction: Instruction,
     memory_pure: &BTreeSet<String>,
     allocation_regions: &HashMap<Instruction, String>,
+    layout: &TargetData,
 ) -> Result<TransferFn, AdapterError> {
     let mut effects = Vec::<TransferEffect>::new();
 
@@ -830,7 +916,7 @@ fn lower_node_transfer(
                     .get_operand(0)
                     .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?,
             );
-            let offset = lower_gep_offset(function_name, instruction)?;
+            let offset = lower_gep_offset(function_name, instruction, layout)?;
             effects.push(TransferEffect::GetElementPtr {
                 target,
                 base,

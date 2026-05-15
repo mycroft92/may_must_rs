@@ -108,6 +108,10 @@ pub struct FunctionGraph {
     pub vars: HashMap<String, Instruction>,
     /// All `may_assert` call sites found in the function, in source order.
     pub asserts: Vec<AssertSite>,
+    /// The module's data-layout string, copied at graph-build time.
+    /// Used by the adapter to construct a [`TargetData`] for accurate GEP
+    /// offset calculation without needing to hold the LLVM `Module` reference.
+    pub data_layout_str: String,
 }
 
 impl<'a> Labeller<'a, Instruction, (Instruction, Instruction)> for FunctionGraph {
@@ -178,7 +182,7 @@ impl FunctionGraph {
     ///
     /// `start` is set to the first visible instruction of the entry block
     /// (the first basic block in LLVM's block list).
-    pub fn new(function: Function) -> Result<FunctionGraph> {
+    pub fn new(function: Function, data_layout_str: String) -> Result<FunctionGraph> {
         if function.get_basic_block_count() == 0 {
             return Err(ProgError::NoDefinitionForGraph(function.get_name()));
         }
@@ -208,6 +212,7 @@ impl FunctionGraph {
             end: Vec::new(),
             vars: HashMap::new(),
             asserts: Vec::new(),
+            data_layout_str,
         };
 
         let basic_blocks = function.get_all_basic_blocks();
@@ -359,8 +364,9 @@ impl FunctionGraph {
 /// in the order functions appear in the module.
 pub fn generate_program_graph(module: &Module) -> Result<Vec<FunctionGraph>> {
     let mut graphs = Vec::new();
+    let layout = module.get_data_layout_str();
     for function in module.get_all_functions() {
-        match FunctionGraph::new(function) {
+        match FunctionGraph::new(function, layout.clone()) {
             Ok(graph) => graphs.push(graph),
             Err(ProgError::NoDefinitionForGraph(_)) => {}
             Err(error) => return Err(error),

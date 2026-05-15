@@ -27,6 +27,7 @@ use llvm_sys::debuginfo::*;
 use llvm_sys::ir_reader::*;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
+use llvm_sys::target::LLVMTargetDataRef;
 use llvm_sys::{LLVMIntPredicate, LLVMOpcode, LLVMRealPredicate, LLVMTypeKind};
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -436,6 +437,70 @@ impl Module {
             res
         }
     }
+
+    /// Build a [`TargetData`] from this module's data-layout string.
+    ///
+    /// The returned `TargetData` can compute struct field byte offsets
+    /// (`offset_of_element`) and type store sizes (`store_size_of_type`),
+    /// which are needed for correct GEP offset calculation.
+    pub fn get_data_layout(&self) -> TargetData {
+        unsafe {
+            let layout_str = LLVMGetDataLayoutStr(self.0);
+            let td = LLVMCreateTargetData(layout_str);
+            TargetData(td)
+        }
+    }
+
+    /// Return the module's data-layout string (e.g. `"e-m:o-i64:64-..."`)
+    /// as an owned `String`.  This can be stored alongside a `FunctionGraph`
+    /// so the layout can be reconstructed later without holding a `Module`
+    /// reference.
+    pub fn get_data_layout_str(&self) -> String {
+        unsafe {
+            let ptr = LLVMGetDataLayoutStr(self.0);
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Wraps an LLVM `TargetDataRef`, providing type-layout queries.
+///
+/// Built from the module's data-layout string via [`Module::get_data_layout`].
+/// All size and offset values are in **bytes**. Divide by 4 to convert to
+/// i32-unit offsets used by the abstract memory model.
+pub struct TargetData(LLVMTargetDataRef);
+
+impl Drop for TargetData {
+    fn drop(&mut self) {
+        unsafe { LLVMDisposeTargetData(self.0) }
+    }
+}
+
+impl TargetData {
+    /// Build a `TargetData` from a data-layout string (e.g. the value
+    /// stored in [`FunctionGraph::data_layout_str`]).
+    pub fn from_str(layout: &str) -> TargetData {
+        unsafe {
+            let cstr = CString::new(layout).unwrap_or_default();
+            TargetData(LLVMCreateTargetData(cstr.as_ptr()))
+        }
+    }
+
+    /// Returns the byte offset of `field_index` within `struct_type`.
+    ///
+    /// Accounts for alignment padding between fields, so this is correct
+    /// for all C-compatible struct layouts including mixed-width fields.
+    pub fn offset_of_element(&self, struct_type: Type, field_index: u32) -> u64 {
+        unsafe { LLVMOffsetOfElement(self.0, struct_type.0, field_index) }
+    }
+
+    /// Returns the store size (in bytes) of `ty`.
+    ///
+    /// This is the number of bytes written by a store of this type,
+    /// which is the correct stride for array element indexing.
+    pub fn store_size_of_type(&self, ty: Type) -> u64 {
+        unsafe { LLVMStoreSizeOfType(self.0, ty.0) }
+    }
 }
 
 impl AsMut<llvm_sys::LLVMModule> for Module {
@@ -457,6 +522,10 @@ pub enum TypeKind {
     Pointer,
     Function,
     Label,
+    /// A fixed-size array type `[N x T]`.
+    Array,
+    /// A struct type (named or literal, packed or not).
+    Struct,
     Other,
 }
 
@@ -472,9 +541,49 @@ impl Type {
                 LLVMTypeKind::LLVMPointerTypeKind => TypeKind::Pointer,
                 LLVMTypeKind::LLVMFunctionTypeKind => TypeKind::Function,
                 LLVMTypeKind::LLVMLabelTypeKind => TypeKind::Label,
+                LLVMTypeKind::LLVMArrayTypeKind => TypeKind::Array,
+                LLVMTypeKind::LLVMStructTypeKind => TypeKind::Struct,
                 _ => TypeKind::Other,
             }
         }
+    }
+
+    /// Returns the element type of an array or the pointee type of a pointer.
+    /// Returns `None` for struct and scalar types.
+    pub fn get_element_type(&self) -> Option<Type> {
+        match self.kind() {
+            TypeKind::Array | TypeKind::Pointer => {
+                let ty = unsafe { LLVMGetElementType(self.0) };
+                if ty.is_null() { None } else { Some(Type(ty)) }
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the type of the field at `index` for a struct type.
+    /// Returns `None` for non-struct types or out-of-range indices.
+    pub fn get_struct_element_type_at(&self, index: u32) -> Option<Type> {
+        if self.kind() != TypeKind::Struct {
+            return None;
+        }
+        unsafe {
+            let count = LLVMCountStructElementTypes(self.0);
+            if index >= count {
+                return None;
+            }
+            let mut types = vec![std::ptr::null_mut(); count as usize];
+            LLVMGetStructElementTypes(self.0, types.as_mut_ptr());
+            let ty = types[index as usize];
+            if ty.is_null() { None } else { Some(Type(ty)) }
+        }
+    }
+
+    /// Returns the number of fields in a struct type, or 0 for other types.
+    pub fn count_struct_fields(&self) -> u32 {
+        if self.kind() != TypeKind::Struct {
+            return 0;
+        }
+        unsafe { LLVMCountStructElementTypes(self.0) }
     }
 }
 
@@ -1164,6 +1273,18 @@ impl Instruction {
                 }
             }
             res
+        }
+    }
+
+    /// Returns the source element type of a `getelementptr` instruction.
+    ///
+    /// For `getelementptr T, ptr %p, ...`, this returns `T` — the type that
+    /// the pointer is declared to point to, which drives the offset calculation
+    /// for each subsequent GEP index.  Returns `None` for non-GEP instructions.
+    pub fn get_gep_source_element_type(&self) -> Option<Type> {
+        unsafe {
+            let ty = LLVMGetGEPSourceElementType(self.0);
+            if ty.is_null() { None } else { Some(Type(ty)) }
         }
     }
 
