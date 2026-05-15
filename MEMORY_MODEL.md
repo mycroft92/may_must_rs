@@ -111,7 +111,7 @@ tracks stack allocas.  Heap objects need different treatment because:
 ### Proposed model
 
 **Call-site regions.** Each `malloc` / `new` call site is treated as a distinct
-named region `heap$N` (N = stable per-call-site id):
+named region `heap$callC` (C = stable per-call-site id):
 
 ```
 %p = call i8* @malloc(...)   →  heap$call42
@@ -121,9 +121,32 @@ named region `heap$N` (N = stable per-call-site id):
 All runtime objects allocated at the same call site share one abstract region
 (standard allocation-site abstraction — sound when results don't cross-alias).
 
+**Per-field heap struct regions.** When a `malloc` result is cast to a struct
+pointer type and accessed via `StructFieldGep`, the existing field-sensitive
+machinery creates dedicated sub-regions automatically — no special-casing is
+needed:
+
+```
+%raw = call i8* @malloc(sizeof(Foo))     →  pts(%raw) = { heap$call42 }
+%p   = bitcast i8* %raw to Foo*          →  pts(%p)   = { heap$call42 }
+%fp0 = gep Foo* %p, 0, 0  (StructFieldGep, field 0)
+                                         →  pts(%fp0) = { heap$call42$f0 }
+%fp1 = gep Foo* %p, 0, 1  (StructFieldGep, field 1)
+                                         →  pts(%fp1) = { heap$call42$f1 }
+store i32 42, %fp0  →  MemoryStore { region: heap$call42$f0, offset: 0, value: 42 }
+store i32  7, %fp1  →  MemoryStore { region: heap$call42$f1, offset: 0, value:  7 }
+```
+
+Each heap struct field gets its own SMT array — the same precision as stack
+struct fields (Step 2), requiring no array-theory reasoning to separate fields.
+The alias analysis (Step 4 prerequisite, see `ALIAS_ANALYSIS.md`) propagates
+these `$fN` subscripts through the points-to sets so that field-level havocing
+is precise even for heap objects.
+
 **Pointer tracking.** `PointerEnv` is extended to map heap pointer SSA values
-to `(heap$N, offset)` pairs using the same machinery as stack pointers.  GEP
-offsets use the same `lower_gep` logic (Steps 1–2 apply).
+to `(heap$callC, offset)` or `(heap$callC$fN, 0)` pairs using the same
+machinery as stack pointers.  GEP offsets use the same `lower_gep` logic
+(Steps 1–2 apply).
 
 **Aliasing over-approximation.** A `PointerStore` whose region cannot be
 resolved havoces all heap regions — sound but may produce `UNKNOWN` for
@@ -152,7 +175,7 @@ reachable-state formula begins with `True` for heap.
 | Concept           | Stack (done)            | Heap (planned)            |
 |-------------------|-------------------------|---------------------------|
 | Region source     | `alloca` instruction    | `malloc`/`new` call site  |
-| Region name       | `fn$stackN`, `fn$stackN$fM` | `heap$callN`          |
+| Region name       | `fn$stackN`, `fn$stackN$fM` | `heap$callC`, `heap$callC$fM` |
 | Aliasing          | distinct by default     | call-site abstraction     |
 | Unknown store     | havoces one region      | havoces all heap regions  |
 | Deallocation      | end of scope (implicit) | `free` havoces region     |
