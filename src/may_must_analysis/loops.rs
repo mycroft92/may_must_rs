@@ -521,6 +521,10 @@ fn normalize_term_with_defs(term: &Term, defs: &BTreeMap<String, AssignValue>) -
             normalize_term_with_defs(lhs, defs),
             normalize_term_with_defs(rhs, defs),
         ),
+        Term::Rem(lhs, rhs) => Term::rem(
+            normalize_term_with_defs(lhs, defs),
+            normalize_term_with_defs(rhs, defs),
+        ),
         Term::Neg(inner) => Term::neg(normalize_term_with_defs(inner, defs)),
     }
 }
@@ -551,9 +555,11 @@ fn term_mentions_var(term: &Term, name: &str) -> bool {
         Term::Int(_) | Term::Real(_) => false,
         Term::BoolToInt(inner) => formula_mentions_var(inner, name),
         Term::Select(_, index) => term_mentions_var(index, name),
-        Term::Add(lhs, rhs) | Term::Sub(lhs, rhs) | Term::Mul(lhs, rhs) | Term::Div(lhs, rhs) => {
-            term_mentions_var(lhs, name) || term_mentions_var(rhs, name)
-        }
+        Term::Add(lhs, rhs)
+        | Term::Sub(lhs, rhs)
+        | Term::Mul(lhs, rhs)
+        | Term::Div(lhs, rhs)
+        | Term::Rem(lhs, rhs) => term_mentions_var(lhs, name) || term_mentions_var(rhs, name),
         Term::Neg(inner) => term_mentions_var(inner, name),
     }
 }
@@ -595,7 +601,11 @@ fn collect_int_constants_term(term: &Term, out: &mut Vec<i64>) {
         Term::Var(_) | Term::Real(_) => {}
         Term::BoolToInt(inner) => collect_int_constants_formula(inner, out),
         Term::Select(_, index) => collect_int_constants_term(index, out),
-        Term::Add(lhs, rhs) | Term::Sub(lhs, rhs) | Term::Mul(lhs, rhs) | Term::Div(lhs, rhs) => {
+        Term::Add(lhs, rhs)
+        | Term::Sub(lhs, rhs)
+        | Term::Mul(lhs, rhs)
+        | Term::Div(lhs, rhs)
+        | Term::Rem(lhs, rhs) => {
             collect_int_constants_term(lhs, out);
             collect_int_constants_term(rhs, out);
         }

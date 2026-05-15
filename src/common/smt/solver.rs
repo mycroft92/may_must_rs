@@ -238,6 +238,22 @@ impl SmtScope {
                     right: Sort::Int,
                 }),
             },
+            Term::Rem(lhs, rhs) => match (self.lower_term(lhs)?, self.lower_term(rhs)?) {
+                (EncodedTerm::Int(lhs), EncodedTerm::Int(rhs)) => {
+                    Ok(EncodedTerm::Int(lhs.rem(&rhs)))
+                }
+                (EncodedTerm::Int(_), EncodedTerm::Real(_)) => Err(FormulaError::MixedSorts {
+                    left: Sort::Int,
+                    right: Sort::Real,
+                }),
+                (EncodedTerm::Real(_), EncodedTerm::Int(_)) => Err(FormulaError::MixedSorts {
+                    left: Sort::Real,
+                    right: Sort::Int,
+                }),
+                (EncodedTerm::Real(_), EncodedTerm::Real(_)) => {
+                    Err(FormulaError::ExpectedIntegerSort { found: Sort::Real })
+                }
+            },
             Term::Neg(inner) => match self.lower_term(inner)? {
                 EncodedTerm::Int(value) => Ok(EncodedTerm::Int(-value)),
                 EncodedTerm::Real(value) => Ok(EncodedTerm::Real(-value)),

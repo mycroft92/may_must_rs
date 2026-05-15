@@ -4,7 +4,7 @@ use crate::common::abstract_cfg::{
     AbstractCfg, AssignValue, CallMemoryEffect, CfgEdgeId, CfgNodeId, PointerEnv, SourceLocation,
     TransferEffect, TransferFn,
 };
-use crate::common::formula::{Formula, Rational, Sort, Term, Var};
+use crate::common::formula::{Formula, Memory, Rational, Sort, Term, Var};
 use crate::common::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TypeKind};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use std::cell::Cell;
@@ -130,7 +130,6 @@ pub fn adapt_with_purity_and_summaries(
         start,
         memory_pure,
         &allocation_regions,
-        summaries,
     )?);
     let mut instruction_nodes = HashMap::new();
     instruction_nodes.insert(start, cfg.entry());
@@ -144,7 +143,6 @@ pub fn adapt_with_purity_and_summaries(
             *instruction,
             memory_pure,
             &allocation_regions,
-            summaries,
         )?;
         let node_id = cfg.add_node(instruction.print(), transfer);
         instruction_nodes.insert(*instruction, node_id);
@@ -184,7 +182,22 @@ pub fn adapt_with_purity_and_summaries(
     let assertions = lower_assertions(function_name, graph, &mut cfg, &instruction_nodes)?;
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-    resolve_memory_effects(&mut cfg);
+    let final_env = resolve_memory_effects(&mut cfg, graph, function_name);
+    apply_pending_return_summaries(
+        &mut cfg,
+        graph,
+        &instruction_nodes,
+        function_name,
+        summaries,
+        &final_env,
+    )?;
+    apply_pending_memcpy_effects(
+        &mut cfg,
+        graph,
+        &instruction_nodes,
+        function_name,
+        &final_env,
+    )?;
 
     Ok(AdaptedProcedure {
         name: graph.name.clone(),
@@ -363,7 +376,20 @@ fn sort_of_instruction_value(instruction: Instruction) -> Result<Sort, AdapterEr
     }
 }
 
+fn is_pointer_value(value: Instruction) -> bool {
+    matches!(
+        value.get_type().map(|ty| ty.kind()),
+        Some(TypeKind::Pointer)
+    )
+}
+
 fn lower_numeric_value(function_name: &str, value: Instruction) -> Result<Term, AdapterError> {
+    if is_pointer_value(value) {
+        if value.as_constant_int() == Some(0) || value.print().contains("null") {
+            return Ok(Term::int(0));
+        }
+        return Ok(Term::var(local_name(function_name, value), Sort::Int));
+    }
     if let Some(constant) = value.as_constant_int() {
         return Ok(Term::int(constant));
     }
@@ -425,7 +451,6 @@ fn lower_node_transfer(
     instruction: Instruction,
     memory_pure: &BTreeSet<String>,
     allocation_regions: &HashMap<Instruction, String>,
-    summaries: &CallSummaryRegistry,
 ) -> Result<TransferFn, AdapterError> {
     let mut effects = Vec::<TransferEffect>::new();
 
@@ -435,6 +460,8 @@ fn lower_node_transfer(
         | InstructionOpcode::Mul
         | InstructionOpcode::SDiv
         | InstructionOpcode::UDiv
+        | InstructionOpcode::SRem
+        | InstructionOpcode::URem
         | InstructionOpcode::FAdd
         | InstructionOpcode::FSub
         | InstructionOpcode::FMul
@@ -459,6 +486,7 @@ fn lower_node_transfer(
                 InstructionOpcode::SDiv | InstructionOpcode::UDiv | InstructionOpcode::FDiv => {
                     Term::div(lhs, rhs)
                 }
+                InstructionOpcode::SRem | InstructionOpcode::URem => Term::rem(lhs, rhs),
                 _ => unreachable!(),
             };
             effects.push(TransferEffect::Assign {
@@ -504,6 +532,10 @@ fn lower_node_transfer(
             });
         }
         InstructionOpcode::And | InstructionOpcode::Or | InstructionOpcode::Xor => {
+            let result_sort = sort_of_instruction_value(instruction)?;
+            if result_sort != Sort::Bool {
+                return Ok(TransferFn::new(effects));
+            }
             let target = assigned_var(function_name, instruction)?;
             let lhs = lower_bool_value(
                 function_name,
@@ -637,11 +669,6 @@ fn lower_node_transfer(
                     callee: callee.clone(),
                     memory_effect,
                 });
-                if let Some(obligation) =
-                    summary_assume_for_call(function_name, instruction, &callee, summaries)?
-                {
-                    effects.push(obligation);
-                }
             }
         }
         InstructionOpcode::FNeg => {
@@ -667,9 +694,17 @@ fn lower_node_transfer(
         | InstructionOpcode::SIToFP
         | InstructionOpcode::UIToFP
         | InstructionOpcode::FPToSI
-        | InstructionOpcode::FPToUI
-        | InstructionOpcode::BitCast
-        | InstructionOpcode::AddrSpaceCast => {}
+        | InstructionOpcode::FPToUI => {}
+        InstructionOpcode::BitCast | InstructionOpcode::AddrSpaceCast => {
+            if is_pointer_value(instruction) {
+                if let Some(op) = instruction.get_operand(0) {
+                    effects.push(TransferEffect::PointerAlias {
+                        target: local_name(function_name, instruction),
+                        source: pointer_name(function_name, op),
+                    });
+                }
+            }
+        }
         InstructionOpcode::Switch | InstructionOpcode::IndirectBr => {}
         InstructionOpcode::Invoke => {
             return Err(AdapterError::UnsupportedInstruction(instruction.print()));
@@ -829,12 +864,41 @@ fn assertion_location(site: &crate::common::llvm_utils::program_graph::AssertSit
     }
 }
 
-fn resolve_memory_effects(cfg: &mut AbstractCfg) {
+fn resolve_memory_effects(
+    cfg: &mut AbstractCfg,
+    graph: &FunctionGraph,
+    function_name: &str,
+) -> PointerEnv {
+    let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
     let order = cfg
-        .topological_order()
+        .topological_order_excluding(&excluded)
         .unwrap_or_else(|| cfg.node_ids().collect::<Vec<_>>());
 
     let mut env = PointerEnv::default();
+    for &param_index in &graph.pointer_param_indices {
+        if let Some(param_name) = graph.params.get(param_index) {
+            env.bind(
+                format!("{function_name}${param_name}"),
+                ext_region_name(function_name, param_index),
+                Term::int(0),
+            );
+        }
+    }
+
+    for instruction in &graph.vertices {
+        for operand_idx in 0..instruction.get_operand_count() {
+            if let Some(op) = instruction.get_operand(operand_idx) {
+                if op.is_global_variable_ref() && is_pointer_value(op) {
+                    let ptr_name = local_name(function_name, op);
+                    if env.get(&ptr_name).is_none() {
+                        let region = format!("global${}", op.display_name());
+                        env.bind(ptr_name, region, Term::int(0));
+                    }
+                }
+            }
+        }
+    }
+
     for node_id in order {
         let effects = match cfg.node_mut(node_id) {
             Ok(node) => std::mem::take(&mut node.transfer.effects),
@@ -883,7 +947,7 @@ fn resolve_memory_effects(cfg: &mut AbstractCfg) {
                             rewritten.push(TransferEffect::Assign {
                                 target,
                                 value: AssignValue::Term(Term::select(
-                                    crate::common::formula::Memory::var(&binding.region),
+                                    Memory::var(&binding.region),
                                     binding.offset.clone(),
                                 )),
                             });
@@ -934,6 +998,12 @@ fn resolve_memory_effects(cfg: &mut AbstractCfg) {
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
+                TransferEffect::PointerAlias { target, source } => {
+                    if let Some(binding) = env.get(&source).cloned() {
+                        env.bind(target.clone(), binding.region, binding.offset);
+                    }
+                    rewritten.push(TransferEffect::Nop);
+                }
                 other => rewritten.push(other),
             }
         }
@@ -942,6 +1012,8 @@ fn resolve_memory_effects(cfg: &mut AbstractCfg) {
             node.transfer.effects = rewritten;
         }
     }
+
+    env
 }
 
 fn scalar_memory_slot_var(region: &str, offset: &Term, sort: Sort) -> Option<Var> {
@@ -951,43 +1023,160 @@ fn scalar_memory_slot_var(region: &str, offset: &Term, sort: Sort) -> Option<Var
     }
 }
 
-fn summary_assume_for_call(
-    caller: &str,
-    instruction: Instruction,
-    callee: &str,
+fn apply_pending_return_summaries(
+    cfg: &mut AbstractCfg,
+    graph: &FunctionGraph,
+    instruction_nodes: &HashMap<Instruction, CfgNodeId>,
+    function_name: &str,
     summaries: &CallSummaryRegistry,
-) -> Result<Option<TransferEffect>, AdapterError> {
-    let Some(summary) = summaries.get(callee).cloned() else {
-        return Ok(None);
-    };
-
-    let mut mapping = BTreeMap::<String, String>::new();
-    let actual_args = instruction.get_call_args();
-    for (formal, actual) in summary.formal_parameters.iter().zip(actual_args.iter()) {
-        if actual.as_constant_int().is_some() {
+    final_env: &PointerEnv,
+) -> Result<(), AdapterError> {
+    for instruction in &graph.vertices {
+        if instruction.get_opcode() != InstructionOpcode::Call {
             continue;
         }
-        mapping.insert(formal.clone(), local_name(caller, *actual));
-    }
-    mapping.insert(summary.retval_name.clone(), local_name(caller, instruction));
+        let Some(callee) = instruction.get_called_function() else {
+            continue;
+        };
+        let Some(summary) = summaries.get(&callee) else {
+            continue;
+        };
+        let Some(&node_id) = instruction_nodes.get(instruction) else {
+            continue;
+        };
 
-    let call_site_id = summaries.next_call_site_id();
-    let local_prefix = format!("{caller}$call{call_site_id}");
-    let renamed = rename_callee_vars(
-        &summary.relation,
-        &mapping,
-        &summary.function,
-        &local_prefix,
-    );
+        let actual_args = instruction.get_call_args();
+        let call_site_id = summaries.next_call_site_id();
+        let local_prefix = format!("{function_name}$call{call_site_id}");
+        let mut mapping = BTreeMap::<String, String>::new();
+        for (formal, actual) in summary.formal_parameters.iter().zip(actual_args.iter()) {
+            if actual.as_constant_int().is_none() {
+                mapping.insert(formal.clone(), local_name(function_name, *actual));
+            }
+        }
+        mapping.insert(
+            summary.retval_name.clone(),
+            local_name(function_name, *instruction),
+        );
 
-    let mut substituted = renamed;
-    for (formal, actual) in summary.formal_parameters.iter().zip(actual_args.iter()) {
-        if let Some(constant) = actual.as_constant_int() {
-            substituted = substitute_var_name_with_term(&substituted, formal, &Term::int(constant));
+        let renamed = rename_callee_vars(&summary.relation, &mapping, &callee, &local_prefix);
+
+        let mut region_map = BTreeMap::<String, (String, Term)>::new();
+        for (param_idx, actual) in actual_args.iter().enumerate() {
+            if !is_pointer_value(*actual) {
+                continue;
+            }
+            let ptr_name = pointer_name(function_name, *actual);
+            if let Some(binding) = final_env.get(&ptr_name) {
+                let callee_prefix = format!("{callee}$");
+                let ext_key = ext_region_name(&callee, param_idx);
+                let renamed_key = if let Some(suffix) = ext_key.strip_prefix(&callee_prefix) {
+                    format!("{local_prefix}${suffix}")
+                } else {
+                    ext_key
+                };
+                region_map.insert(
+                    renamed_key,
+                    (binding.region.clone(), binding.offset.clone()),
+                );
+            }
+        }
+        let rewritten = substitute_ext_regions(&renamed, &region_map);
+        let mut substituted = rewritten;
+        for (formal, actual) in summary.formal_parameters.iter().zip(actual_args.iter()) {
+            if let Some(constant) = actual.as_constant_int() {
+                substituted =
+                    substitute_var_name_with_term(&substituted, formal, &Term::int(constant));
+            }
+        }
+        if let Ok(node) = cfg.node_mut(node_id) {
+            node.transfer
+                .effects
+                .push(TransferEffect::Obligation(substituted));
         }
     }
+    Ok(())
+}
 
-    Ok(Some(TransferEffect::Obligation(substituted)))
+fn apply_pending_memcpy_effects(
+    cfg: &mut AbstractCfg,
+    graph: &FunctionGraph,
+    instruction_nodes: &HashMap<Instruction, CfgNodeId>,
+    function_name: &str,
+    final_env: &PointerEnv,
+) -> Result<(), AdapterError> {
+    for instruction in &graph.vertices {
+        let Some(callee) = instruction.get_called_function() else {
+            continue;
+        };
+        let is_memcpy = callee.starts_with("llvm.memcpy") || callee.starts_with("llvm.memmove");
+        let is_memset = callee.starts_with("llvm.memset");
+        if !is_memcpy && !is_memset {
+            continue;
+        }
+        let Some(&node_id) = instruction_nodes.get(instruction) else {
+            continue;
+        };
+        let args = instruction.get_call_args();
+        let Some(dst_arg) = args.first().copied() else {
+            continue;
+        };
+        let dst_ptr = pointer_name(function_name, dst_arg);
+        let Some(dst_binding) = final_env.get(&dst_ptr).cloned() else {
+            continue;
+        };
+
+        let mut emitted = Vec::new();
+        if is_memcpy {
+            let Some(src_arg) = args.get(1).copied() else {
+                continue;
+            };
+            if let Some(values) = src_arg.constant_int_elements() {
+                for (index, value) in values.into_iter().enumerate() {
+                    emitted.push(TransferEffect::MemoryStore {
+                        region: dst_binding.region.clone(),
+                        offset: Term::add(dst_binding.offset.clone(), Term::int(index as i64)),
+                        value: Term::int(value),
+                    });
+                }
+            } else if let Some(len) = args.get(2).and_then(|arg| arg.as_constant_int()) {
+                let src_ptr = pointer_name(function_name, src_arg);
+                if let Some(src_binding) = final_env.get(&src_ptr).cloned() {
+                    for index in 0..len {
+                        let rel = Term::int(index);
+                        emitted.push(TransferEffect::MemoryStore {
+                            region: dst_binding.region.clone(),
+                            offset: Term::add(dst_binding.offset.clone(), rel.clone()),
+                            value: Term::select(
+                                Memory::var(src_binding.region.clone()),
+                                Term::add(src_binding.offset.clone(), rel),
+                            ),
+                        });
+                    }
+                }
+            }
+        } else if let (Some(fill), Some(len)) = (
+            args.get(1).and_then(|arg| arg.as_constant_int()),
+            args.get(2).and_then(|arg| arg.as_constant_int()),
+        ) {
+            for index in 0..len {
+                emitted.push(TransferEffect::MemoryStore {
+                    region: dst_binding.region.clone(),
+                    offset: Term::add(dst_binding.offset.clone(), Term::int(index)),
+                    value: Term::int(fill),
+                });
+            }
+        }
+
+        if !emitted.is_empty() {
+            cfg.node_mut(node_id)
+                .map_err(|error| AdapterError::Cfg(error.to_string()))?
+                .transfer
+                .effects
+                .extend(emitted);
+        }
+    }
+    Ok(())
 }
 
 fn rename_callee_vars(
@@ -1082,6 +1271,10 @@ pub fn rename_vars_in_term(term: &Term, rename: impl Fn(&str) -> String + Copy) 
             rename_vars_in_term(rhs, rename),
         ),
         Term::Div(lhs, rhs) => Term::div(
+            rename_vars_in_term(lhs, rename),
+            rename_vars_in_term(rhs, rename),
+        ),
+        Term::Rem(lhs, rhs) => Term::rem(
             rename_vars_in_term(lhs, rename),
             rename_vars_in_term(rhs, rename),
         ),
@@ -1185,6 +1378,10 @@ fn substitute_var_name_with_term_term(term: &Term, name: &str, replacement: &Ter
             substitute_var_name_with_term_term(lhs, name, replacement),
             substitute_var_name_with_term_term(rhs, name, replacement),
         ),
+        Term::Rem(lhs, rhs) => Term::rem(
+            substitute_var_name_with_term_term(lhs, name, replacement),
+            substitute_var_name_with_term_term(rhs, name, replacement),
+        ),
         Term::Neg(inner) => Term::neg(substitute_var_name_with_term_term(inner, name, replacement)),
     }
 }
@@ -1205,6 +1402,121 @@ fn substitute_var_name_with_term_memory(
                 substitute_var_name_with_term_term(value, name, replacement),
             )
         }
+    }
+}
+
+fn substitute_ext_regions(
+    formula: &Formula,
+    region_map: &BTreeMap<String, (String, Term)>,
+) -> Formula {
+    match formula {
+        Formula::True => Formula::True,
+        Formula::False => Formula::False,
+        Formula::Var(var) => Formula::Var(var.clone()),
+        Formula::Not(inner) => Formula::not(substitute_ext_regions(inner, region_map)),
+        Formula::And(items) => Formula::and_many(
+            items
+                .iter()
+                .map(|item| substitute_ext_regions(item, region_map)),
+        ),
+        Formula::Or(items) => Formula::or_many(
+            items
+                .iter()
+                .map(|item| substitute_ext_regions(item, region_map)),
+        ),
+        Formula::Implies(lhs, rhs) => Formula::implies(
+            substitute_ext_regions(lhs, region_map),
+            substitute_ext_regions(rhs, region_map),
+        ),
+        Formula::Eq(lhs, rhs) => Formula::eq(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(
+            substitute_ext_regions_memory(lhs, region_map),
+            substitute_ext_regions_memory(rhs, region_map),
+        ),
+        Formula::Lt(lhs, rhs) => Formula::lt(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Formula::Le(lhs, rhs) => Formula::le(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Formula::Gt(lhs, rhs) => Formula::gt(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Formula::Ge(lhs, rhs) => Formula::ge(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+    }
+}
+
+fn substitute_ext_regions_term(term: &Term, region_map: &BTreeMap<String, (String, Term)>) -> Term {
+    match term {
+        Term::Var(var) => Term::Var(var.clone()),
+        Term::Int(value) => Term::Int(*value),
+        Term::Real(value) => Term::Real(*value),
+        Term::BoolToInt(value) => Term::bool_to_int(substitute_ext_regions(value, region_map)),
+        Term::Select(memory, index) => {
+            let rewritten_index = substitute_ext_regions_term(index, region_map);
+            if let Memory::Var(name) = memory.as_ref() {
+                if let Some((actual_region, base)) = region_map.get(name) {
+                    return Term::select(
+                        Memory::var(actual_region.clone()),
+                        Term::add(base.clone(), rewritten_index),
+                    );
+                }
+            }
+            Term::select(
+                substitute_ext_regions_memory(memory, region_map),
+                rewritten_index,
+            )
+        }
+        Term::Add(lhs, rhs) => Term::add(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Term::Sub(lhs, rhs) => Term::sub(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Term::Mul(lhs, rhs) => Term::mul(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Term::Div(lhs, rhs) => Term::div(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Term::Rem(lhs, rhs) => Term::rem(
+            substitute_ext_regions_term(lhs, region_map),
+            substitute_ext_regions_term(rhs, region_map),
+        ),
+        Term::Neg(inner) => Term::neg(substitute_ext_regions_term(inner, region_map)),
+    }
+}
+
+fn substitute_ext_regions_memory(
+    memory: &Memory,
+    region_map: &BTreeMap<String, (String, Term)>,
+) -> Memory {
+    match memory {
+        Memory::Var(name) => {
+            if let Some((actual_region, _)) = region_map.get(name) {
+                Memory::var(actual_region.clone())
+            } else {
+                Memory::var(name)
+            }
+        }
+        Memory::Store(inner, index, value) => Memory::store(
+            substitute_ext_regions_memory(inner, region_map),
+            substitute_ext_regions_term(index, region_map),
+            substitute_ext_regions_term(value, region_map),
+        ),
     }
 }
 
@@ -1238,9 +1550,11 @@ fn term_contains_var(term: &Term, name: &str) -> bool {
         Term::Select(memory, index) => {
             memory_contains_var(memory, name) || term_contains_var(index, name)
         }
-        Term::Add(lhs, rhs) | Term::Sub(lhs, rhs) | Term::Mul(lhs, rhs) | Term::Div(lhs, rhs) => {
-            term_contains_var(lhs, name) || term_contains_var(rhs, name)
-        }
+        Term::Add(lhs, rhs)
+        | Term::Sub(lhs, rhs)
+        | Term::Mul(lhs, rhs)
+        | Term::Div(lhs, rhs)
+        | Term::Rem(lhs, rhs) => term_contains_var(lhs, name) || term_contains_var(rhs, name),
         Term::Neg(inner) => term_contains_var(inner, name),
     }
 }

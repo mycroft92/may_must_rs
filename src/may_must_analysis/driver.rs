@@ -356,6 +356,8 @@ mod tests {
     use crate::common::llvm_utils::llvm_wrap::{initialize_target, Context};
     use crate::common::llvm_utils::program_graph::generate_program_graph;
     use crate::may_must_analysis::providers::ManualProvider;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     fn with_graphs(ir: &str, check: impl FnOnce(&[FunctionGraph])) {
         initialize_target();
@@ -363,6 +365,52 @@ mod tests {
         let module = context.parse_ir_str(ir, "test").unwrap();
         let graphs = generate_program_graph(&module).unwrap();
         check(&graphs);
+    }
+
+    fn compile_fixture(stem: &str) -> PathBuf {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = repo_root.join("tests").join(format!("{stem}.c"));
+        let status = Command::new("sh")
+            .arg("tests/build_ir.sh")
+            .arg(&source)
+            .current_dir(repo_root)
+            .status()
+            .expect("run tests/build_ir.sh");
+        assert!(
+            status.success(),
+            "failed to compile fixture {}",
+            source.display()
+        );
+        repo_root.join("tests/out").join(format!("{stem}.bc"))
+    }
+
+    fn with_bc_graphs(stem: &str, check: impl FnOnce(&[FunctionGraph])) {
+        initialize_target();
+        let fixture = compile_fixture(stem);
+        let context = Context::new();
+        let module = context
+            .parse_bc_file(fixture.to_str().expect("fixture path utf-8"))
+            .unwrap();
+        let graphs = generate_program_graph(&module).unwrap();
+        check(&graphs);
+    }
+
+    fn procedure<'a>(report: &'a ModuleReport, name: &str) -> &'a ProcedureReport {
+        report
+            .reports
+            .iter()
+            .find(|procedure| procedure.procedure == name)
+            .unwrap_or_else(|| panic!("missing procedure report for {name}"))
+    }
+
+    fn assert_all_verified(report: &ProcedureReport, expected_assertions: usize) {
+        assert_eq!(report.assertions.len(), expected_assertions);
+        assert_eq!(report.verdict(), SafetyVerdict::Safe);
+        assert!(report.failures.is_empty());
+        assert!(report
+            .assertions
+            .iter()
+            .all(|assertion| matches!(assertion.judgement, Judgement::Verified)));
     }
 
     #[test]
@@ -560,5 +608,49 @@ mod tests {
                     .any(|(_, invariant)| invariant.to_string().contains(">= 0")));
             },
         );
+    }
+
+    #[test]
+    fn array_max_callee_verified_with_return_summary() {
+        with_bc_graphs("array_max_callee", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "main"), 5);
+            assert!(report
+                .computed_summaries
+                .iter()
+                .any(|summary| summary.function == "find_max"));
+        });
+    }
+
+    #[test]
+    fn global_int_store_then_assert_verified() {
+        with_bc_graphs("global_int", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "test"), 1);
+        });
+    }
+
+    #[test]
+    fn array_init_verified_after_memcpy_modeling() {
+        with_bc_graphs("array_init", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "main"), 3);
+        });
+    }
+
+    #[test]
+    fn array_max_offset_verified_with_nonzero_base_offset() {
+        with_bc_graphs("array_max_offset", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "main"), 3);
+        });
     }
 }

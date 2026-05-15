@@ -98,6 +98,10 @@ pub enum TransferEffect {
         target_ptr: String,
         source_slot: String,
     },
+    PointerAlias {
+        target: String,
+        source: String,
+    },
     Assume(Formula),
     Obligation(Formula),
     Nop,
@@ -566,6 +570,7 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
         | TransferEffect::GetElementPtr { .. }
         | TransferEffect::PointerStore { .. }
         | TransferEffect::PointerLoad { .. }
+        | TransferEffect::PointerAlias { .. }
         | TransferEffect::Call { .. }
         | TransferEffect::Load { .. }
         | TransferEffect::Store { .. } => post.clone(),
@@ -596,6 +601,7 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
         | TransferEffect::GetElementPtr { .. }
         | TransferEffect::PointerStore { .. }
         | TransferEffect::PointerLoad { .. }
+        | TransferEffect::PointerAlias { .. }
         | TransferEffect::Load { .. }
         | TransferEffect::Store { .. }
         | TransferEffect::MemoryStore { .. }
@@ -692,6 +698,10 @@ pub fn substitute_var_in_term(target: &Var, replacement: &Term, term: &Term) -> 
             substitute_var_in_term(target, replacement, rhs),
         ),
         Term::Div(lhs, rhs) => Term::div(
+            substitute_var_in_term(target, replacement, lhs),
+            substitute_var_in_term(target, replacement, rhs),
+        ),
+        Term::Rem(lhs, rhs) => Term::rem(
             substitute_var_in_term(target, replacement, lhs),
             substitute_var_in_term(target, replacement, rhs),
         ),
@@ -824,6 +834,10 @@ pub fn substitute_memory_var_in_term(region: &str, replacement: &Memory, term: &
             substitute_memory_var_in_term(region, replacement, rhs),
         ),
         Term::Div(lhs, rhs) => Term::div(
+            substitute_memory_var_in_term(region, replacement, lhs),
+            substitute_memory_var_in_term(region, replacement, rhs),
+        ),
+        Term::Rem(lhs, rhs) => Term::rem(
             substitute_memory_var_in_term(region, replacement, lhs),
             substitute_memory_var_in_term(region, replacement, rhs),
         ),

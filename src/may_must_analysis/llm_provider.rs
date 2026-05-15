@@ -341,7 +341,11 @@ fn collect_term_var_sorts(term: &Term, vars: &mut BTreeMap<String, Sort>) {
         Term::Int(_) | Term::Real(_) => {}
         Term::BoolToInt(inner) => collect_formula_var_sorts_rec(inner, vars),
         Term::Select(_, index) => collect_term_var_sorts(index, vars),
-        Term::Add(lhs, rhs) | Term::Sub(lhs, rhs) | Term::Mul(lhs, rhs) | Term::Div(lhs, rhs) => {
+        Term::Add(lhs, rhs)
+        | Term::Sub(lhs, rhs)
+        | Term::Mul(lhs, rhs)
+        | Term::Div(lhs, rhs)
+        | Term::Rem(lhs, rhs) => {
             collect_term_var_sorts(lhs, vars);
             collect_term_var_sorts(rhs, vars);
         }

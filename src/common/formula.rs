@@ -203,6 +203,7 @@ pub enum Term {
     Sub(Box<Term>, Box<Term>),
     Mul(Box<Term>, Box<Term>),
     Div(Box<Term>, Box<Term>),
+    Rem(Box<Term>, Box<Term>),
     Neg(Box<Term>),
 }
 
@@ -243,6 +244,10 @@ impl Term {
         Term::Div(Box::new(lhs), Box::new(rhs))
     }
 
+    pub fn rem(lhs: Term, rhs: Term) -> Self {
+        Term::Rem(Box::new(lhs), Box::new(rhs))
+    }
+
     pub fn neg(inner: Term) -> Self {
         Term::Neg(Box::new(inner))
     }
@@ -266,7 +271,8 @@ impl Term {
             Term::Add(lhs, rhs)
             | Term::Sub(lhs, rhs)
             | Term::Mul(lhs, rhs)
-            | Term::Div(lhs, rhs) => {
+            | Term::Div(lhs, rhs)
+            | Term::Rem(lhs, rhs) => {
                 let lhs_sort = lhs.sort()?;
                 let rhs_sort = rhs.sort()?;
                 if lhs_sort != rhs_sort {
@@ -303,6 +309,7 @@ impl fmt::Display for Term {
             Term::Sub(lhs, rhs) => write!(f, "({lhs} - {rhs})"),
             Term::Mul(lhs, rhs) => write!(f, "({lhs} * {rhs})"),
             Term::Div(lhs, rhs) => write!(f, "({lhs} / {rhs})"),
+            Term::Rem(lhs, rhs) => write!(f, "({lhs} % {rhs})"),
             Term::Neg(inner) => write!(f, "(-{inner})"),
         }
     }
@@ -667,6 +674,10 @@ fn substitute_term_vars(term: &Term, mapping: &HashMap<Var, Var>) -> Term {
             substitute_term_vars(lhs, mapping),
             substitute_term_vars(rhs, mapping),
         ),
+        Term::Rem(lhs, rhs) => Term::rem(
+            substitute_term_vars(lhs, mapping),
+            substitute_term_vars(rhs, mapping),
+        ),
         Term::Neg(inner) => Term::neg(substitute_term_vars(inner, mapping)),
     }
 }
@@ -729,7 +740,11 @@ fn collect_select_indices_term(term: &Term, indices: &mut Vec<i64>) {
             }
             collect_select_indices_term(index, indices);
         }
-        Term::Add(lhs, rhs) | Term::Sub(lhs, rhs) | Term::Mul(lhs, rhs) | Term::Div(lhs, rhs) => {
+        Term::Add(lhs, rhs)
+        | Term::Sub(lhs, rhs)
+        | Term::Mul(lhs, rhs)
+        | Term::Div(lhs, rhs)
+        | Term::Rem(lhs, rhs) => {
             collect_select_indices_term(lhs, indices);
             collect_select_indices_term(rhs, indices);
         }

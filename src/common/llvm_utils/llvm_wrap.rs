@@ -690,6 +690,51 @@ impl Instruction {
         }
     }
 
+    pub fn is_global_variable_ref(&self) -> bool {
+        unsafe { !LLVMIsAGlobalVariable(self.0).is_null() }
+    }
+
+    pub fn constant_int_elements(&self) -> Option<Vec<i64>> {
+        self.constant_int_elements_inner()
+            .or_else(|| self.get_operand(0)?.constant_int_elements_inner())
+    }
+
+    fn constant_int_elements_inner(&self) -> Option<Vec<i64>> {
+        unsafe {
+            let arr = if !LLVMIsAGlobalVariable(self.0).is_null() {
+                let init = LLVMGetInitializer(self.0);
+                if init.is_null() {
+                    return None;
+                }
+                init
+            } else if !LLVMIsAConstantArray(self.0).is_null()
+                || !LLVMIsAConstantDataArray(self.0).is_null()
+            {
+                self.0
+            } else {
+                return None;
+            };
+            let mut out = Vec::new();
+            let mut index = 0u32;
+            loop {
+                let elem = LLVMGetAggregateElement(arr, index);
+                if elem.is_null() {
+                    break;
+                }
+                if LLVMIsAConstantInt(elem).is_null() {
+                    return None;
+                }
+                out.push(LLVMConstIntGetSExtValue(elem));
+                index += 1;
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+    }
+
     pub fn get_icmp_predicate(&self) -> Option<&'static str> {
         if self.get_opcode() != InstructionOpcode::ICmp {
             return None;

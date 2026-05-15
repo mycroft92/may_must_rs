@@ -12,6 +12,11 @@
 - wire real LLVM debug/source locations into `llvm_wrap.rs` and `adapter.rs` so
   assertion reports point to source coordinates instead of relative instruction
   descriptions
+- struct / aggregate GEP layout:
+  `lower_gep_offset` sums all GEP indices as plain integers, ignoring
+  element sizes and struct field layout. Fix: use `LLVMOffsetOfElement` /
+  `LLVMStoreSizeOfType` to convert GEP indices to correct abstract integer
+  offsets
 - broaden cast/instruction coverage beyond the current integer/boolean subset
 - decide whether `assertions::translation` should become a CLI input path or
   remain a library-only component
