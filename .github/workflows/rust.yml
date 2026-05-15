@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Link against the LLVM shared library instead of individual static libs.
+  # This avoids needing separate packages for every LLVM component (e.g. Polly).
+  LLVM_LINK_LLVM_DYLIB: 1
 
 jobs:
   build-and-test:
