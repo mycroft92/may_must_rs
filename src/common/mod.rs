@@ -2,7 +2,6 @@ pub mod abstract_cfg;
 pub mod adapter;
 pub mod assertions;
 pub mod errors;
-pub mod expressions;
 pub mod formula;
 pub mod llvm_utils;
 pub mod oracle;

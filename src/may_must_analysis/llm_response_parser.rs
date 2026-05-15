@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
+use crate::common::assertions::exp::parse_cmd_line;
 use crate::common::assertions::translation::{translate_assertion, SortSeeds};
-use crate::common::expressions::exp::parse_cmd_line;
 use crate::common::formula::{Formula, Sort};
 use thiserror::Error;
 
