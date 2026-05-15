@@ -5,8 +5,9 @@
 - add real-valued lowering so fixtures like `tests/flow/float_compare.c` are
   analyzed instead of reported as unsupported
 - strengthen cyclic procedure handling:
-  return summaries for looping callees, tighter invariant checking, and better
-  accepted-candidate quality
+  observer-invariant synthesis covers pointer-parameter looping callees; tighter
+  invariant checking and broader callee patterns (non-pointer return values)
+  remain open
 - decide whether the driver should gain best-effort module analysis internally
   instead of relying on the CLI fallback path
 - wire real LLVM debug/source locations into `llvm_wrap.rs` and `adapter.rs` so

@@ -1,17 +1,24 @@
 #![allow(dead_code)]
 
+use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, SourceLocation};
 use crate::common::adapter::{
     adapt, adapt_with_purity_and_summaries, collect_callee_names, compute_return_summary,
-    AdapterError, CallSummaryRegistry, ReturnSummary,
+    ext_region_name, synthetic_retval_name, AdaptedProcedure, AdapterError, AssertionSite,
+    CallSummaryRegistry, ReturnSummary,
 };
+use crate::common::formula::{Formula, Memory, Term, Var};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{
     analyze, analyze_with_tables, discover_loop_invariants, render_result, AssertionResult,
     BackwardError, InvariantConfig,
 };
+use crate::may_must_analysis::loops::{
+    check_loop_invariant_verbose, detect_loops, normalize_candidate, sort_innermost_first,
+    InvariantCheckResult, LoopInfo,
+};
 use crate::may_must_analysis::providers::{CandidateProvider, NoProvider};
-use crate::may_must_analysis::rules::Judgement;
+use crate::may_must_analysis::rules::{Judgement, RuleEngine};
 use crate::may_must_analysis::summaries::{MustSummary, NotMaySummary, SummaryTables};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -156,7 +163,7 @@ pub fn analyze_module_with_llm(
         let snapshot = summaries.clone();
         for graph in graphs {
             if let Ok(adapted) = adapt_with_purity_and_summaries(graph, memory_pure, &snapshot) {
-                if let Some(summary) = compute_return_summary(graph, &adapted) {
+                if let Some(summary) = infer_return_summary(graph, &adapted, oracle) {
                     summaries.insert(summary);
                 }
             }
@@ -304,6 +311,558 @@ pub fn analyze_with_summaries(
     })
 }
 
+fn infer_return_summary(
+    graph: &FunctionGraph,
+    adapted: &AdaptedProcedure,
+    oracle: &Oracle,
+) -> Option<ReturnSummary> {
+    compute_return_summary(graph, adapted)
+        .or_else(|| infer_cyclic_observer_summary(graph, adapted, oracle))
+}
+
+fn infer_cyclic_observer_summary(
+    graph: &FunctionGraph,
+    adapted: &AdaptedProcedure,
+    oracle: &Oracle,
+) -> Option<ReturnSummary> {
+    if adapted.cfg.topological_order().is_some() || graph.pointer_param_indices.is_empty() {
+        return None;
+    }
+
+    let retval_name = synthetic_retval_name(&adapted.name);
+    let mut relations = Vec::new();
+    for &param_index in &graph.pointer_param_indices {
+        let indices = observer_candidate_indices(&adapted.cfg, &adapted.name, param_index);
+        for index in indices {
+            let obligation = Formula::ge(
+                Term::Var(Var::int(retval_name.clone())),
+                Term::select(
+                    Memory::var(ext_region_name(&adapted.name, param_index)),
+                    Term::int(index),
+                ),
+            );
+            let Some(site) = synthetic_exit_assertion(&adapted.cfg, obligation.clone()) else {
+                continue;
+            };
+            let Some(invariants) = observer_summary_invariants(&adapted.cfg, &site, oracle, index)
+            else {
+                continue;
+            };
+            let result = analyze_with_tables(
+                &adapted.cfg,
+                &adapted.name,
+                &site,
+                oracle,
+                &SummaryTables::new(),
+                None,
+                Some(&invariants),
+            )
+            .ok()?;
+            if matches!(result.judgement, Judgement::Verified) {
+                relations.push(obligation);
+            }
+        }
+    }
+
+    if relations.is_empty() {
+        return None;
+    }
+
+    Some(ReturnSummary {
+        function: adapted.name.clone(),
+        formal_parameters: graph
+            .params
+            .iter()
+            .map(|param| format!("{}${param}", adapted.name))
+            .collect(),
+        retval_name,
+        relation: Formula::and_all(relations),
+        write_effects: Vec::new(),
+    })
+}
+
+fn synthetic_exit_assertion(cfg: &AbstractCfg, obligation: Formula) -> Option<AssertionSite> {
+    Some(AssertionSite {
+        id: 0,
+        node: cfg.exit()?,
+        source_location: SourceLocation::default(),
+        location: "summary exit".to_string(),
+        obligation,
+    })
+}
+
+fn observer_candidate_indices(cfg: &AbstractCfg, function: &str, param_index: usize) -> Vec<i64> {
+    let ext_region = ext_region_name(function, param_index);
+    let mut indices = BTreeSet::new();
+    let mut saw_dynamic = false;
+    let mut max_nonnegative_constant = 0i64;
+
+    for node in cfg.nodes().values() {
+        for effect in &node.transfer.effects {
+            collect_observer_indices_effect(
+                effect,
+                &ext_region,
+                &mut indices,
+                &mut saw_dynamic,
+                &mut max_nonnegative_constant,
+            );
+        }
+    }
+    for edge in cfg.edges().values() {
+        collect_observer_indices_formula(
+            &edge.guard,
+            &ext_region,
+            &mut indices,
+            &mut saw_dynamic,
+            &mut max_nonnegative_constant,
+        );
+    }
+
+    if saw_dynamic {
+        for index in 0..=max_nonnegative_constant {
+            indices.insert(index);
+        }
+    }
+    indices.into_iter().collect()
+}
+
+fn collect_observer_indices_effect(
+    effect: &crate::common::abstract_cfg::TransferEffect,
+    ext_region: &str,
+    indices: &mut BTreeSet<i64>,
+    saw_dynamic: &mut bool,
+    max_nonnegative_constant: &mut i64,
+) {
+    use crate::common::abstract_cfg::{AssignValue, TransferEffect};
+
+    match effect {
+        TransferEffect::Assign { value, .. } => match value {
+            AssignValue::Term(term) => collect_observer_indices_term(
+                term,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            ),
+            AssignValue::Predicate(formula) => collect_observer_indices_formula(
+                formula,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            ),
+        },
+        TransferEffect::Assume(formula) | TransferEffect::Obligation(formula) => {
+            collect_observer_indices_formula(
+                formula,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+        TransferEffect::Store { value, .. } | TransferEffect::MemoryStore { value, .. } => {
+            collect_observer_indices_term(
+                value,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+        TransferEffect::GetElementPtr { offset, .. } => collect_observer_indices_term(
+            offset,
+            ext_region,
+            indices,
+            saw_dynamic,
+            max_nonnegative_constant,
+        ),
+        _ => {}
+    }
+}
+
+fn collect_observer_indices_formula(
+    formula: &Formula,
+    ext_region: &str,
+    indices: &mut BTreeSet<i64>,
+    saw_dynamic: &mut bool,
+    max_nonnegative_constant: &mut i64,
+) {
+    match formula {
+        Formula::True | Formula::False | Formula::Var(_) => {}
+        Formula::Not(inner) => collect_observer_indices_formula(
+            inner,
+            ext_region,
+            indices,
+            saw_dynamic,
+            max_nonnegative_constant,
+        ),
+        Formula::And(items) | Formula::Or(items) => {
+            for item in items {
+                collect_observer_indices_formula(
+                    item,
+                    ext_region,
+                    indices,
+                    saw_dynamic,
+                    max_nonnegative_constant,
+                );
+            }
+        }
+        Formula::Implies(lhs, rhs) => {
+            collect_observer_indices_formula(
+                lhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+            collect_observer_indices_formula(
+                rhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+        Formula::Eq(lhs, rhs)
+        | Formula::Lt(lhs, rhs)
+        | Formula::Le(lhs, rhs)
+        | Formula::Gt(lhs, rhs)
+        | Formula::Ge(lhs, rhs) => {
+            collect_observer_indices_term(
+                lhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+            collect_observer_indices_term(
+                rhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+        Formula::MemoryEq(lhs, rhs) => {
+            collect_observer_indices_memory(
+                lhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+            collect_observer_indices_memory(
+                rhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+    }
+}
+
+fn collect_observer_indices_term(
+    term: &Term,
+    ext_region: &str,
+    indices: &mut BTreeSet<i64>,
+    saw_dynamic: &mut bool,
+    max_nonnegative_constant: &mut i64,
+) {
+    match term {
+        Term::Var(_) => {}
+        Term::Int(value) => {
+            if *value >= 0 {
+                *max_nonnegative_constant = (*max_nonnegative_constant).max(*value);
+            }
+        }
+        Term::Real(_) => {}
+        Term::BoolToInt(inner) => collect_observer_indices_formula(
+            inner,
+            ext_region,
+            indices,
+            saw_dynamic,
+            max_nonnegative_constant,
+        ),
+        Term::Select(memory, index) => {
+            collect_observer_indices_memory(
+                memory,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+            if matches!(memory.as_ref(), Memory::Var(name) if name == ext_region) {
+                if let Some(constant) = const_int_value(index) {
+                    indices.insert(constant);
+                } else {
+                    *saw_dynamic = true;
+                }
+            }
+            collect_observer_indices_term(
+                index,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+        Term::Add(lhs, rhs)
+        | Term::Sub(lhs, rhs)
+        | Term::Mul(lhs, rhs)
+        | Term::Div(lhs, rhs)
+        | Term::Rem(lhs, rhs) => {
+            collect_observer_indices_term(
+                lhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+            collect_observer_indices_term(
+                rhs,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+        Term::Neg(inner) => collect_observer_indices_term(
+            inner,
+            ext_region,
+            indices,
+            saw_dynamic,
+            max_nonnegative_constant,
+        ),
+    }
+}
+
+fn collect_observer_indices_memory(
+    memory: &Memory,
+    ext_region: &str,
+    indices: &mut BTreeSet<i64>,
+    saw_dynamic: &mut bool,
+    max_nonnegative_constant: &mut i64,
+) {
+    match memory {
+        Memory::Var(_) => {}
+        Memory::Store(inner, index, value) => {
+            collect_observer_indices_memory(
+                inner,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+            collect_observer_indices_term(
+                index,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+            collect_observer_indices_term(
+                value,
+                ext_region,
+                indices,
+                saw_dynamic,
+                max_nonnegative_constant,
+            );
+        }
+    }
+}
+
+fn const_int_value(term: &Term) -> Option<i64> {
+    match term {
+        Term::Int(value) => Some(*value),
+        Term::Add(lhs, rhs) => Some(const_int_value(lhs)? + const_int_value(rhs)?),
+        Term::Sub(lhs, rhs) => Some(const_int_value(lhs)? - const_int_value(rhs)?),
+        Term::Neg(inner) => Some(-const_int_value(inner)?),
+        _ => None,
+    }
+}
+
+fn observer_summary_invariants(
+    cfg: &AbstractCfg,
+    site: &AssertionSite,
+    oracle: &Oracle,
+    observed_index: i64,
+) -> Option<Vec<(CfgNodeId, Formula)>> {
+    let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
+    let assertion_postconditions = preliminary_backward_states(cfg, site, &excluded).ok()?;
+    let mut loops = detect_loops(cfg);
+    sort_innermost_first(&mut loops);
+    let mut accepted = Vec::new();
+
+    for loop_info in loops {
+        let header_state = assertion_postconditions.get(&loop_info.header)?;
+        let Some((counter, accumulator, observed)) = extract_counter_acc_obs(header_state) else {
+            return None;
+        };
+        let candidate = Formula::or(
+            Formula::le(counter, Term::int(observed_index)),
+            Formula::ge(accumulator, observed),
+        );
+        // Skip exit closure check: the invariant only needs to be inductive here.
+        // The actual obligation is verified by the analyze_with_tables call in
+        // infer_cyclic_observer_summary, which is the authoritative check.
+        let result = check_loop_invariant_verbose(
+            &loop_info,
+            cfg,
+            &candidate,
+            oracle,
+            &BTreeMap::new(),
+            &accepted,
+        );
+        if result != InvariantCheckResult::Accepted {
+            return None;
+        }
+        accepted.push((
+            loop_info.header,
+            normalize_candidate(cfg, loop_info.header, &candidate),
+        ));
+    }
+    Some(accepted)
+}
+
+fn preliminary_backward_states(
+    cfg: &AbstractCfg,
+    site: &AssertionSite,
+    excluded_back_edges: &BTreeSet<CfgEdgeId>,
+) -> Result<BTreeMap<CfgNodeId, Formula>, BackwardError> {
+    let order = cfg
+        .topological_order_excluding(excluded_back_edges)
+        .ok_or(BackwardError::CyclicCfgUnsupported)?;
+    let mut engine = RuleEngine::new(cfg);
+    engine.init();
+    for edge in excluded_back_edges {
+        engine.block_edge(*edge);
+    }
+
+    let neg_obligation = Formula::not(site.obligation.clone());
+    let pre_at_assertion = cfg
+        .node(site.node)
+        .map_err(|_| crate::may_must_analysis::rules::RuleError::UnknownNode { node: site.node })?
+        .transfer
+        .wp(&neg_obligation);
+    engine.set_state(site.node, pre_at_assertion)?;
+
+    for node in order.iter().rev() {
+        for edge in cfg.incoming_edges(*node) {
+            engine.notmay_pre(edge)?;
+        }
+    }
+
+    Ok(engine
+        .summaries()
+        .iter()
+        .map(|(id, summary)| (*id, summary.state.clone()))
+        .collect())
+}
+
+fn loop_counter_term(cfg: &AbstractCfg, loop_info: &LoopInfo) -> Option<Term> {
+    for edge_id in cfg.outgoing_edges(loop_info.header) {
+        let edge = cfg.edge(edge_id).ok()?;
+        if loop_info.body.contains(&edge.target) {
+            if let Some(counter) = counter_term_from_guard(&edge.guard) {
+                return Some(counter);
+            }
+        }
+    }
+    counter_term_from_guard(&loop_info.back_edge_guard)
+}
+
+fn counter_term_from_guard(guard: &Formula) -> Option<Term> {
+    match guard {
+        Formula::Lt(lhs, _) | Formula::Le(lhs, _) => Some(lhs.clone()),
+        Formula::Not(inner) => match inner.as_ref() {
+            Formula::Ge(lhs, _) | Formula::Gt(lhs, _) => Some(lhs.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn summary_accumulator_term(cfg: &AbstractCfg, site: &AssertionSite) -> Option<Term> {
+    let pre = cfg
+        .node(site.node)
+        .ok()?
+        .transfer
+        .wp(&Formula::not(site.obligation.clone()));
+    match pre {
+        Formula::Not(inner) => match *inner {
+            Formula::Ge(lhs, _) => Some(lhs),
+            Formula::Le(_, rhs) => Some(rhs),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn summary_observed_term(cfg: &AbstractCfg, site: &AssertionSite) -> Option<Term> {
+    let pre = cfg
+        .node(site.node)
+        .ok()?
+        .transfer
+        .wp(&Formula::not(site.obligation.clone()));
+    match pre {
+        Formula::Not(inner) => match *inner {
+            Formula::Ge(_, rhs) => Some(rhs),
+            Formula::Le(lhs, _) => Some(lhs),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn extract_counter_acc_obs(formula: &Formula) -> Option<(Term, Term, Term)> {
+    let conjuncts: Vec<&Formula> = match formula {
+        Formula::And(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    let mut counter = None;
+    let mut acc_obs = None;
+    for conjunct in &conjuncts {
+        if counter.is_none() {
+            if let Some(t) = extract_exit_counter(conjunct) {
+                counter = Some(t);
+                continue;
+            }
+        }
+        if acc_obs.is_none() {
+            if let Some(pair) = extract_lt_pair(conjunct) {
+                acc_obs = Some(pair);
+            }
+        }
+    }
+    let counter = counter?;
+    let (acc, obs) = acc_obs?;
+    Some((counter, acc, obs))
+}
+
+fn extract_exit_counter(formula: &Formula) -> Option<Term> {
+    match formula {
+        Formula::Ge(lhs, _) | Formula::Gt(lhs, _) => Some(lhs.clone()),
+        Formula::Not(inner) => match inner.as_ref() {
+            Formula::Lt(lhs, _) | Formula::Le(lhs, _) => Some(lhs.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn extract_lt_pair(formula: &Formula) -> Option<(Term, Term)> {
+    match formula {
+        Formula::Lt(lhs, rhs) | Formula::Le(lhs, rhs) => Some((lhs.clone(), rhs.clone())),
+        Formula::Not(inner) => match inner.as_ref() {
+            Formula::Ge(lhs, rhs) | Formula::Gt(lhs, rhs) => Some((lhs.clone(), rhs.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn recursive_functions(graphs: &[FunctionGraph]) -> BTreeSet<String> {
     let in_graph = graphs
         .iter()
@@ -369,7 +928,14 @@ mod tests {
 
     fn compile_fixture(stem: &str) -> PathBuf {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let source = repo_root.join("tests").join(format!("{stem}.c"));
+        let source = {
+            let direct = repo_root.join("tests").join(format!("{stem}.c"));
+            if direct.exists() {
+                direct
+            } else {
+                repo_root.join("tests/flow").join(format!("{stem}.c"))
+            }
+        };
         let status = Command::new("sh")
             .arg("tests/build_ir.sh")
             .arg(&source)
@@ -651,6 +1217,20 @@ mod tests {
             let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
             let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
             assert_all_verified(procedure(&report, "main"), 3);
+        });
+    }
+
+    #[test]
+    fn array_max_5_verified_with_cyclic_callee_summary() {
+        with_bc_graphs("array_max_5", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "main"), 5);
+            assert!(report
+                .computed_summaries
+                .iter()
+                .any(|summary| summary.function == "max_of_5"));
         });
     }
 }

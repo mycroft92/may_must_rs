@@ -25,6 +25,7 @@ Implemented and CLI-active:
 - algorithmic loop-invariant discovery plus CHC/Houdini/template/LLM candidate
   plumbing
 - simple interprocedural return-summary inference and reuse for direct calls
+- cyclic callee return-summary inference via observer-invariant synthesis
 - cached loop invariants in summary tables
 - best-effort CLI reporting: unsupported procedures return `UNKNOWN` instead of
   terminating the whole run
@@ -38,10 +39,12 @@ Implemented but not CLI-active:
 
 Unsupported and reported as `UNKNOWN`:
 
-- cyclic procedures where no invariant candidate is accepted
+- cyclic procedures where no invariant candidate is accepted (including cyclic
+  callees where observer-invariant synthesis fails)
 - floating-point lowering
 - richer casts and broader LLVM instruction coverage
-- loop summaries for cyclic return-summary inference
+- loop summaries for general cyclic return-summary inference (observer-invariant
+  synthesis covers pointer-parameter cases; arbitrary loops remain unsupported)
 - precise source locations for assertion reports
 
 ## How To Run
