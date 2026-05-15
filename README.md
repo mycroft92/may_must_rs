@@ -1,4 +1,4 @@
-# may-must: Compositional May/Must Assertion Checker
+# Plus-ultra-smash: Compositional May/Must Assertion Checker
 
 An LLVM IR implementation of the compositional may/must analysis described in:
 
