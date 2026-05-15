@@ -1,2 +1,2 @@
-#include <stdbool.h>
-void may_assert (bool);
+/* Compatibility shim — use verification.h instead. */
+#include "../verification.h"

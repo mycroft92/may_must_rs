@@ -6,7 +6,7 @@ An LLVM IR implementation of the compositional may/must analysis described in:
 > Patrice Godefroid, Aditya V. Nori, Sriram K. Rajamani, SaiDeep Tetali  
 > POPL 2010 — https://dl.acm.org/doi/10.1145/1707801.1706307
 
-Given an LLVM bitcode file, the tool either proves that each `may_assert`
+Given an LLVM bitcode file, the tool either proves that each assertion
 condition always holds on reachable executions or reports a concrete
 counterexample.
 
@@ -57,25 +57,49 @@ runs the checker on each one, printing a `SAFE` / `UNSAFE` / `UNKNOWN` verdict.
 
 ## Annotating Your Own Code
 
-Mark assertions with the `may_assert` sentinel (declare it `extern` — the
-checker removes it from the visible graph and records the condition as an
-obligation):
+Include `verification.h` (at the project root) and use the standard `assert()`
+macro. The checker recognises `assert` calls, strips them from the visible CFG,
+and records each condition as a formal verification obligation. At runtime,
+`may_assert` is a no-op — no overhead in production builds.
 
 ```c
-extern void may_assert(_Bool condition);
+#include "verification.h"
 
 int abs(int x) {
     int result = x < 0 ? -x : x;
-    may_assert(result >= 0);
+    assert(result >= 0);
     return result;
 }
 ```
 
-Compile to bitcode:
+Compile to bitcode and run the checker:
 
 ```sh
 clang -O0 -g -c -emit-llvm my_file.c -o my_file.bc
 cargo run --bin main -- --no-dot my_file.bc
+```
+
+Alternatively, pass the header via a compiler flag so existing code needs no
+`#include` changes:
+
+```sh
+clang -O0 -g -include path/to/verification.h -c -emit-llvm my_file.c -o my_file.bc
+```
+
+### How `verification.h` works
+
+The header declares a sentinel function `may_assert(_Bool)` and redefines
+`assert(cond)` to call it. The tool detects direct calls to `may_assert`,
+extracts the asserted condition, and verifies it. If `<assert.h>` is also
+included, `verification.h` shadows its `assert` definition — include
+`verification.h` last (or first — it unconditionally `#undef`s `assert`).
+
+If you prefer to use the sentinel name directly without overriding `assert`:
+
+```c
+extern void may_assert(_Bool condition);
+
+may_assert(result >= 0);
 ```
 
 ---
