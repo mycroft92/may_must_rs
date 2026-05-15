@@ -1,5 +1,7 @@
 # Plus-ultra-smash: Compositional May/Must Assertion Checker
 
+[![Rust](https://github.com/mycroft92/Plus-ultra-smash/actions/workflows/rust.yml/badge.svg)](https://github.com/mycroft92/Plus-ultra-smash/actions/workflows/rust.yml)
+
 An LLVM IR implementation of the compositional may/must analysis described in:
 
 > **Compositional May-Must Program Analysis: Unleashing the Power of Alternation**
