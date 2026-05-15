@@ -26,8 +26,8 @@ use llvm_sys::core::*;
 use llvm_sys::debuginfo::*;
 use llvm_sys::ir_reader::*;
 use llvm_sys::prelude::*;
-use llvm_sys::target::*;
 use llvm_sys::target::LLVMTargetDataRef;
+use llvm_sys::target::*;
 use llvm_sys::{LLVMIntPredicate, LLVMOpcode, LLVMRealPredicate, LLVMTypeKind};
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -554,7 +554,11 @@ impl Type {
         match self.kind() {
             TypeKind::Array | TypeKind::Pointer => {
                 let ty = unsafe { LLVMGetElementType(self.0) };
-                if ty.is_null() { None } else { Some(Type(ty)) }
+                if ty.is_null() {
+                    None
+                } else {
+                    Some(Type(ty))
+                }
             }
             _ => None,
         }
@@ -574,7 +578,11 @@ impl Type {
             let mut types = vec![std::ptr::null_mut(); count as usize];
             LLVMGetStructElementTypes(self.0, types.as_mut_ptr());
             let ty = types[index as usize];
-            if ty.is_null() { None } else { Some(Type(ty)) }
+            if ty.is_null() {
+                None
+            } else {
+                Some(Type(ty))
+            }
         }
     }
 
@@ -1284,7 +1292,11 @@ impl Instruction {
     pub fn get_gep_source_element_type(&self) -> Option<Type> {
         unsafe {
             let ty = LLVMGetGEPSourceElementType(self.0);
-            if ty.is_null() { None } else { Some(Type(ty)) }
+            if ty.is_null() {
+                None
+            } else {
+                Some(Type(ty))
+            }
         }
     }
 

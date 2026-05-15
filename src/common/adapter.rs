@@ -654,10 +654,9 @@ fn lower_gep(
     // Detect the pure struct-field pattern: source_ty is Struct, exactly two
     // indices [0, field_N], first index is compile-time constant 0.
     if source_ty.kind() == TypeKind::Struct && indices.len() == 2 {
-        if let (Some(0), Some(field_idx)) = (
-            indices[0].as_constant_int(),
-            indices[1].as_constant_int(),
-        ) {
+        if let (Some(0), Some(field_idx)) =
+            (indices[0].as_constant_int(), indices[1].as_constant_int())
+        {
             if field_idx >= 0 {
                 return Ok(GepLowering::StructField(field_idx as u32));
             }
@@ -683,8 +682,7 @@ fn lower_gep(
             match current_type.kind() {
                 TypeKind::Struct => {
                     if let Some(field_idx) = index_instr.as_constant_int() {
-                        let byte_off =
-                            layout.offset_of_element(current_type, field_idx as u32);
+                        let byte_off = layout.offset_of_element(current_type, field_idx as u32);
                         offset = Term::add(offset, Term::int((byte_off / 4) as i64));
                         if let Some(field_ty) =
                             current_type.get_struct_element_type_at(field_idx as u32)
@@ -944,10 +942,18 @@ fn lower_node_transfer(
             );
             match lower_gep(function_name, instruction, layout)? {
                 GepLowering::Offset(offset) => {
-                    effects.push(TransferEffect::GetElementPtr { target, base, offset });
+                    effects.push(TransferEffect::GetElementPtr {
+                        target,
+                        base,
+                        offset,
+                    });
                 }
                 GepLowering::StructField(field_index) => {
-                    effects.push(TransferEffect::StructFieldGep { target, base, field_index });
+                    effects.push(TransferEffect::StructFieldGep {
+                        target,
+                        base,
+                        field_index,
+                    });
                 }
             }
         }
