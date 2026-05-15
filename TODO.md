@@ -43,13 +43,13 @@ in separate SMT arrays — no array-theory reasoning needed.
 A test (`struct_fields.c`) verifies `p.x == 3`, `p.y == 7`, `p.x + p.y == 10`
 with cross-field non-interference checked by the solver.
 
-### Step 3 — Stack-allocated C++ objects
+### Step 3 — Stack-allocated C++ objects (done)
 
-Free once Steps 1+2 are done. C++ methods compile to functions with an
-implicit `*this` pointer parameter, which the adapter already handles as an
-`ext_region`. Constructors and destructors are regular functions; they work
-once struct fields do. Templates and inheritance are transparent at the IR
-level (they compile to concrete structs).
+Free once Steps 1+2 are done. `*this` is already an `ext_region`; with
+per-field regions (Step 2), field accesses through `*this` emit
+`StructFieldGep` and the return-summary machinery substitutes the ext
+region with the caller's allocation. Constructors, destructors, templates,
+and single-inheritance classes are all transparent at the LLVM IR level.
 
 ### Step 4 — Heap model
 

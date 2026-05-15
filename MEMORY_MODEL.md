@@ -158,14 +158,25 @@ rather than whatever the alloca initialisation implies.
 
 ---
 
-## C++ Stack Objects (Step 3)
+## C++ Stack Objects (Step 3 — done)
 
 C++ methods compile to functions with an implicit `*this` pointer parameter.
 The adapter already treats pointer parameters as `ext_region` symbols
-(`fn$__ext_N`).  Once struct fields have per-field regions (Step 2), C++
-constructors and destructors work as regular functions — they receive `this`
-as an external region and the analysis infers their memory effects from the
-IR.  Templates and inheritance are transparent at the IR level.
+(`fn$__ext_N`).  With per-field regions in place (Step 2), struct field
+accesses through `*this` emit `StructFieldGep` and redirect to
+`ext_0$f{N}` — the same mechanism as local struct allocas.  At the call
+site, return-summary injection substitutes the ext region with the caller's
+actual allocation, connecting the callee's field writes to the caller's
+concrete object.
+
+Constructors (`@_ZN3FooC1Ev`) and destructors (`@_ZN3FooD1Ev`) are
+regular functions in the LLVM IR — no special handling needed.  Templates
+and inheritance are transparent at the IR level (they compile down to
+concrete struct types).
+
+What is **not** covered here: heap-allocated objects (`new` / `delete` —
+Step 4) and virtual dispatch (Step 5), both of which require additional
+analysis passes.
 
 ---
 
