@@ -8,18 +8,18 @@ and flags any soundness or completeness anomalies.
 
 ---
 
-## 2026-05-17 — `116c4dd`
+## 2026-05-17 — `f8f79df`
 
 Run: all files
 
 | Category | SAFE | UNSAFE | UNKNOWN | TIMEOUT | ERROR | Wrong | Total |
 |---|---|---|---|---|---|---|---|
 | infeasible-control-flow | 10 | 0 | 0 | 0 | 0 | 0 | 10 |
-| locks | 4 | 0 | 8 | 1 | 0 | 0 | 13 |
+| locks | 5 | 0 | 6 | 2 | 0 | 0 | 13 |
 | loop-crafted | 6 | 1 | 2 | 0 | 0 | 0 | 9 |
 | loop-invariants | 9 | 1 | 0 | 0 | 0 | **2** | 10 |
 | loops | 37 | 12 | 14 | 0 | 0 | **15** | 63 |
-| **Total** | **66** | **14** | **24** | **1** | **0** | **17** | **105** |
+| **Total** | **67** | **14** | **22** | **2** | **0** | **17** | **105** |
 
 **Soundness / completeness flags:**
   - MISSED:  `c/loops/array-2` expected UNSAFE, got SAFE
