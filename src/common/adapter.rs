@@ -222,11 +222,13 @@ pub fn adapt_with_purity(
 /// 3. Wire up edges and attach branch guards via [`lower_edge_guard`].
 /// 4. Append PHI-node incoming-value assignments to CFG edges via [`lower_phi_edge_effects`].
 /// 5. Extract `may_assert` call sites as [`AssertionSite`]s.
-/// 6. Ensure the CFG has a single exit node.
-/// 7. Build the pointer environment and rewrite memory effects via [`resolve_memory_effects`],
+/// 6. Inject `may_assume` call sites as [`TransferEffect::Assume`] effects on the
+///    nearest CFG node via [`lower_assumes`].
+/// 7. Ensure the CFG has a single exit node.
+/// 8. Build the pointer environment and rewrite memory effects via [`resolve_memory_effects`],
 ///    using `alias` to resolve any pointer operations the local env cannot handle.
-/// 8. Inject callee summaries as `Obligation` effects via [`apply_pending_return_summaries`].
-/// 9. Expand `llvm.memcpy`/`llvm.memset` intrinsics via [`apply_pending_memcpy_effects`].
+/// 9. Inject callee summaries as `Obligation` effects via [`apply_pending_return_summaries`].
+/// 10. Expand `llvm.memcpy`/`llvm.memset` intrinsics via [`apply_pending_memcpy_effects`].
 pub fn adapt_with_purity_and_summaries(
     graph: &FunctionGraph,
     memory_pure: &BTreeSet<String>,
@@ -304,6 +306,7 @@ pub fn adapt_with_purity_and_summaries(
         &edge_ids,
     )?;
     let assertions = lower_assertions(function_name, graph, &mut cfg, &instruction_nodes)?;
+    lower_assumes(function_name, graph, &mut cfg, &instruction_nodes)?;
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
     let final_env = resolve_memory_effects(&mut cfg, graph, function_name, alias);
@@ -335,7 +338,8 @@ pub fn adapt_with_purity_and_summaries(
 /// either directly or through any callee.
 ///
 /// "Memory-pure" means the function contains no `store` instruction and calls only other
-/// memory-pure functions (the `may_assert` pseudo-call is always treated as pure).
+/// memory-pure functions (the `may_assert` and `may_assume` pseudo-calls are always treated
+/// as pure since they are stripped from the visible graph before this pass runs).
 ///
 /// The analysis is a simple fixed-point: initially every function that contains a `store`
 /// is marked impure, then any caller of an impure function is also marked impure, and so
@@ -390,11 +394,12 @@ pub fn infer_memory_pure_functions(graphs: &[FunctionGraph]) -> BTreeSet<String>
         .collect()
 }
 
-/// Collects the names of every non-assertion callee referenced anywhere in `graphs`.
+/// Collects the names of every non-sentinel callee referenced anywhere in `graphs`.
 ///
 /// The driver uses this to determine which functions must be analysed before their callers
-/// so that summaries can be constructed in bottom-up order.  `may_assert` is excluded
-/// because it is a pseudo-call handled directly by the lowering, not a real procedure.
+/// so that summaries can be constructed in bottom-up order.  `may_assert` and `may_assume`
+/// are excluded because they are pseudo-calls handled directly by the lowering pipeline,
+/// not real procedures that require summaries.
 pub fn collect_callee_names(graphs: &[FunctionGraph]) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for graph in graphs {
@@ -403,7 +408,7 @@ pub fn collect_callee_names(graphs: &[FunctionGraph]) -> BTreeSet<String> {
                 continue;
             }
             if let Some(callee) = instruction.get_called_function() {
-                if callee != "may_assert" {
+                if callee != "may_assert" && callee != "may_assume" {
                     names.insert(callee);
                 }
             }
@@ -1189,6 +1194,34 @@ fn lower_assertions(
     Ok(sites)
 }
 
+/// Injects a [`TransferEffect::Assume`] for each `may_assume` call site in the function.
+///
+/// Each assume is attached to the CFG node of the `predecessor` instruction — the last
+/// visible instruction before the `may_assume` call.  When no predecessor exists (the
+/// assume is at the very start of the block), the `successor` node is used instead.
+///
+/// The effect is appended to the node's existing effects so that, in backward WP order
+/// (last-to-first), `Assume(cond)` is processed first, weakening `post` to `cond => post`
+/// before the node's other assignments are applied.
+fn lower_assumes(
+    function_name: &str,
+    graph: &FunctionGraph,
+    cfg: &mut AbstractCfg,
+    instruction_nodes: &HashMap<Instruction, CfgNodeId>,
+) -> Result<(), AdapterError> {
+    for site in &graph.assumes {
+        let node_id =
+            choose_assume_node(site, instruction_nodes).ok_or(AdapterError::MissingStart)?;
+        let condition = lower_bool_value(function_name, site.assumed_value)?;
+        if let Ok(node) = cfg.node_mut(node_id) {
+            node.transfer
+                .effects
+                .push(TransferEffect::Assume(condition));
+        }
+    }
+    Ok(())
+}
+
 fn choose_assert_node(
     site: &crate::common::llvm_utils::program_graph::AssertSite,
     instruction_nodes: &HashMap<Instruction, CfgNodeId>,
@@ -1200,6 +1233,23 @@ fn choose_assert_node(
             site.predecessor
                 .and_then(|inst| instruction_nodes.get(&inst).copied())
         })
+        .or_else(|| {
+            site.successor
+                .and_then(|inst| instruction_nodes.get(&inst).copied())
+        })
+}
+
+/// Finds the CFG node to attach a `may_assume` effect to.
+///
+/// Prefers the `predecessor` node (last instruction before the assume call) so
+/// the condition is checked at the point of execution; falls back to `successor`
+/// when the assume appears at the very start of a basic block.
+fn choose_assume_node(
+    site: &crate::common::llvm_utils::program_graph::AssumeSite,
+    instruction_nodes: &HashMap<Instruction, CfgNodeId>,
+) -> Option<CfgNodeId> {
+    site.predecessor
+        .and_then(|inst| instruction_nodes.get(&inst).copied())
         .or_else(|| {
             site.successor
                 .and_then(|inst| instruction_nodes.get(&inst).copied())

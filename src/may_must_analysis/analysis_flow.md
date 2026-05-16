@@ -6,8 +6,9 @@
    builds one raw instruction graph per defined function.
 
 2. `program_graph.rs`
-   removes `may_assert` from the visible instruction graph and records each
-   assertion as an `AssertSite`.
+   removes `may_assert` and `may_assume` from the visible instruction graph,
+   recording each assertion as an `AssertSite` and each assumption as an
+   `AssumeSite`.
 
 2.5. `common::alias_analysis::run_alias_analysis`
    runs field-sensitive, flow-insensitive Andersen alias analysis on the full
@@ -22,6 +23,9 @@
    - instruction-to-node bookkeeping
    `resolve_memory_effects` uses the `AliasResult` as a fallback when the local
    `PointerEnv` cannot resolve a `PointerStore` or `PointerLoad` target.
+   `lower_assumes` injects each `AssumeSite` as `TransferEffect::Assume(cond)`
+   on the nearest CFG node; the backward WP then conjoins `cond` (not implies)
+   to exclude infeasible violation traces.
 
 4. `analysis::driver`
    infers and reuses direct-call return summaries across the module, and

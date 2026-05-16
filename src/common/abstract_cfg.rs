@@ -142,7 +142,7 @@ pub enum AssignValue {
 /// | Variant | WP rule |
 /// |---|---|
 /// | `Assign` | standard substitution: `post[target := value]` |
-/// | `Assume(c)` | `c => post` (path condition) |
+/// | `Assume(c)` | `c AND post` (violation must pass through the assume) |
 /// | `Obligation(c)` | `c AND post` (assertion site) |
 /// | `MemoryStore` | memory substitution: `post[region := store(region, off, val)]` |
 /// | All pointer / alloca / load / store / call variants | `post` (transparent — memory modelled elsewhere or havoced by `HavocMemory`) |
@@ -967,7 +967,7 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
                 substitute_bool_var_in_formula(target, predicate, post)
             }
         },
-        TransferEffect::Assume(condition) => Formula::implies(condition.clone(), post.clone()),
+        TransferEffect::Assume(condition) => Formula::and(condition.clone(), post.clone()),
         TransferEffect::Obligation(condition) => Formula::and(condition.clone(), post.clone()),
         TransferEffect::MemoryStore {
             region,
@@ -1269,12 +1269,15 @@ mod tests {
     }
 
     #[test]
-    fn wp_assume_creates_implication() {
+    fn wp_assume_creates_conjunction() {
+        // In the violation analysis, a trace must pass through assume(c) to reach an
+        // assertion, so c must be true.  The violation precondition is therefore
+        // `c AND post`, not the Hoare-style implication `c => post`.
         let transfer = TransferFn::new(vec![TransferEffect::Assume(Formula::bool_var("c"))]);
         let pre = transfer.wp(&Formula::bool_var("p"));
         assert_eq!(
             pre,
-            Formula::implies(Formula::bool_var("c"), Formula::bool_var("p"))
+            Formula::and(Formula::bool_var("c"), Formula::bool_var("p"))
         );
     }
 

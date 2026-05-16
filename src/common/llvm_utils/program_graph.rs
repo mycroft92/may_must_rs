@@ -66,6 +66,30 @@ pub struct AssertSite {
     pub source_location: SourceLocation,
 }
 
+/// A `may_assume` call site extracted from the LLVM IR.
+///
+/// The `may_assume` call itself is **not** inserted as a graph node — it is
+/// stripped from the visible-instruction list. Instead, each call site is
+/// recorded here so that the adapter can inject a `TransferEffect::Assume`
+/// onto the nearest CFG node.
+///
+/// Fields:
+/// - `assumed_value`: the first argument to `may_assume(cond)` — the `i1`
+///   value that is asserted to hold for all feasible paths through this point.
+/// - `predecessor`: the last visible instruction before the `may_assume` call
+///   in the same basic block, if any. The adapter prefers to attach the
+///   assume effect here.
+/// - `successor`: the first visible instruction after the `may_assume` call,
+///   used as a fallback when there is no predecessor in the block.
+/// - `source_location`: file/line/column from DWARF debug info.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssumeSite {
+    pub assumed_value: Instruction,
+    pub predecessor: Option<Instruction>,
+    pub successor: Option<Instruction>,
+    pub source_location: SourceLocation,
+}
+
 /// The instruction-level control-flow graph for a single LLVM function.
 ///
 /// This is the raw graph that the adapter (`adapter.rs`) further lowers into
@@ -108,6 +132,8 @@ pub struct FunctionGraph {
     pub vars: HashMap<String, Instruction>,
     /// All `may_assert` call sites found in the function, in source order.
     pub asserts: Vec<AssertSite>,
+    /// All `may_assume` call sites found in the function, in source order.
+    pub assumes: Vec<AssumeSite>,
     /// The module's data-layout string, copied at graph-build time.
     /// Used by the adapter to construct a [`TargetData`] for accurate GEP
     /// offset calculation without needing to hold the LLVM `Module` reference.
@@ -212,6 +238,7 @@ impl FunctionGraph {
             end: Vec::new(),
             vars: HashMap::new(),
             asserts: Vec::new(),
+            assumes: Vec::new(),
             data_layout_str,
         };
 
@@ -235,6 +262,20 @@ impl FunctionGraph {
                     let source_location = instruction.get_debug_location().unwrap_or_default();
                     graph.asserts.push(AssertSite {
                         asserted_value,
+                        predecessor: previous_visible_instruction(&instructions, index),
+                        successor: next_visible_instruction(&instructions, index),
+                        source_location,
+                    });
+                }
+                if is_may_assume_call(instruction) {
+                    let assumed_value = instruction
+                        .get_call_args()
+                        .into_iter()
+                        .next()
+                        .unwrap_or(instruction);
+                    let source_location = instruction.get_debug_location().unwrap_or_default();
+                    graph.assumes.push(AssumeSite {
+                        assumed_value,
                         predecessor: previous_visible_instruction(&instructions, index),
                         successor: next_visible_instruction(&instructions, index),
                         source_location,
@@ -387,13 +428,14 @@ pub fn dump_graphs(graphs: &[FunctionGraph], outdir: &str) {
 /// Instructions are skipped when they carry no semantic information relevant
 /// to the assertion being verified:
 /// - `may_assert` calls are handled separately via `AssertSite` recording.
+/// - `may_assume` calls are handled separately via `AssumeSite` recording.
 /// - "Noise" calls (currently `printf`, `putchar`) are I/O side-effects with
 ///   no effect on program state as modelled by the analysis.
 ///
 /// **Invariant**: any instruction skipped here must not appear in `vertices`
-/// or `edges`, but it MAY appear as a callee name in `asserts`.
+/// or `edges`, but it MAY appear as a callee name in `asserts` or `assumes`.
 fn should_skip_instruction(instruction: Instruction) -> bool {
-    is_may_assert_call(instruction) || is_noise_call(instruction)
+    is_may_assert_call(instruction) || is_may_assume_call(instruction) || is_noise_call(instruction)
 }
 
 /// Return `true` if `instruction` is a direct call to `may_assert`.
@@ -403,6 +445,17 @@ fn should_skip_instruction(instruction: Instruction) -> bool {
 /// from the CFG but recorded as an [`AssertSite`].
 fn is_may_assert_call(instruction: Instruction) -> bool {
     instruction.get_called_function().as_deref() == Some("may_assert")
+}
+
+/// Return `true` if `instruction` is a direct call to `may_assume`.
+///
+/// `may_assume` is the sentinel function that marks path feasibility
+/// constraints. Its single argument is the `i1` condition that is assumed to
+/// hold. The call is stripped from the CFG but recorded as an [`AssumeSite`];
+/// the adapter later injects a `TransferEffect::Assume` onto the nearest CFG
+/// node so WP weakens to `(cond => post)` at that program point.
+fn is_may_assume_call(instruction: Instruction) -> bool {
+    instruction.get_called_function().as_deref() == Some("may_assume")
 }
 
 fn is_noise_call(instruction: Instruction) -> bool {
@@ -505,6 +558,33 @@ mod tests {
                     .all(|instruction| !instruction.print().contains("@may_assert")));
                 assert_eq!(
                     graph.asserts[0].asserted_value.display_name(),
+                    "%cond".to_string()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn may_assume_is_recorded_but_not_emitted_as_a_node() {
+        with_graphs(
+            r#"
+                declare void @may_assume(i1)
+
+                define void @main(i1 %cond) {
+                entry:
+                    call void @may_assume(i1 %cond)
+                    ret void
+                }
+            "#,
+            |graphs| {
+                let graph = &graphs[0];
+                assert_eq!(graph.assumes.len(), 1);
+                assert!(graph
+                    .vertices
+                    .iter()
+                    .all(|instruction| !instruction.print().contains("@may_assume")));
+                assert_eq!(
+                    graph.assumes[0].assumed_value.display_name(),
                     "%cond".to_string()
                 );
             },

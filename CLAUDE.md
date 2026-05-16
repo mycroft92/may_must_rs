@@ -225,6 +225,11 @@ For each `call` instruction where the callee has a known `ReturnSummary`:
 - `MemoryStore { region, offset, value }`: substitutes the memory array
   `region ← store(region, offset, value)` in the postcondition, so a subsequent
   `select(region, offset)` resolves to `value`.
+- `Assume(c)`: conjoins `c` into the postcondition (`c AND post`). This
+  reflects that a violating trace must pass through the assume (c must be true);
+  paths where c is false are infeasible and cannot reach the assertion. Note:
+  this differs from the standard Hoare-style `c => post` — that weaker form
+  would include spurious violations from paths the assume would have pruned.
 - `Obligation(f)`: conjoins `f` into the postcondition, asserting the callee
   relation holds at that point.
 - `Call { memory_effect: HavocMemory }`: existentially quantifies away all

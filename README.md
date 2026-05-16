@@ -75,9 +75,8 @@ runs the checker on each one, printing a `SAFE` / `UNSAFE` / `UNKNOWN` verdict.
 
 ## Annotating Your Own Code
 
-Include `verification.h` (at the project root) and use the standard `assert()`
-macro. The checker recognises `assert` calls, strips them from the visible CFG,
-and records each condition as a formal verification obligation.
+Include `verification.h` (at the project root) and use `assert()` and
+`assume()`.
 
 ```c
 #include "verification.h"
@@ -86,6 +85,11 @@ int abs(int x) {
     int result = x < 0 ? -x : x;
     assert(result >= 0);
     return result;
+}
+
+void bounded(int x) {
+    assume(x >= 0 && x < 100);  // prune infeasible paths
+    assert(x * x < 10000);      // trivially discharged
 }
 ```
 
@@ -105,11 +109,19 @@ clang -O0 -g -include path/to/verification.h -c -emit-llvm my_file.c -o my_file.
 
 ### How `verification.h` works
 
-The header declares a sentinel function `may_assert(_Bool)` and redefines
-`assert(cond)` to call it. The tool detects direct calls to `may_assert`,
-extracts the asserted condition, and verifies it. If `<assert.h>` is also
-included, `verification.h` shadows its `assert` definition — include
-`verification.h` last (or first — it unconditionally `#undef`s `assert`).
+The header declares two sentinel functions:
+- `may_assert(_Bool)` — redefines `assert(cond)` to call it. The tool strips
+  these from the visible CFG, records the condition as a verification
+  obligation, and propagates `NOT condition` backward as the violation seed.
+- `may_assume(_Bool)` — redefines `assume(cond)` to call it. The tool strips
+  these from the visible CFG and injects `TransferEffect::Assume(cond)` on the
+  nearest CFG node. In the backward violation analysis, the WP of `Assume(c)`
+  is `c AND post`, ensuring that paths where `c` is false (which the assume
+  would have pruned) are excluded from the violation precondition.
+
+If `<assert.h>` is also included, `verification.h` shadows its `assert`
+definition — include `verification.h` last (or first — it unconditionally
+`#undef`s `assert`).
 
 ---
 
@@ -216,6 +228,7 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | Feature | Status |
 |---|---|
 | Integer and boolean scalar reasoning | ✅ |
+| `assume(cond)` path-feasibility constraints | ✅ |
 | Integer-array memory (`alloca` / `load` / `store` / `gep`) | ✅ |
 | Struct field access — stack allocated (`alloca %Foo`) | ✅ |
 | Struct field access — C++ stack objects via `*this` | ✅ |

@@ -1182,6 +1182,75 @@ mod tests {
     }
 
     #[test]
+    fn assume_discharges_same_condition() {
+        // assume(x > 0) followed by assert(x > 0): the assume constrains the
+        // entry state so the assertion is trivially verified.
+        with_graphs(
+            r#"
+                declare void @may_assert(i1)
+                declare void @may_assume(i1)
+                define i32 @main(i32 %x) {
+                entry:
+                    %pos = icmp sgt i32 %x, 0
+                    call void @may_assume(i1 %pos)
+                    call void @may_assert(i1 %pos)
+                    ret i32 0
+                }
+            "#,
+            |graphs| {
+                let oracle = Oracle::new();
+                let report = analyze_function_graph(&graphs[0], &oracle).unwrap();
+                assert_eq!(report.verdict(), SafetyVerdict::Safe);
+            },
+        );
+    }
+
+    #[test]
+    fn assume_without_assertion_is_safe() {
+        // A function with only an assume and no assertion should trivially be safe.
+        with_graphs(
+            r#"
+                declare void @may_assume(i1)
+                define i32 @main(i32 %x) {
+                entry:
+                    %pos = icmp sgt i32 %x, 0
+                    call void @may_assume(i1 %pos)
+                    ret i32 0
+                }
+            "#,
+            |graphs| {
+                let oracle = Oracle::new();
+                let report = analyze_function_graph(&graphs[0], &oracle).unwrap();
+                assert_eq!(report.verdict(), SafetyVerdict::Safe);
+            },
+        );
+    }
+
+    #[test]
+    fn assume_does_not_discharge_stronger_assertion() {
+        // assume(x > 0) does NOT discharge assert(x > 1): still unsafe.
+        with_graphs(
+            r#"
+                declare void @may_assert(i1)
+                declare void @may_assume(i1)
+                define i32 @main(i32 %x) {
+                entry:
+                    %pos  = icmp sgt i32 %x, 0
+                    %pos2 = icmp sgt i32 %x, 1
+                    call void @may_assume(i1 %pos)
+                    call void @may_assert(i1 %pos2)
+                    ret i32 0
+                }
+            "#,
+            |graphs| {
+                let oracle = Oracle::new();
+                let report = analyze_function_graph(&graphs[0], &oracle).unwrap();
+                assert_eq!(report.verdict(), SafetyVerdict::Unsafe);
+            },
+        );
+    }
+
+    #[test]
     fn unconstrained_assertion_is_unsafe() {
         with_graphs(
             r#"
