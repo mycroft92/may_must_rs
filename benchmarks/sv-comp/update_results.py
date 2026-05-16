@@ -35,41 +35,54 @@ def build_table(rows: list[dict]) -> str:
     """Return a Markdown table summarising verdicts by category."""
     # category → verdict-bucket → count
     counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    # wrong[cat] = verdicts that contradict the expected outcome:
+    #   SAFE when expected unsafe (missed bug) or UNSAFE when expected safe (false alarm)
+    wrong: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
+    total_wrong = 0
 
     for row in rows:
         cat = row.get("directory", row.get("category", "unknown"))
         v   = bucket(row.get("verdict", "UNKNOWN"))
+        exp = row.get("expected", "").lower()
         counts[cat][v] += 1
         totals[v] += 1
+        if (exp == "safe" and v == "UNSAFE") or (exp == "unsafe" and v == "SAFE"):
+            wrong[cat] += 1
+            total_wrong += 1
 
     # Short category label (drop "c/" prefix and "ReachSafety-" for readability)
     def label(cat: str) -> str:
         return cat.replace("c/ReachSafety-", "").replace("c/", "")
 
     lines = []
-    lines.append("| Category | SAFE | UNSAFE | UNKNOWN | ERROR | Total |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| Category | SAFE | UNSAFE | UNKNOWN | ERROR | Wrong | Total |")
+    lines.append("|---|---|---|---|---|---|---|")
 
     for cat in sorted(counts):
         c = counts[cat]
         total = sum(c.values())
+        w = wrong[cat]
+        wrong_cell = f"**{w}**" if w > 0 else "0"
         lines.append(
             f"| {label(cat)} "
             f"| {c['SAFE']} "
             f"| {c['UNSAFE']} "
             f"| {c['UNKNOWN']} "
             f"| {c['ERROR']} "
+            f"| {wrong_cell} "
             f"| {total} |"
         )
 
     grand = sum(totals.values())
+    total_wrong_cell = f"**{total_wrong}**" if total_wrong > 0 else "**0**"
     lines.append(
         f"| **Total** "
         f"| **{totals['SAFE']}** "
         f"| **{totals['UNSAFE']}** "
         f"| **{totals['UNKNOWN']}** "
         f"| **{totals['ERROR']}** "
+        f"| {total_wrong_cell} "
         f"| **{grand}** |"
     )
 

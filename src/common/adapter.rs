@@ -782,9 +782,7 @@ fn lower_node_transfer(
         | InstructionOpcode::Sub
         | InstructionOpcode::Mul
         | InstructionOpcode::SDiv
-        | InstructionOpcode::UDiv
         | InstructionOpcode::SRem
-        | InstructionOpcode::URem
         | InstructionOpcode::FAdd
         | InstructionOpcode::FSub
         | InstructionOpcode::FMul
@@ -806,16 +804,48 @@ fn lower_node_transfer(
                 InstructionOpcode::Add | InstructionOpcode::FAdd => Term::add(lhs, rhs),
                 InstructionOpcode::Sub | InstructionOpcode::FSub => Term::sub(lhs, rhs),
                 InstructionOpcode::Mul | InstructionOpcode::FMul => Term::mul(lhs, rhs),
-                InstructionOpcode::SDiv | InstructionOpcode::UDiv | InstructionOpcode::FDiv => {
-                    Term::div(lhs, rhs)
-                }
-                InstructionOpcode::SRem | InstructionOpcode::URem => Term::rem(lhs, rhs),
+                InstructionOpcode::SDiv | InstructionOpcode::FDiv => Term::div(lhs, rhs),
+                InstructionOpcode::SRem => Term::rem(lhs, rhs),
                 _ => unreachable!(),
             };
             effects.push(TransferEffect::Assign {
                 target,
                 value: AssignValue::Term(term),
             });
+        }
+        // Unsigned division and remainder: semantically the operands are non-negative
+        // (unsigned bit-pattern) and the result is non-negative. Inject assumes so the
+        // unbounded-Int model doesn't produce spuriously negative values, which would
+        // cause the analysis to miss real violations (wrong Verified).
+        InstructionOpcode::UDiv | InstructionOpcode::URem => {
+            let target = assigned_var(function_name, instruction)?;
+            let lhs = lower_numeric_value(
+                function_name,
+                instruction
+                    .get_operand(0)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?,
+            )?;
+            let rhs = lower_numeric_value(
+                function_name,
+                instruction
+                    .get_operand(1)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?,
+            )?;
+            let term = if instruction.get_opcode() == InstructionOpcode::UDiv {
+                Term::div(lhs.clone(), rhs.clone())
+            } else {
+                Term::rem(lhs.clone(), rhs.clone())
+            };
+            effects.push(TransferEffect::Assign {
+                target: target.clone(),
+                value: AssignValue::Term(term),
+            });
+            effects.push(TransferEffect::Assume(Formula::ge(lhs, Term::Int(0))));
+            effects.push(TransferEffect::Assume(Formula::ge(rhs, Term::Int(0))));
+            effects.push(TransferEffect::Assume(Formula::ge(
+                Term::Var(target),
+                Term::Int(0),
+            )));
         }
         InstructionOpcode::ICmp | InstructionOpcode::FCmp => {
             let target = assigned_var(function_name, instruction)?;
@@ -2415,6 +2445,97 @@ mod tests {
                     .flat_map(|n| n.transfer.effects.iter())
                     .any(|e| matches!(e, TransferEffect::Assume(_)));
                 assert!(!has_assume, "trunc should not emit range assumes");
+            },
+        );
+    }
+
+    #[test]
+    fn udiv_emits_non_negative_assumes_on_operands_and_result() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %a, i32 %b) {
+                entry:
+                    %v = udiv i32 %a, %b
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assumes: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assume(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    assumes.iter().filter(|s| s.contains(">= 0")).count(),
+                    3,
+                    "expected assumes on lhs, rhs, and result; got: {assumes:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn urem_emits_non_negative_assumes_on_operands_and_result() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %a, i32 %b) {
+                entry:
+                    %v = urem i32 %a, %b
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assumes: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assume(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    assumes.iter().filter(|s| s.contains(">= 0")).count(),
+                    3,
+                    "expected assumes on lhs, rhs, and result; got: {assumes:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sdiv_emits_no_range_assumes() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %a, i32 %b) {
+                entry:
+                    %v = sdiv i32 %a, %b
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let has_assume = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .any(|e| matches!(e, TransferEffect::Assume(_)));
+                assert!(!has_assume, "sdiv should not emit range assumes");
             },
         );
     }
