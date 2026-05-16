@@ -2,6 +2,17 @@
 
 ## Current Backlog
 
+- **type-based domain bounds in the adapter** — emit `TransferEffect::Assume`
+  range constraints directly in `lower_node_transfer` based on LLVM integer
+  type widths (e.g. `i8 → [-128, 127]`, `i32 → [-2^31, 2^31-1]`) without
+  routing through C-level macros.  Soundness is clear; the challenge is
+  performance: naively adding two assumes per arithmetic result caused SMT
+  timeouts (array_max_5 regression).  Needs predicate simplification /
+  subsumption pass before the solver call, or selective application only at
+  widening points (ZExt, SExt, call returns with typed signatures).  Currently
+  worked around via `nondet_*()` macros in `verification.h` that inject bounds
+  at the C level for SV-COMP nondeterministic inputs.
+
 - add real-valued lowering so fixtures like `tests/flow/float_compare.c` are
   analyzed instead of reported as unsupported
 - strengthen cyclic procedure handling:

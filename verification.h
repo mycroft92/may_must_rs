@@ -49,4 +49,53 @@ extern void may_assume(_Bool condition);
 /* assume() is a fresh macro with no standard-library conflict. */
 #define assume(cond) may_assume((_Bool)(cond))
 
+/* ---------------------------------------------------------------------------
+ * Bounded nondeterministic values
+ *
+ * Each nondet_*() macro calls an opaque external source and then uses
+ * assume() to constrain the result to the C type's range.  This keeps the
+ * SMT model sound: the checker's integer model is unbounded, so without these
+ * constraints an "unsigned int" could take the value -1 and produce a false
+ * counterexample.
+ *
+ * The macros use GCC/Clang statement expressions ({ ... }), which expand
+ * inline at the call site and are unaffected by -fno-inline.
+ *
+ * Usage:
+ *   unsigned int n = nondet_uint();   // guaranteed >= 0 in the SMT model
+ *   char c         = nondet_char();   // guaranteed in [-128, 127]
+ * -------------------------------------------------------------------------*/
+
+/* Opaque source of nondeterminism — an unconstrained external integer.
+ * Do not call directly; use the typed nondet_*() macros below. */
+extern int __may_nondet_raw(void);
+
+/* Signed types — the SMT integer model already matches; no bound needed. */
+#define nondet_int()  (__may_nondet_raw())
+#define nondet_long() (__may_nondet_raw())
+
+/* Unsigned types — lower-bound only for 32-bit/64-bit (upper bound
+ * 2^32−1 or 2^64−1 doesn't fit in a signed SMT integer without care;
+ * non-negativity is the critical constraint for soundness). */
+#define nondet_uint() \
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); _v; })
+#define nondet_ulong() \
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); _v; })
+
+/* Small unsigned types — full range constraints since they fit in i64. */
+#define nondet_uchar() \
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); assume(_v <= 255); _v; })
+#define nondet_ushort() \
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); assume(_v <= 65535); _v; })
+
+/* Small signed types — full range constraints. */
+#define nondet_char() \
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= -128); assume(_v <= 127); _v; })
+#define nondet_short() \
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= -32768); assume(_v <= 32767); _v; })
+
+/* Boolean — constrained to {0, 1}. */
+#define nondet_bool() \
+    __extension__({ int _v = __may_nondet_raw(); assume(_v == 0 || _v == 1); _v; })
+
 #endif /* VERIFICATION_H */

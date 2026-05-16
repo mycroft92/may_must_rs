@@ -8,16 +8,15 @@ Usage
 
 What it does
 ------------
-1. Strips extern declarations for __VERIFIER_error (the macro in svcomp_shim.h
-   replaces call sites; keeping the declaration causes a preprocessor collision).
-2. Strips standalone __VERIFIER_error function definitions (some benchmarks
-   define the body themselves: `void __VERIFIER_error(void) { abort(); }`).
-3. Strips extern declarations for __VERIFIER_assume (same reason as above).
+1. Strips extern declarations for __VERIFIER_error, __VERIFIER_assume,
+   __VERIFIER_assert, and reach_error (the macros in svcomp_shim.h replace
+   call sites; keeping the declarations causes preprocessor collisions).
+2. Strips standalone function definitions for those same sentinels (some
+   benchmarks define the body themselves: `void __VERIFIER_error() { abort(); }`).
+3. Strips __VERIFIER_nondet_* forward declarations (with or without `extern`):
+   svcomp_shim.h maps each __VERIFIER_nondet_*() to a bounded nondet_*() macro
+   from verification.h; a lingering declaration would conflict with the macro.
 4. Prepends `#include "<shim>"` so the SV-COMP sentinels map to our intrinsics.
-
-Everything else — __VERIFIER_nondet_* declarations, program logic, includes —
-is left untouched.  The checker handles unknown external calls as unconstrained
-inputs, which is the correct over-approximation for nondet functions.
 """
 
 import argparse
@@ -30,12 +29,16 @@ import sys
 # Patterns for lines / blocks we want to strip
 # ---------------------------------------------------------------------------
 
-# extern declarations that conflict with the macros in svcomp_shim.h
+# Declarations that conflict with the macros in svcomp_shim.h.
 _EXTERN_STRIP_PATTERNS = [
     re.compile(r"^\s*extern\s+void\s+__VERIFIER_error\s*\("),
     re.compile(r"^\s*extern\s+void\s+__VERIFIER_assume\s*\("),
     re.compile(r"^\s*extern\s+void\s+__VERIFIER_assert\s*\("),
     re.compile(r"^\s*extern\s+void\s+reach_error\s*\("),
+    # Nondet *declarations* (with or without `extern`, any return type).
+    # The type portion before the function name is only word chars/spaces/stars,
+    # so assignment call sites like `n = __VERIFIER_nondet_uint()` are not matched.
+    re.compile(r"^\s*(?:extern\s+)?[\w\s*]+\s+__VERIFIER_nondet_\w+\s*\([^)]*\)\s*(?:__attribute__[^;]*)?\s*;"),
 ]
 
 
