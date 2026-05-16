@@ -279,6 +279,30 @@ Also run when touching CLI behavior, lowering, or smoke assumptions:
 make -C tests smoke
 ```
 
+## Branch and Release Workflow
+
+Two long-lived branches:
+
+- **`main`** — active development. No CI is triggered on push. Work here freely.
+- **`stable`** — gates all CI (build, tests, scheduled benchmarks). Only advance
+  stable when a TODO item is fully complete and all local tests pass.
+
+**Merging to stable (do this when a TODO item is done):**
+
+```sh
+git checkout stable
+git merge main
+git push                          # triggers CI + benchmark run on GitHub
+git checkout main
+git tag v<short-description> <merge-commit-sha>
+git push origin <tag>             # checkpoint the milestone on main
+```
+
+The tag name should be a short kebab-case description of what was completed,
+e.g. `v-udiv-urem-soundness` or `v-zext-sext-bounds`.
+
+Never push directly to stable without a passing `cargo test` locally first.
+
 ## Development Rules
 
 - Keep LLVM-specific logic in `llvm_utils/`.
