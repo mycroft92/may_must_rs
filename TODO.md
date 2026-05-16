@@ -2,6 +2,24 @@
 
 ## Current Backlog
 
+- **`assume(cond)` intrinsic support** — add a `may_assume(_Bool)` sentinel
+  (mirroring `may_assert`) recognised by `program_graph.rs` and lowered by the
+  adapter to `TransferEffect::Assume(cond)` on the call node.  `Assume` already
+  exists in the WP engine (`wp_one` returns `cond ⇒ post`); the work is purely
+  in the frontend:
+  1. Declare `may_assume` in `verification.h` alongside `may_assert`.
+  2. Detect `may_assume` calls in `program_graph.rs` (strip from the visible
+     graph, record as an `AssumeSite` or emit the assume inline — similar to
+     how `may_assert` sites are handled, but as an `Assume` effect rather than
+     an obligation).
+  3. In `adapter.rs`, lower each `may_assume` call to
+     `TransferEffect::Assume(condition)` on the call node, where `condition` is
+     the translated argument formula.
+  4. Add a unit test: a loop with a precondition `assume(x > 0)` that should
+     discharge an assertion `assert(x > 0)` trivially at entry.
+  This is the prerequisite for running SV-COMP benchmarks natively, since
+  `__VERIFIER_assume` maps directly to `may_assume`.
+
 - add real-valued lowering so fixtures like `tests/flow/float_compare.c` are
   analyzed instead of reported as unsupported
 - strengthen cyclic procedure handling:
