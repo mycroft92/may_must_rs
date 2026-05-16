@@ -3,50 +3,41 @@
 Scaffolding to run Smash-plus-ultra against selected SV-COMP benchmark
 categories and collect a per-file verdict summary.
 
+The clone lives at `benchmarks/sv-comp/.sv-benchmarks/` (~39 MB, gitignored).
+It is created on the first run and reused on subsequent runs — no re-clone needed.
+
 ---
 
-## Quick start
+## Running
 
-### All-in-one (recommended)
-
-`bench.sh` sparse-clones sv-benchmarks, runs the checker, updates `RESULTS.md`,
-then deletes the clone.  No manual setup needed.
+### First time
 
 ```sh
-# From the repo root — builds the checker if needed:
+# Build the checker:
 cargo build --release
 
-# Run all active categories (can take a while):
-./benchmarks/sv-comp/bench.sh
-
-# Quick sanity check — first 20 files per category:
-./benchmarks/sv-comp/bench.sh --limit 20
-
-# Commit the updated RESULTS.md automatically:
-./benchmarks/sv-comp/bench.sh --limit 20 --commit
+# Clone sv-benchmarks, run all files, update RESULTS.md, and commit it:
+./benchmarks/sv-comp/bench.sh --commit
 ```
 
-`RESULTS.md` is updated in place (newest run first) and is committed to the
-repo so benchmark progress is tracked over time.
+### Every time after that
 
-### Manual (step-by-step)
-
-If you want to keep the sv-benchmarks clone around for repeated runs:
+The clone already exists, so this goes straight to checking:
 
 ```sh
-# 1 — Clone sv-benchmarks (sparse, ~100 MB for two categories):
-git clone --depth 1 --filter=blob:none --sparse \
-    https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git \
-    /path/to/sv-benchmarks
-cd /path/to/sv-benchmarks
-git sparse-checkout set properties c/ReachSafety-Loops c/ReachSafety-ControlFlow
-cd -
+./benchmarks/sv-comp/bench.sh --commit
+```
 
-# 2 — Build the checker:
-cargo build --release
+### Quick sanity check (first 5 files per directory)
 
-# 3 — Run:
-./benchmarks/sv-comp/run.sh --benchmarks /path/to/sv-benchmarks --limit 20
+```sh
+./benchmarks/sv-comp/bench.sh --limit 5 --commit
+```
+
+### Without auto-commit (just update RESULTS.md locally)
+
+```sh
+./benchmarks/sv-comp/bench.sh
 ```
 
 ---
