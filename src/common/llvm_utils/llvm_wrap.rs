@@ -1175,6 +1175,24 @@ impl Instruction {
         }
     }
 
+    /// Returns `true` if this is an `icmp` with an unsigned predicate
+    /// (`ult`, `ule`, `ugt`, `uge`).  `eq` and `ne` are sign-agnostic and
+    /// return `false`.
+    pub fn is_unsigned_icmp(&self) -> bool {
+        if self.get_opcode() != InstructionOpcode::ICmp {
+            return false;
+        }
+        unsafe {
+            matches!(
+                LLVMGetICmpPredicate(self.0),
+                LLVMIntPredicate::LLVMIntUGT
+                    | LLVMIntPredicate::LLVMIntUGE
+                    | LLVMIntPredicate::LLVMIntULT
+                    | LLVMIntPredicate::LLVMIntULE
+            )
+        }
+    }
+
     /// Return the comparison operator of an `fcmp` instruction as a symbolic
     /// string, or `None` if this is not an `fcmp` or if the predicate cannot
     /// be mapped (e.g. `uno`, `ord`, `true`, `false` predicates).

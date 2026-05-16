@@ -870,6 +870,20 @@ fn lower_node_transfer(
                     .get_fcmp_predicate()
                     .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?
             };
+            // For unsigned integer comparisons (ult/ule/ugt/uge) the operands are
+            // always non-negative in the unsigned interpretation.  Inject Assume
+            // constraints so the unbounded-int model doesn't admit negative
+            // operands, which would give signed-comparison results instead.
+            if instruction.is_unsigned_icmp() {
+                effects.push(TransferEffect::Assume(Formula::ge(
+                    lhs.clone(),
+                    Term::int(0),
+                )));
+                effects.push(TransferEffect::Assume(Formula::ge(
+                    rhs.clone(),
+                    Term::int(0),
+                )));
+            }
             let predicate = match predicate_name {
                 "==" => Formula::eq(lhs, rhs),
                 "!=" => Formula::not(Formula::eq(lhs, rhs)),
@@ -2606,6 +2620,66 @@ mod tests {
                     assumes.iter().filter(|s| s.contains(">= 0")).count(),
                     3,
                     "expected assumes on lhs, rhs, and result; got: {assumes:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn unsigned_icmp_injects_nonneg_assumes_on_operands() {
+        with_graphs(
+            r#"
+                define i1 @test(i32 %a, i32 %b) {
+                entry:
+                    %v = icmp ult i32 %a, %b
+                    ret i1 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assumes: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assume(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    assumes.iter().filter(|s| s.contains(">= 0")).count(),
+                    2,
+                    "unsigned icmp should inject Assume >= 0 on both operands; got: {assumes:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn signed_icmp_does_not_inject_nonneg_assumes() {
+        with_graphs(
+            r#"
+                define i1 @test(i32 %a, i32 %b) {
+                entry:
+                    %v = icmp slt i32 %a, %b
+                    ret i1 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let has_assume = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .any(|e| matches!(e, TransferEffect::Assume(_)));
+                assert!(
+                    !has_assume,
+                    "signed icmp should not inject any Assume effects"
                 );
             },
         );

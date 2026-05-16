@@ -18,22 +18,14 @@ if doing so requires an unsound approximation.  Ordering of priorities:
 ## Soundness Debt (fix before broadening)
 
 These items can produce a **wrong `Verified`** on a program that is actually unsafe.
-Fix in order:
 
-- **`udiv`/`urem` treated as signed** — `udiv i32 a b` and `sdiv i32 a b` are both
-  lowered to `Term::div(lhs, rhs)`.  In the unbounded-Int model, if an operand is
-  negative (possible for values from unmodeled calls), the result differs from C
-  unsigned semantics.  Fix: inject `Assume(lhs >= 0)`, `Assume(rhs >= 0)`, and
-  `Assume(result >= 0)` for `udiv`; `Assume(lhs >= 0)` and `Assume(result >= 0)`
-  for `urem`.  This is analogous to the ZExt `>= 0` injection and equally cheap.
+- **`udiv`/`urem` treated as signed** — DONE.  `Assume(lhs >= 0)`, `Assume(rhs >= 0)`,
+  `Assume(result >= 0)` already injected for both `udiv` and `urem`.
 
-- **Unsigned icmp collapsed to signed** — `get_icmp_predicate` in `llvm_wrap.rs`
-  maps `ult/ule/ugt/uge` to the same `</<=/>/>=` symbols as their signed
-  counterparts.  For operands the analysis can prove are non-negative this is
-  sound; for values from unmodeled calls or signed arithmetic it is not.  Fix:
-  either propagate a sign flag through the comparison and inject `>= 0` constraints
-  on operands of unsigned comparisons, or emit a conservative `UNKNOWN` when a
-  comparison operand cannot be proved non-negative.
+- **Unsigned icmp collapsed to signed** — DONE (`0.4.2`).  Added `is_unsigned_icmp()`
+  to `llvm_wrap.rs`; adapter injects `Assume(lhs >= 0)` and `Assume(rhs >= 0)` before
+  any `ult`/`ule`/`ugt`/`uge` comparison so the unbounded-int model cannot admit
+  negative operands that bitvector semantics would treat as large unsigned values.
 
 ## Known Benchmark Gaps (as of `ea8e6f5`, 2026-05-16)
 
