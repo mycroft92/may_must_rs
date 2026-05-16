@@ -61,6 +61,12 @@ fn main() {
         .arg(arg!(--"inv-chc" "Enable CHC invariant candidates"))
         .arg(arg!(--"inv-houdini" "Enable Houdini invariant candidates"))
         .arg(arg!(--"inv-template" "Enable template invariant candidates"))
+        .arg(
+            arg!(--"max-function-size" <N> "Skip analysis of functions with more than N instructions (default: 500; 0 = unlimited)")
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("500"),
+        )
         .get_matches();
 
     init_logging(matches.get_flag("debug-invariants"));
@@ -128,10 +134,15 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
         }
     });
 
+    let max_function_size = *matches
+        .get_one::<usize>("max-function-size")
+        .unwrap_or(&500);
+
     InvariantConfig {
         methods,
         llm,
         skip_algorithmic: false,
+        max_function_size,
     }
 }
 
