@@ -8,6 +8,10 @@ on:
         description: 'Max files per directory (0 = all, 5 = quick smoke check)'
         required: false
         default: '0'
+      mem_limit:
+        description: 'Virtual memory cap per checker run in MiB (0 = unlimited)'
+        required: false
+        default: '0'
 
   # Also run automatically every Sunday at 02:00 UTC.
   schedule:
@@ -62,9 +66,12 @@ jobs:
       - name: Run benchmarks
         run: |
           LIMIT="${{ github.event.inputs.limit || '0' }}"
+          MEM_LIMIT="${{ github.event.inputs.mem_limit || '0' }}"
           LIMIT_FLAG=""
+          MEM_FLAG=""
           [ "$LIMIT" -gt 0 ] && LIMIT_FLAG="--limit $LIMIT"
-          ./benchmarks/sv-comp/bench.sh $LIMIT_FLAG
+          [ "$MEM_LIMIT" -gt 0 ] && MEM_FLAG="--mem-limit $MEM_LIMIT"
+          ./benchmarks/sv-comp/bench.sh $LIMIT_FLAG $MEM_FLAG
         env:
           CLANG: clang-20
 

@@ -10,6 +10,7 @@
 #
 # Options
 #   --limit N          Stop after N files per source directory (default: 0 = all).
+#   --mem-limit MB     Virtual memory cap per checker run in MiB (default: 0 = unlimited).
 #   --categories FILE  Category list (default: categories.txt next to this script).
 #   --commit           Git-commit the updated RESULTS.md automatically.
 #   --sv-url URL       sv-benchmarks Git URL
@@ -31,6 +32,7 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 CATEGORIES_FILE="$SCRIPT_DIR/categories.txt"
 CLONE_DIR="$SCRIPT_DIR/.sv-benchmarks"
 LIMIT=0
+MEM_LIMIT_MB=10240
 COMMIT=0
 SV_URL="https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
 
@@ -40,6 +42,7 @@ SV_URL="https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
 while [ $# -gt 0 ]; do
     case "$1" in
         --limit)        LIMIT="$2"; shift 2 ;;
+        --mem-limit)    MEM_LIMIT_MB="$2"; shift 2 ;;
         --categories)   CATEGORIES_FILE="$2"; shift 2 ;;
         --commit)       COMMIT=1; shift ;;
         --sv-url)       SV_URL="$2"; shift 2 ;;
@@ -101,13 +104,16 @@ trap 'rm -f "$CSV_TMP"' EXIT INT TERM
 
 LIMIT_FLAG=""
 [ "$LIMIT" -gt 0 ] && LIMIT_FLAG="--limit $LIMIT"
+MEM_FLAG=""
+[ "$MEM_LIMIT_MB" -gt 0 ] && MEM_FLAG="--mem-limit $MEM_LIMIT_MB"
 
 "$SCRIPT_DIR/run.sh" \
     --benchmarks "$CLONE_DIR" \
     --categories "$CATEGORIES_FILE" \
     --csv        "$CSV_TMP" \
     --out-dir    "$SCRIPT_DIR/out" \
-    ${LIMIT_FLAG:-}
+    ${LIMIT_FLAG:-} \
+    ${MEM_FLAG:-}
 
 # ---------------------------------------------------------------------------
 # Update RESULTS.md

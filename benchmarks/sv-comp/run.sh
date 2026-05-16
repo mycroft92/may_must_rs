@@ -15,6 +15,7 @@
 #   --checker PATH     Path to the checker binary (default: auto-detect via cargo).
 #   --checker-flags F  Extra flags passed to the checker (default: --no-dot).
 #   --csv FILE         Write results to this CSV file (default: results.csv).
+#   --mem-limit MB     Virtual memory cap per checker run in MiB (default: 0 = unlimited).
 #
 # Output
 # ------
@@ -35,6 +36,7 @@ CHECKER=""
 CHECKER_FLAGS="--no-dot"
 CSV_FILE="$SCRIPT_DIR/results.csv"
 BENCHMARKS_DIR=""
+MEM_LIMIT_MB=0
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -48,6 +50,7 @@ while [ $# -gt 0 ]; do
         --checker)       CHECKER="$2"; shift 2 ;;
         --checker-flags) CHECKER_FLAGS="$2"; shift 2 ;;
         --csv)           CSV_FILE="$2"; shift 2 ;;
+        --mem-limit)     MEM_LIMIT_MB="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,/^set -eu/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -133,7 +136,12 @@ check_one() {
 
     # Run checker; capture verdict.
     start_ms=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
-    checker_out=$("$CHECKER" $CHECKER_FLAGS "$bc" 2>/dev/null || true)
+    checker_out=$(
+        if [ "$MEM_LIMIT_MB" -gt 0 ]; then
+            ulimit -v $((MEM_LIMIT_MB * 1024)) 2>/dev/null || true
+        fi
+        "$CHECKER" $CHECKER_FLAGS "$bc" 2>/dev/null || true
+    )
     end_ms=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
     elapsed_ms=$(( end_ms - start_ms ))
     time_s=$(python3 -c "print(f'{$elapsed_ms/1000:.2f}')" 2>/dev/null || echo "0.00")

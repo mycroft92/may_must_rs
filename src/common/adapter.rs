@@ -899,7 +899,44 @@ fn lower_node_transfer(
                     AssignValue::Term(lower_numeric_value(function_name, source)?)
                 }
             };
-            effects.push(TransferEffect::Assign { target, value });
+            effects.push(TransferEffect::Assign {
+                target: target.clone(),
+                value,
+            });
+            // Inject range bounds at widening points (ZExt/SExt only; Trunc skipped).
+            if let Some(w) = source.get_type().and_then(|ty| match ty.kind() {
+                TypeKind::Integer(bits) => Some(bits),
+                _ => None,
+            }) {
+                let t = Term::Var(target);
+                match instruction.get_opcode() {
+                    InstructionOpcode::ZExt => {
+                        // Non-negativity is always cheap; upper bound only for small source types
+                        // (≤ 16 bits) to avoid large constants that slow loop-invariant search.
+                        effects.push(TransferEffect::Assume(Formula::ge(t.clone(), Term::Int(0))));
+                        if w <= 16 {
+                            if let Some(upper) = zext_upper_bound(w) {
+                                effects
+                                    .push(TransferEffect::Assume(Formula::le(t, Term::Int(upper))));
+                            }
+                        }
+                    }
+                    InstructionOpcode::SExt => {
+                        // Only inject tight bounds for small source types; i32→i64 sext on loop
+                        // counters produces wide constants (±2^31) that hurt invariant search.
+                        if w <= 16 {
+                            if let Some((lo, hi)) = sext_bounds(w) {
+                                effects.push(TransferEffect::Assume(Formula::ge(
+                                    t.clone(),
+                                    Term::Int(lo),
+                                )));
+                                effects.push(TransferEffect::Assume(Formula::le(t, Term::Int(hi))));
+                            }
+                        }
+                    }
+                    _ => {} // Trunc: no range bounds
+                }
+            }
         }
         InstructionOpcode::Alloca => {
             let target = pointer_name(function_name, instruction);
@@ -2141,6 +2178,31 @@ pub fn build_horn_model(
     })
 }
 
+/// Upper bound (inclusive) on the result of a `zext` from a `w`-bit unsigned integer.
+/// Returns `None` if the value doesn't fit in `i64` (i.e. `w >= 64`).
+fn zext_upper_bound(w: u32) -> Option<i64> {
+    match w {
+        0 => None,
+        1..=62 => Some((1i64 << w) - 1),
+        63 => Some(i64::MAX), // 2^63 - 1
+        _ => None,
+    }
+}
+
+/// Signed range `[lo, hi]` for the result of a `sext` from a `w`-bit signed integer.
+/// Returns `None` if `w` is 0 or greater than 64.
+fn sext_bounds(w: u32) -> Option<(i64, i64)> {
+    match w {
+        0 => None,
+        1..=63 => {
+            let half = 1i64 << (w - 1); // w-1 in 0..=62, never overflows i64
+            Some((-half, half - 1))
+        }
+        64 => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2256,6 +2318,103 @@ mod tests {
                     .flat_map(|node| node.transfer.effects.iter())
                     .any(|effect| matches!(effect, TransferEffect::Obligation(_)));
                 assert!(has_obligation);
+            },
+        );
+    }
+
+    #[test]
+    fn zext_emits_non_negative_and_upper_bound_assumes() {
+        with_graphs(
+            r#"
+                define i32 @test(i8 %x) {
+                entry:
+                    %v = zext i8 %x to i32
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assumes: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assume(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    assumes.iter().any(|s| s.contains(">= 0")),
+                    "expected non-negative assume; got: {assumes:?}"
+                );
+                assert!(
+                    assumes.iter().any(|s| s.contains("<= 255")),
+                    "expected upper-bound assume; got: {assumes:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sext_emits_signed_range_assumes() {
+        with_graphs(
+            r#"
+                define i32 @test(i8 %x) {
+                entry:
+                    %v = sext i8 %x to i32
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assumes: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assume(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    assumes.iter().any(|s| s.contains(">= -128")),
+                    "expected lower-bound assume; got: {assumes:?}"
+                );
+                assert!(
+                    assumes.iter().any(|s| s.contains("<= 127")),
+                    "expected upper-bound assume; got: {assumes:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn trunc_emits_no_range_assumes() {
+        with_graphs(
+            r#"
+                define i8 @test(i32 %x) {
+                entry:
+                    %v = trunc i32 %x to i8
+                    ret i8 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let has_assume = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .any(|e| matches!(e, TransferEffect::Assume(_)));
+                assert!(!has_assume, "trunc should not emit range assumes");
             },
         );
     }
