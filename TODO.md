@@ -35,24 +35,17 @@ Fix in order:
   on operands of unsigned comparisons, or emit a conservative `UNKNOWN` when a
   comparison operand cannot be proved non-negative.
 
-## Known Benchmark Gaps (as of `1e7fb97`, 2026-05-16)
+## Known Benchmark Gaps (as of `ea8e6f5`, 2026-05-16)
 
 Reference: `benchmarks/sv-comp/RESULTS.md`, latest run.
-Totals: 51 UNKNOWN · 5 UNSOUND · 7 MISSED · 105 files.
+Totals: ~51 UNKNOWN · 3 UNSOUND · 7 MISSED · 105 files.
+(`count_up_down-1` and `trex03-2` fixed by Hoare-style inductiveness WP in `ea8e6f5`.)
 
 ### UNSOUND (wrong `Verified` on unsafe program — false safe)
 
-- `c/loops/count_up_down-1` — expected SAFE, got UNSAFE
 - `c/loops/linear_sea.ch` — expected SAFE, got UNSAFE
-- `c/loops/trex03-2` — expected SAFE, got UNSAFE
 - `c/loops/veris.c_NetBSD-libc_loop.i` — expected SAFE, got UNSAFE
 - `c/loop-invariants/bin-suffix-5` — expected SAFE, got UNSAFE
-
-`count_up_down-1` and `trex03-2` were previously fixed (in `970a9dd`) by
-ZExt/SExt `Assume` bounds in WP, but the `TypeBound` fix (which restores loop
-invariant synthesis) removes these from WP. The underlying root cause for
-these two is likely **unsigned icmp collapsed to signed** — fix that item
-first before revisiting.
 
 ### MISSED (wrong verdict on unsafe program)
 
@@ -70,18 +63,15 @@ locks 13 · loops 33 · loop-crafted 5 · loop-invariants 0.
 
 ## Instruction Coverage (sound but lossy — produce ERROR/UNKNOWN today)
 
-- **Integer bitwise And/Or/Xor** — currently only lowered for `i1`-typed values
-  (mapped to Boolean `and`/`or`/`xor`).  Integer-width variants fall through to
-  `Nop`, leaving the result variable unconstrained → `UNKNOWN` for any program
-  that uses bitmask operations.  Fix: lower as `Rem(lhs, 2^w)` or emit an
-  `Assume(result >= 0 && result <= max(|lhs|, |rhs|))` as a conservative
-  overapproximation, then refine toward bitvector modelling later.
+- **Integer bitwise And/Or/Xor** — DONE (`0.4.1`).  `And` with non-negative
+  constant mask emits `TypeBound(result >= 0 && result <= mask)`.  `Xor` with
+  constant `-1` (bitwise NOT) lowers to `result = -x - 1`.  `Or` leaves result
+  unconstrained (no useful bound without bitvector range info).
 
-- **Shifts (`Shl`, `LShr`, `AShr`)** — not in the opcode match → fall to the `_`
-  wildcard → `UnsupportedInstruction` error for any program that uses shifts.
-  Fix: lower `shl x, n` as `Mul(x, 2^n)` when `n` is a constant (sound for
-  non-negative `x`); `lshr`/`ashr` as `Div(x, 2^n)`.  Constant shifts cover the
-  majority of SV-COMP uses.
+- **Shifts (`Shl`, `LShr`, `AShr`)** — DONE (`0.4.1`).  Constant-amount shifts
+  lower to `Mul(x, 2^n)` / `Div(x, 2^n)`.  `LShr` adds a `TypeBound(result >= 0)`.
+  Variable shift amounts leave the result unconstrained.  Bitvector-precise
+  semantics deferred to long-term BitVector theory work.
 
 ## Long-term / Structural
 

@@ -884,11 +884,95 @@ fn lower_node_transfer(
                 value: AssignValue::Predicate(predicate),
             });
         }
+        InstructionOpcode::Shl | InstructionOpcode::LShr | InstructionOpcode::AShr => {
+            if sort_of_instruction_value(instruction)? == Sort::Bool {
+                return Ok(TransferFn::new(effects));
+            }
+            let target = assigned_var(function_name, instruction)?;
+            let lhs = lower_numeric_value(
+                function_name,
+                instruction
+                    .get_operand(0)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?,
+            )?;
+            let shift_instr = instruction
+                .get_operand(1)
+                .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
+            if let Some(shift) = shift_instr.as_constant_int() {
+                if shift >= 0 && shift < 63 {
+                    let factor = 1i64 << shift;
+                    let term = if instruction.get_opcode() == InstructionOpcode::Shl {
+                        Term::mul(lhs, Term::int(factor))
+                    } else {
+                        Term::div(lhs, Term::int(factor))
+                    };
+                    effects.push(TransferEffect::Assign {
+                        target: target.clone(),
+                        value: AssignValue::Term(term),
+                    });
+                    if instruction.get_opcode() == InstructionOpcode::LShr {
+                        // Logical right shift fills with zero bits; result is always non-negative.
+                        effects.push(TransferEffect::TypeBound(Formula::ge(
+                            Term::Var(target),
+                            Term::int(0),
+                        )));
+                    }
+                }
+            }
+            // Variable or large shift amount: leave target unconstrained.
+        }
         InstructionOpcode::And | InstructionOpcode::Or | InstructionOpcode::Xor => {
             let result_sort = sort_of_instruction_value(instruction)?;
             if result_sort != Sort::Bool {
+                // Integer-width variants: apply conservative approximations where possible.
+                let target = assigned_var(function_name, instruction)?;
+                let op0 = instruction
+                    .get_operand(0)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
+                let op1 = instruction
+                    .get_operand(1)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
+                match instruction.get_opcode() {
+                    InstructionOpcode::And => {
+                        // x & c where c >= 0: result is in [0, c].
+                        // Bitwise AND with a non-negative mask can only clear bits, never set
+                        // bits beyond what c already has.
+                        let mask = op1.as_constant_int().or_else(|| op0.as_constant_int());
+                        if let Some(c) = mask.filter(|&c| c >= 0) {
+                            let t = Term::Var(target);
+                            effects.push(TransferEffect::TypeBound(Formula::ge(
+                                t.clone(),
+                                Term::int(0),
+                            )));
+                            effects.push(TransferEffect::TypeBound(Formula::le(t, Term::int(c))));
+                        }
+                    }
+                    InstructionOpcode::Xor => {
+                        // `xor x, -1` is the canonical LLVM bitwise NOT: result = -x - 1.
+                        let (is_not, operand) = if op1.as_constant_int() == Some(-1) {
+                            (true, op0)
+                        } else if op0.as_constant_int() == Some(-1) {
+                            (true, op1)
+                        } else {
+                            (false, op0)
+                        };
+                        if is_not {
+                            if let Ok(lhs) = lower_numeric_value(function_name, operand) {
+                                effects.push(TransferEffect::Assign {
+                                    target,
+                                    value: AssignValue::Term(Term::sub(
+                                        Term::sub(Term::int(0), lhs),
+                                        Term::int(1),
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                    _ => {} // Or: no useful bound without range information
+                }
                 return Ok(TransferFn::new(effects));
             }
+            // i1 Bool case: lower bitwise ops to logical connectives.
             let target = assigned_var(function_name, instruction)?;
             let lhs = lower_bool_value(
                 function_name,
@@ -2601,6 +2685,176 @@ mod tests {
                     .join("\n");
                 assert!(rendered.contains("main$call0$tmp"));
                 assert!(rendered.contains("main$call1$tmp"));
+            },
+        );
+    }
+
+    #[test]
+    fn shl_by_constant_lowers_to_multiply() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = shl i32 %x, 3
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assigns: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assign {
+                            value: AssignValue::Term(t),
+                            ..
+                        } = e
+                        {
+                            Some(t.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    assigns.iter().any(|s| s.contains("* 8")),
+                    "shl 3 should lower to multiply by 8; got: {assigns:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn lshr_by_constant_lowers_to_divide_with_nonneg_bound() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = lshr i32 %x, 2
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let effects: Vec<_> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .collect();
+                let has_div = effects.iter().any(|e| {
+                    matches!(e, TransferEffect::Assign { value: AssignValue::Term(t), .. }
+                        if t.to_string().contains("/ 4"))
+                });
+                let has_nonneg = effects.iter().any(
+                    |e| matches!(e, TransferEffect::TypeBound(f) if f.to_string().contains(">= 0")),
+                );
+                assert!(has_div, "lshr 2 should lower to divide by 4");
+                assert!(has_nonneg, "lshr result should have non-negative TypeBound");
+            },
+        );
+    }
+
+    #[test]
+    fn ashr_by_constant_lowers_to_divide_no_nonneg_bound() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = ashr i32 %x, 1
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let effects: Vec<_> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .collect();
+                let has_div = effects.iter().any(|e| {
+                    matches!(e, TransferEffect::Assign { value: AssignValue::Term(t), .. }
+                        if t.to_string().contains("/ 2"))
+                });
+                assert!(has_div, "ashr 1 should lower to divide by 2");
+            },
+        );
+    }
+
+    #[test]
+    fn and_with_nonneg_constant_emits_typebound_range() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = and i32 %x, 255
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let bounds: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::TypeBound(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    bounds.iter().any(|s| s.contains(">= 0")),
+                    "and with mask should emit lower bound; got: {bounds:?}"
+                );
+                assert!(
+                    bounds.iter().any(|s| s.contains("<= 255")),
+                    "and with mask 255 should emit upper bound; got: {bounds:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn xor_with_minus_one_lowers_to_bitwise_not() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = xor i32 %x, -1
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assigns: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assign {
+                            value: AssignValue::Term(t),
+                            ..
+                        } = e
+                        {
+                            Some(t.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                // NOT x = (0 - x) - 1
+                assert!(
+                    assigns.iter().any(|s| s.contains("- 1")),
+                    "xor with -1 should lower to bitwise NOT; got: {assigns:?}"
+                );
             },
         );
     }
