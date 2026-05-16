@@ -279,6 +279,20 @@ Also run when touching CLI behavior, lowering, or smoke assumptions:
 make -C tests smoke
 ```
 
+## Versioning Policy
+
+Version is `MAJOR.MINOR.PATCH` in `Cargo.toml`. Bump it in the same commit as
+the change, before committing:
+
+| Change type | Example | Bump |
+|---|---|---|
+| Bug fix, small improvement, tooling patch | mem-limit flag, Wrong column, git hash | `PATCH` — 0.3.0 → 0.3.1 |
+| TODO item completed or soundness debt resolved | ZExt/SExt bounds, udiv/urem fix | `MINOR` — 0.2.0 → 0.3.0 |
+| Large feature milestone, new analysis capability | bitvector support, heap model | `MAJOR` — 0.x.y → 1.0.0 |
+
+Never skip levels. A TODO completion that also includes minor patches still
+counts as one MINOR bump — don't compound.
+
 ## Branch and Release Workflow
 
 Two long-lived branches:
