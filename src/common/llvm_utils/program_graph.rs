@@ -66,28 +66,28 @@ pub struct AssertSite {
     pub source_location: SourceLocation,
 }
 
-/// A `may_assume` call site extracted from the LLVM IR.
+/// A `may_assume` or `may_type_bound` call site extracted from the LLVM IR.
 ///
-/// The `may_assume` call itself is **not** inserted as a graph node — it is
-/// stripped from the visible-instruction list. Instead, each call site is
-/// recorded here so that the adapter can inject a `TransferEffect::Assume`
-/// onto the nearest CFG node.
+/// Both calls are stripped from the visible-instruction list. The adapter
+/// injects either `TransferEffect::Assume` or `TransferEffect::TypeBound`
+/// onto the nearest CFG node, depending on `is_type_bound`.
 ///
 /// Fields:
-/// - `assumed_value`: the first argument to `may_assume(cond)` — the `i1`
-///   value that is asserted to hold for all feasible paths through this point.
-/// - `predecessor`: the last visible instruction before the `may_assume` call
-///   in the same basic block, if any. The adapter prefers to attach the
-///   assume effect here.
-/// - `successor`: the first visible instruction after the `may_assume` call,
-///   used as a fallback when there is no predecessor in the block.
+/// - `assumed_value`: the first argument — the `i1` condition.
+/// - `predecessor`: the last visible instruction before the call in the same
+///   basic block, if any. The adapter prefers to attach the effect here.
+/// - `successor`: the first visible instruction after the call, used as a
+///   fallback when there is no predecessor in the block.
 /// - `source_location`: file/line/column from DWARF debug info.
+/// - `is_type_bound`: true for `may_type_bound` calls (type-system facts that
+///   narrow the forward reach but have no backward WP effect).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssumeSite {
     pub assumed_value: Instruction,
     pub predecessor: Option<Instruction>,
     pub successor: Option<Instruction>,
     pub source_location: SourceLocation,
+    pub is_type_bound: bool,
 }
 
 /// The instruction-level control-flow graph for a single LLVM function.
@@ -267,7 +267,7 @@ impl FunctionGraph {
                         source_location,
                     });
                 }
-                if is_may_assume_call(instruction) {
+                if is_may_assume_call(instruction) || is_may_type_bound_call(instruction) {
                     let assumed_value = instruction
                         .get_call_args()
                         .into_iter()
@@ -279,6 +279,7 @@ impl FunctionGraph {
                         predecessor: previous_visible_instruction(&instructions, index),
                         successor: next_visible_instruction(&instructions, index),
                         source_location,
+                        is_type_bound: is_may_type_bound_call(instruction),
                     });
                 }
             }
@@ -435,7 +436,10 @@ pub fn dump_graphs(graphs: &[FunctionGraph], outdir: &str) {
 /// **Invariant**: any instruction skipped here must not appear in `vertices`
 /// or `edges`, but it MAY appear as a callee name in `asserts` or `assumes`.
 fn should_skip_instruction(instruction: Instruction) -> bool {
-    is_may_assert_call(instruction) || is_may_assume_call(instruction) || is_noise_call(instruction)
+    is_may_assert_call(instruction)
+        || is_may_assume_call(instruction)
+        || is_may_type_bound_call(instruction)
+        || is_noise_call(instruction)
 }
 
 /// Return `true` if `instruction` is a direct call to `may_assert`.
@@ -448,14 +452,19 @@ fn is_may_assert_call(instruction: Instruction) -> bool {
 }
 
 /// Return `true` if `instruction` is a direct call to `may_assume`.
-///
-/// `may_assume` is the sentinel function that marks path feasibility
-/// constraints. Its single argument is the `i1` condition that is assumed to
-/// hold. The call is stripped from the CFG but recorded as an [`AssumeSite`];
-/// the adapter later injects a `TransferEffect::Assume` onto the nearest CFG
-/// node so WP weakens to `(cond => post)` at that program point.
 fn is_may_assume_call(instruction: Instruction) -> bool {
     instruction.get_called_function().as_deref() == Some("may_assume")
+}
+
+/// Return `true` if `instruction` is a direct call to `may_type_bound`.
+///
+/// `may_type_bound` marks type-system facts (e.g. "unsigned int >= 0") that
+/// always hold in well-typed programs.  Like `may_assume`, the call is stripped
+/// from the visible CFG and recorded as an [`AssumeSite`] with `is_type_bound`
+/// set to true.  The adapter injects a `TransferEffect::TypeBound` (WP =
+/// identity, SP = `pre AND cond`) rather than a regular `Assume`.
+fn is_may_type_bound_call(instruction: Instruction) -> bool {
+    instruction.get_called_function().as_deref() == Some("may_type_bound")
 }
 
 fn is_noise_call(instruction: Instruction) -> bool {

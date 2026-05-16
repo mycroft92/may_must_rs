@@ -213,8 +213,15 @@ pub enum TransferEffect {
         field_index: u32,
     },
     /// A path condition that must hold for execution to reach this point.
-    /// WP: `condition => post`.
+    /// WP: `condition AND post` (violation path must pass through the assume).
+    /// SP: `pre AND condition`.
     Assume(Formula),
+    /// A type-system fact derived from LLVM type widths (e.g. ZExt/SExt bounds).
+    /// Always satisfied by well-typed programs, so it is used only to narrow
+    /// the forward reach.
+    /// WP: identity (`post` — no backward obligation added).
+    /// SP: `pre AND condition` (same as Assume).
+    TypeBound(Formula),
     /// An assertion or verification obligation. The analysis must prove
     /// `condition` holds whenever this effect is reached.
     /// WP: `condition AND post` (both the obligation and the continuation
@@ -968,6 +975,7 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
             }
         },
         TransferEffect::Assume(condition) => Formula::and(condition.clone(), post.clone()),
+        TransferEffect::TypeBound(_) => post.clone(),
         TransferEffect::Obligation(condition) => Formula::and(condition.clone(), post.clone()),
         TransferEffect::MemoryStore {
             region,
@@ -1008,9 +1016,9 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
                 ),
             ),
         },
-        TransferEffect::Assume(condition) | TransferEffect::Obligation(condition) => {
-            Formula::and(pre.clone(), condition.clone())
-        }
+        TransferEffect::Assume(condition)
+        | TransferEffect::TypeBound(condition)
+        | TransferEffect::Obligation(condition) => Formula::and(pre.clone(), condition.clone()),
     }
 }
 
@@ -1288,6 +1296,27 @@ mod tests {
         assert_eq!(
             pre,
             Formula::and(Formula::bool_var("c"), Formula::bool_var("p"))
+        );
+    }
+
+    #[test]
+    fn wp_type_bound_is_identity() {
+        // TypeBound facts are always satisfied by type-correct programs, so they
+        // must not add extra obligations to the backward violation-condition WP.
+        let transfer = TransferFn::new(vec![TransferEffect::TypeBound(Formula::bool_var("c"))]);
+        let post = Formula::bool_var("p");
+        assert_eq!(transfer.wp(&post), post, "TypeBound WP must be identity");
+    }
+
+    #[test]
+    fn sp_type_bound_narrows_reach() {
+        // TypeBound facts do narrow the forward reach, so SP must conjoin the condition.
+        let transfer = TransferFn::new(vec![TransferEffect::TypeBound(Formula::bool_var("c"))]);
+        let pre = Formula::bool_var("p");
+        assert_eq!(
+            transfer.sp(&pre),
+            Formula::and(pre, Formula::bool_var("c")),
+            "TypeBound SP must conjoin the condition"
         );
     }
 

@@ -934,6 +934,11 @@ fn lower_node_transfer(
                 value,
             });
             // Inject range bounds at widening points (ZExt/SExt only; Trunc skipped).
+            // TypeBound has WP=identity so these facts narrow the forward reach without
+            // adding extra obligations to the backward violation-condition WP.  This
+            // prevents loop-invariant inductiveness checks from failing because a
+            // ZExt inside the loop body introduces a fresh free variable (e.g. a nondet
+            // call return) that no invariant candidate can bound.
             if let Some(w) = source.get_type().and_then(|ty| match ty.kind() {
                 TypeKind::Integer(bits) => Some(bits),
                 _ => None,
@@ -941,13 +946,18 @@ fn lower_node_transfer(
                 let t = Term::Var(target);
                 match instruction.get_opcode() {
                     InstructionOpcode::ZExt => {
-                        // Non-negativity is always cheap; upper bound only for small source types
+                        // Non-negativity always injected; upper bound only for small source types
                         // (≤ 16 bits) to avoid large constants that slow loop-invariant search.
-                        effects.push(TransferEffect::Assume(Formula::ge(t.clone(), Term::Int(0))));
+                        effects.push(TransferEffect::TypeBound(Formula::ge(
+                            t.clone(),
+                            Term::Int(0),
+                        )));
                         if w <= 16 {
                             if let Some(upper) = zext_upper_bound(w) {
-                                effects
-                                    .push(TransferEffect::Assume(Formula::le(t, Term::Int(upper))));
+                                effects.push(TransferEffect::TypeBound(Formula::le(
+                                    t,
+                                    Term::Int(upper),
+                                )));
                             }
                         }
                     }
@@ -956,11 +966,12 @@ fn lower_node_transfer(
                         // counters produces wide constants (±2^31) that hurt invariant search.
                         if w <= 16 {
                             if let Some((lo, hi)) = sext_bounds(w) {
-                                effects.push(TransferEffect::Assume(Formula::ge(
+                                effects.push(TransferEffect::TypeBound(Formula::ge(
                                     t.clone(),
                                     Term::Int(lo),
                                 )));
-                                effects.push(TransferEffect::Assume(Formula::le(t, Term::Int(hi))));
+                                effects
+                                    .push(TransferEffect::TypeBound(Formula::le(t, Term::Int(hi))));
                             }
                         }
                     }
@@ -1261,15 +1272,11 @@ fn lower_assertions(
     Ok(sites)
 }
 
-/// Injects a [`TransferEffect::Assume`] for each `may_assume` call site in the function.
+/// Injects `Assume` or `TypeBound` effects for each recorded assume/type-bound site.
 ///
-/// Each assume is attached to the CFG node of the `predecessor` instruction — the last
-/// visible instruction before the `may_assume` call.  When no predecessor exists (the
-/// assume is at the very start of the block), the `successor` node is used instead.
-///
-/// The effect is appended to the node's existing effects so that, in backward WP order
-/// (last-to-first), `Assume(cond)` is processed first, weakening `post` to `cond => post`
-/// before the node's other assignments are applied.
+/// `may_assume` sites → `TransferEffect::Assume` (WP: `cond AND post`).
+/// `may_type_bound` sites → `TransferEffect::TypeBound` (WP: identity; SP: `pre AND cond`).
+/// Each effect is attached to the nearest CFG node (predecessor preferred).
 fn lower_assumes(
     function_name: &str,
     graph: &FunctionGraph,
@@ -1281,9 +1288,12 @@ fn lower_assumes(
             choose_assume_node(site, instruction_nodes).ok_or(AdapterError::MissingStart)?;
         let condition = lower_bool_value(function_name, site.assumed_value)?;
         if let Ok(node) = cfg.node_mut(node_id) {
-            node.transfer
-                .effects
-                .push(TransferEffect::Assume(condition));
+            let effect = if site.is_type_bound {
+                TransferEffect::TypeBound(condition)
+            } else {
+                TransferEffect::Assume(condition)
+            };
+            node.transfer.effects.push(effect);
         }
     }
     Ok(())
@@ -2353,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn zext_emits_non_negative_and_upper_bound_assumes() {
+    fn zext_emits_non_negative_and_upper_bound_type_bounds() {
         with_graphs(
             r#"
                 define i32 @test(i8 %x) {
@@ -2364,13 +2374,13 @@ mod tests {
             "#,
             |graphs| {
                 let adapted = adapt(&graphs[0]).unwrap();
-                let assumes: Vec<String> = adapted
+                let bounds: Vec<String> = adapted
                     .cfg
                     .nodes()
                     .values()
                     .flat_map(|n| n.transfer.effects.iter())
                     .filter_map(|e| {
-                        if let TransferEffect::Assume(f) = e {
+                        if let TransferEffect::TypeBound(f) = e {
                             Some(f.to_string())
                         } else {
                             None
@@ -2378,19 +2388,19 @@ mod tests {
                     })
                     .collect();
                 assert!(
-                    assumes.iter().any(|s| s.contains(">= 0")),
-                    "expected non-negative assume; got: {assumes:?}"
+                    bounds.iter().any(|s| s.contains(">= 0")),
+                    "expected non-negative TypeBound; got: {bounds:?}"
                 );
                 assert!(
-                    assumes.iter().any(|s| s.contains("<= 255")),
-                    "expected upper-bound assume; got: {assumes:?}"
+                    bounds.iter().any(|s| s.contains("<= 255")),
+                    "expected upper-bound TypeBound; got: {bounds:?}"
                 );
             },
         );
     }
 
     #[test]
-    fn sext_emits_signed_range_assumes() {
+    fn sext_emits_signed_range_type_bounds() {
         with_graphs(
             r#"
                 define i32 @test(i8 %x) {
@@ -2401,13 +2411,13 @@ mod tests {
             "#,
             |graphs| {
                 let adapted = adapt(&graphs[0]).unwrap();
-                let assumes: Vec<String> = adapted
+                let bounds: Vec<String> = adapted
                     .cfg
                     .nodes()
                     .values()
                     .flat_map(|n| n.transfer.effects.iter())
                     .filter_map(|e| {
-                        if let TransferEffect::Assume(f) = e {
+                        if let TransferEffect::TypeBound(f) = e {
                             Some(f.to_string())
                         } else {
                             None
@@ -2415,19 +2425,19 @@ mod tests {
                     })
                     .collect();
                 assert!(
-                    assumes.iter().any(|s| s.contains(">= -128")),
-                    "expected lower-bound assume; got: {assumes:?}"
+                    bounds.iter().any(|s| s.contains(">= -128")),
+                    "expected lower-bound TypeBound; got: {bounds:?}"
                 );
                 assert!(
-                    assumes.iter().any(|s| s.contains("<= 127")),
-                    "expected upper-bound assume; got: {assumes:?}"
+                    bounds.iter().any(|s| s.contains("<= 127")),
+                    "expected upper-bound TypeBound; got: {bounds:?}"
                 );
             },
         );
     }
 
     #[test]
-    fn trunc_emits_no_range_assumes() {
+    fn trunc_emits_no_range_bounds() {
         with_graphs(
             r#"
                 define i8 @test(i32 %x) {
@@ -2438,13 +2448,13 @@ mod tests {
             "#,
             |graphs| {
                 let adapted = adapt(&graphs[0]).unwrap();
-                let has_assume = adapted
+                let has_bound = adapted
                     .cfg
                     .nodes()
                     .values()
                     .flat_map(|n| n.transfer.effects.iter())
-                    .any(|e| matches!(e, TransferEffect::Assume(_)));
-                assert!(!has_assume, "trunc should not emit range assumes");
+                    .any(|e| matches!(e, TransferEffect::Assume(_) | TransferEffect::TypeBound(_)));
+                assert!(!has_bound, "trunc should not emit range bounds");
             },
         );
     }

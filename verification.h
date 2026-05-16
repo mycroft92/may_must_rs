@@ -37,8 +37,17 @@ extern void may_assert(_Bool condition);
 
 /* Sentinel recognised by the checker as a path feasibility constraint.
  * Stripped from the visible CFG; condition injected as TransferEffect::Assume
- * on the nearest CFG node, so WP weakens to (cond => post) at that point. */
+ * on the nearest CFG node, so WP weakens to (cond AND post) at that point. */
 extern void may_assume(_Bool condition);
+
+/* Sentinel for type-system facts that are always satisfied by well-typed
+ * programs (e.g. "unsigned int is >= 0").  Stripped from the visible CFG;
+ * condition injected as TransferEffect::TypeBound which narrows the forward
+ * reach (SP) but has no backward WP effect.  This prevents type-range
+ * assumptions from polluting loop-invariant inductiveness checks when the
+ * bounded variable is a fresh nondeterministic value introduced inside the
+ * loop body. */
+extern void may_type_bound(_Bool condition);
 
 /* Redefine assert() so existing code needs no source changes. */
 #ifdef assert
@@ -48,6 +57,10 @@ extern void may_assume(_Bool condition);
 
 /* assume() is a fresh macro with no standard-library conflict. */
 #define assume(cond) may_assume((_Bool)(cond))
+
+/* type_bound() is used internally by nondet_*() macros.  Never use it for
+ * user-specified path constraints — use assume() for those. */
+#define type_bound(cond) may_type_bound((_Bool)(cond))
 
 /* ---------------------------------------------------------------------------
  * Bounded nondeterministic values
@@ -78,24 +91,24 @@ extern int __may_nondet_raw(void);
  * 2^32−1 or 2^64−1 doesn't fit in a signed SMT integer without care;
  * non-negativity is the critical constraint for soundness). */
 #define nondet_uint() \
-    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); _v; })
+    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); _v; })
 #define nondet_ulong() \
-    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); _v; })
+    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); _v; })
 
 /* Small unsigned types — full range constraints since they fit in i64. */
 #define nondet_uchar() \
-    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); assume(_v <= 255); _v; })
+    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); type_bound(_v <= 255); _v; })
 #define nondet_ushort() \
-    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); assume(_v <= 65535); _v; })
+    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); type_bound(_v <= 65535); _v; })
 
 /* Small signed types — full range constraints. */
 #define nondet_char() \
-    __extension__({ int _v = __may_nondet_raw(); assume(_v >= -128); assume(_v <= 127); _v; })
+    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= -128); type_bound(_v <= 127); _v; })
 #define nondet_short() \
-    __extension__({ int _v = __may_nondet_raw(); assume(_v >= -32768); assume(_v <= 32767); _v; })
+    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= -32768); type_bound(_v <= 32767); _v; })
 
 /* Boolean — constrained to {0, 1}. */
 #define nondet_bool() \
-    __extension__({ int _v = __may_nondet_raw(); assume(_v == 0 || _v == 1); _v; })
+    __extension__({ int _v = __may_nondet_raw(); type_bound(_v == 0 || _v == 1); _v; })
 
 #endif /* VERIFICATION_H */

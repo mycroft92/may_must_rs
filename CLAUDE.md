@@ -79,6 +79,12 @@ by `analyze_with_tables`.
 - **`loops.rs`**: `check_loop_invariant_verbose` checks initiation,
   inductiveness, and optionally exit closure. Pass `&BTreeMap::new()` for
   `assertion_postconditions` when exit closure should be skipped.
+  **Inductiveness pitfall**: the inductiveness check computes `WP(body, I)` and
+  calls `oracle.implies(I, WP(body, I))`. Any `Assume(c)` on a fresh
+  call-return variable inside the loop body (e.g. from a `nondet_*()` call in
+  the loop condition) adds `c` to `WP(body, I)`, making the implication
+  unprovable. Use `TypeBound` instead of `Assume` for type-system facts to
+  keep these out of the WP.
 - **`driver.rs`**: orchestrates per-module analysis, caches summaries, and
   drives interprocedural inference.
 
@@ -139,6 +145,12 @@ CFG node. The key instruction kinds:
 **`call`**
 - `may_assert` calls are stripped from the graph by `program_graph.rs` and
   recorded as `AssertionSite` obligations; they produce no transfer effect.
+- `may_assume` calls are stripped and recorded as `AssumeSite { is_type_bound: false }`;
+  the adapter injects `TransferEffect::Assume`.
+- `may_type_bound` calls are stripped and recorded as `AssumeSite { is_type_bound: true }`;
+  the adapter injects `TransferEffect::TypeBound`. Used by the `nondet_*()` macros in
+  `verification.h` for type-range constraints on nondeterministic inputs (e.g.
+  `unsigned int >= 0`). See the TypeBound entry below for why this is distinct from Assume.
 - For other callees: `TransferEffect::Call { callee, memory_effect }`.
   `memory_effect` is `PreservesMemory` if the callee was inferred to be pure
   (no stores, no impure callees), else `HavocMemory`.
@@ -230,6 +242,23 @@ For each `call` instruction where the callee has a known `ReturnSummary`:
   paths where c is false are infeasible and cannot reach the assertion. Note:
   this differs from the standard Hoare-style `c => post` — that weaker form
   would include spurious violations from paths the assume would have pruned.
+- `TypeBound(c)`: **WP = identity** (`post` unchanged). SP = `pre AND c` (same
+  as Assume). Used for type-system facts that are always satisfied by well-typed
+  programs (ZExt/SExt range bounds; `nondet_*()` type constraints). The key
+  distinction from `Assume`: in the loop-invariant inductiveness check, the WP
+  of the loop body is computed for each candidate `I`. If a `nondet_*()` call
+  inside the loop body produces a fresh unconstrained variable `v` and an
+  `Assume(v >= 0)` is in the body, then `WP(body, I)` contains `v >= 0`, and
+  `oracle.implies(I, v >= 0 AND ...)` always fails because no invariant over
+  program state can bound a fresh call-return variable. `TypeBound` removes this
+  obligation from WP while still narrowing the forward reach via SP, so
+  inductiveness succeeds and the assertion is discharged by the combined
+  `reach AND state` check.
+  **Soundness**: any real violating execution satisfies all type-system facts
+  (well-typed programs always have `unsigned int >= 0`). Removing `c` from WP
+  makes `state` weaker but the real violation still satisfies the weaker `state`;
+  the tighter `reach` (from SP) ensures `reach AND state` remains infeasible
+  for safe programs and feasible for genuinely unsafe ones.
 - `Obligation(f)`: conjoins `f` into the postcondition, asserting the callee
   relation holds at that point.
 - `Call { memory_effect: HavocMemory }`: existentially quantifies away all

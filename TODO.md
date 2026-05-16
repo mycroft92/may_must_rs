@@ -35,6 +35,39 @@ Fix in order:
   on operands of unsigned comparisons, or emit a conservative `UNKNOWN` when a
   comparison operand cannot be proved non-negative.
 
+## Known Benchmark Gaps (as of `1e7fb97`, 2026-05-16)
+
+Reference: `benchmarks/sv-comp/RESULTS.md`, latest run.
+Totals: 51 UNKNOWN · 5 UNSOUND · 7 MISSED · 105 files.
+
+### UNSOUND (wrong `Verified` on unsafe program — false safe)
+
+- `c/loops/count_up_down-1` — expected SAFE, got UNSAFE
+- `c/loops/linear_sea.ch` — expected SAFE, got UNSAFE
+- `c/loops/trex03-2` — expected SAFE, got UNSAFE
+- `c/loops/veris.c_NetBSD-libc_loop.i` — expected SAFE, got UNSAFE
+- `c/loop-invariants/bin-suffix-5` — expected SAFE, got UNSAFE
+
+`count_up_down-1` and `trex03-2` were previously fixed (in `970a9dd`) by
+ZExt/SExt `Assume` bounds in WP, but the `TypeBound` fix (which restores loop
+invariant synthesis) removes these from WP. The underlying root cause for
+these two is likely **unsigned icmp collapsed to signed** — fix that item
+first before revisiting.
+
+### MISSED (wrong verdict on unsafe program)
+
+- `c/loops/array-2`
+- `c/loops/ludcmp`
+- `c/loops/nec20`
+- `c/loops/sum01_bug02.i`
+- `c/loops/sum04-1.i`
+- `c/loops/verisec_OpenSER_cases1_stripFullBoth_arr.i`
+- `c/loop-invariants/linear-inequality-inv-b` — expected UNSAFE, got SAFE
+
+### UNKNOWN breakdown by category
+
+locks 13 · loops 33 · loop-crafted 5 · loop-invariants 0.
+
 ## Instruction Coverage (sound but lossy — produce ERROR/UNKNOWN today)
 
 - **Integer bitwise And/Or/Xor** — currently only lowered for `i1`-typed values
