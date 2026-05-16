@@ -230,6 +230,13 @@ pub enum TransferEffect {
         callee: String,
         memory_effect: CallMemoryEffect,
     },
+    /// Havoc a specific set of memory regions.
+    ///
+    /// Emitted by `resolve_memory_effects` when alias analysis identifies the
+    /// target regions of an otherwise-unresolved pointer store.  WP drops any
+    /// top-level conjunction in `post` that mentions one of the listed regions,
+    /// preserving constraints on non-aliasing regions.
+    HavocRegions { regions: Vec<String> },
 }
 
 /// An ordered sequence of [`TransferEffect`]s that models the semantics of a
@@ -864,6 +871,74 @@ pub enum CfgError {
     MissingExit,
 }
 
+/// Returns `true` if `formula` references the named memory region anywhere in
+/// its structure (as `Memory::Var(region)` inside a `select` term).
+fn formula_mentions_region(region: &str, formula: &Formula) -> bool {
+    match formula {
+        Formula::True | Formula::False | Formula::Var(_) => false,
+        Formula::Not(inner) => formula_mentions_region(region, inner),
+        Formula::And(items) | Formula::Or(items) => {
+            items.iter().any(|i| formula_mentions_region(region, i))
+        }
+        Formula::Implies(a, b) => {
+            formula_mentions_region(region, a) || formula_mentions_region(region, b)
+        }
+        Formula::Eq(a, b)
+        | Formula::Lt(a, b)
+        | Formula::Le(a, b)
+        | Formula::Gt(a, b)
+        | Formula::Ge(a, b) => term_mentions_region(region, a) || term_mentions_region(region, b),
+        Formula::MemoryEq(a, b) => {
+            memory_mentions_region(region, a) || memory_mentions_region(region, b)
+        }
+    }
+}
+
+fn term_mentions_region(region: &str, term: &Term) -> bool {
+    match term {
+        Term::Int(_) | Term::Real(_) | Term::Var(_) => false,
+        Term::BoolToInt(inner) => formula_mentions_region(region, inner),
+        Term::Select(mem, idx) => {
+            memory_mentions_region(region, mem) || term_mentions_region(region, idx)
+        }
+        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b) | Term::Rem(a, b) => {
+            term_mentions_region(region, a) || term_mentions_region(region, b)
+        }
+        Term::Neg(inner) => term_mentions_region(region, inner),
+    }
+}
+
+fn memory_mentions_region(region: &str, memory: &Memory) -> bool {
+    match memory {
+        Memory::Var(name) => name == region,
+        Memory::Store(inner, idx, val) => {
+            memory_mentions_region(region, inner)
+                || term_mentions_region(region, idx)
+                || term_mentions_region(region, val)
+        }
+    }
+}
+
+/// WP helper for `HavocRegions`.
+///
+/// At `And` nodes, conjuncts that mention `region` are dropped (they become
+/// unconstrained after havocing). At other nodes, if `region` is mentioned
+/// the entire formula conservatively becomes `True`.  Conjuncts that do not
+/// mention `region` are preserved exactly.
+fn havoc_region_in_formula(region: &str, formula: Formula) -> Formula {
+    if !formula_mentions_region(region, &formula) {
+        return formula;
+    }
+    match formula {
+        Formula::And(items) => Formula::and_many(
+            items
+                .into_iter()
+                .filter(|item| !formula_mentions_region(region, item)),
+        ),
+        _ => Formula::True,
+    }
+}
+
 fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
     match effect {
         TransferEffect::Nop
@@ -876,6 +951,13 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
         | TransferEffect::Call { .. }
         | TransferEffect::Load { .. }
         | TransferEffect::Store { .. } => post.clone(),
+        TransferEffect::HavocRegions { regions } => {
+            let mut result = post.clone();
+            for region in regions {
+                result = havoc_region_in_formula(region, result);
+            }
+            result
+        }
         TransferEffect::Assign { target, value } => match value {
             AssignValue::Term(term) => substitute_var_in_formula(target, term, post),
             AssignValue::Predicate(predicate) => {
@@ -908,7 +990,8 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
         | TransferEffect::Load { .. }
         | TransferEffect::Store { .. }
         | TransferEffect::MemoryStore { .. }
-        | TransferEffect::Call { .. } => pre.clone(),
+        | TransferEffect::Call { .. }
+        | TransferEffect::HavocRegions { .. } => pre.clone(),
         TransferEffect::Assign { target, value } => match value {
             AssignValue::Term(term) => Formula::and(
                 pre.clone(),

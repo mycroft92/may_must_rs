@@ -36,6 +36,7 @@ use crate::common::abstract_cfg::{
     AbstractCfg, AssignValue, CallMemoryEffect, CfgEdgeId, CfgNodeId, PointerEnv, SourceLocation,
     TransferEffect, TransferFn,
 };
+use crate::common::alias_analysis::AliasResult;
 use crate::common::formula::{Formula, Memory, Rational, Sort, Term, Var};
 use crate::common::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TargetData, TypeKind};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
@@ -194,7 +195,12 @@ pub fn adapt_with_purity(
     graph: &FunctionGraph,
     memory_pure: &BTreeSet<String>,
 ) -> Result<AdaptedProcedure, AdapterError> {
-    adapt_with_purity_and_summaries(graph, memory_pure, &CallSummaryRegistry::new())
+    adapt_with_purity_and_summaries(
+        graph,
+        memory_pure,
+        &CallSummaryRegistry::new(),
+        &AliasResult::default(),
+    )
 }
 
 /// Full lowering entry point.
@@ -217,6 +223,7 @@ pub fn adapt_with_purity_and_summaries(
     graph: &FunctionGraph,
     memory_pure: &BTreeSet<String>,
     summaries: &CallSummaryRegistry,
+    alias: &AliasResult,
 ) -> Result<AdaptedProcedure, AdapterError> {
     let function_name = &graph.name;
     let start = graph.start.ok_or(AdapterError::MissingStart)?;
@@ -291,7 +298,7 @@ pub fn adapt_with_purity_and_summaries(
     let assertions = lower_assertions(function_name, graph, &mut cfg, &instruction_nodes)?;
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-    let final_env = resolve_memory_effects(&mut cfg, graph, function_name);
+    let final_env = resolve_memory_effects(&mut cfg, graph, function_name, alias);
     apply_pending_return_summaries(
         &mut cfg,
         graph,
@@ -1237,6 +1244,7 @@ fn resolve_memory_effects(
     cfg: &mut AbstractCfg,
     graph: &FunctionGraph,
     function_name: &str,
+    alias: &AliasResult,
 ) -> PointerEnv {
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
     let order = cfg
@@ -1355,6 +1363,15 @@ fn resolve_memory_effects(
                 } => {
                     if let Some(binding) = env.get(&value_ptr).cloned() {
                         env.bind(target_slot.clone(), binding.region, binding.offset);
+                    } else {
+                        // AA fallback: if value_ptr points to exactly one abstract
+                        // location, propagate that binding to target_slot.
+                        let locs = alias.points_to(&value_ptr);
+                        if locs.len() == 1 {
+                            let region = locs.iter().next().unwrap().0.clone();
+                            env.bind(target_slot.clone(), region, Term::int(0));
+                        }
+                        // If ambiguous or unknown, leave target_slot unbound (conservative).
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
@@ -1364,6 +1381,24 @@ fn resolve_memory_effects(
                 } => {
                     if let Some(binding) = env.get(&source_slot).cloned() {
                         env.bind(target_ptr, binding.region, binding.offset);
+                    } else {
+                        // AA fallback: collect all abstract locations stored into every
+                        // region that source_slot may point to.  If the union is a single
+                        // location, bind target_ptr to it; otherwise leave unresolved.
+                        let candidate_regions: Vec<String> = alias
+                            .points_to(&source_slot)
+                            .iter()
+                            .map(|loc| loc.0.clone())
+                            .collect();
+                        let stored: BTreeSet<&str> = candidate_regions
+                            .iter()
+                            .flat_map(|r| alias.stored_into(r).iter().map(|l| l.0.as_str()))
+                            .collect();
+                        if stored.len() == 1 {
+                            let region = stored.into_iter().next().unwrap().to_string();
+                            env.bind(target_ptr, region, Term::int(0));
+                        }
+                        // If ambiguous or unknown, leave target_ptr unbound (conservative).
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
@@ -2147,9 +2182,13 @@ mod tests {
                     ),
                     write_effects: Vec::new(),
                 });
-                let adapted =
-                    adapt_with_purity_and_summaries(&graphs[0], &BTreeSet::new(), &registry)
-                        .unwrap();
+                let adapted = adapt_with_purity_and_summaries(
+                    &graphs[0],
+                    &BTreeSet::new(),
+                    &registry,
+                    &AliasResult::default(),
+                )
+                .unwrap();
                 let has_obligation = adapted
                     .cfg
                     .nodes()
@@ -2189,9 +2228,13 @@ mod tests {
                     write_effects: Vec::new(),
                 });
 
-                let adapted =
-                    adapt_with_purity_and_summaries(&graphs[0], &BTreeSet::new(), &registry)
-                        .unwrap();
+                let adapted = adapt_with_purity_and_summaries(
+                    &graphs[0],
+                    &BTreeSet::new(),
+                    &registry,
+                    &AliasResult::default(),
+                )
+                .unwrap();
                 let rendered = adapted
                     .cfg
                     .nodes()

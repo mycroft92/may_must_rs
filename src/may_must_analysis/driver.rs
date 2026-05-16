@@ -41,6 +41,7 @@ use crate::common::adapter::{
     ext_region_name, synthetic_retval_name, AdaptedProcedure, AdapterError, AssertionSite,
     CallSummaryRegistry, ReturnSummary,
 };
+use crate::common::alias_analysis::run_alias_analysis;
 use crate::common::formula::{Formula, Memory, Term, Var};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use crate::common::oracle::Oracle;
@@ -205,6 +206,7 @@ pub fn analyze_module_with_llm(
     oracle: &Oracle,
     inv_config: &InvariantConfig,
 ) -> Result<ModuleReport, DriverError> {
+    let alias = run_alias_analysis(graphs);
     let mut summaries = CallSummaryRegistry::new();
 
     let in_graph = graphs
@@ -223,7 +225,9 @@ pub fn analyze_module_with_llm(
     for _ in 0..graphs.len().max(1) {
         let snapshot = summaries.clone();
         for graph in graphs {
-            if let Ok(adapted) = adapt_with_purity_and_summaries(graph, memory_pure, &snapshot) {
+            if let Ok(adapted) =
+                adapt_with_purity_and_summaries(graph, memory_pure, &snapshot, &alias)
+            {
                 if let Some(summary) = infer_return_summary(graph, &adapted, oracle) {
                     summaries.insert(summary);
                 }
@@ -254,7 +258,7 @@ pub fn analyze_module_with_llm(
         let adapted = if summaries.is_empty() && memory_pure.is_empty() {
             adapt(graph)
         } else {
-            adapt_with_purity_and_summaries(graph, memory_pure, &summaries)
+            adapt_with_purity_and_summaries(graph, memory_pure, &summaries, &alias)
         };
         let Ok(adapted) = adapted else {
             continue;
@@ -320,10 +324,11 @@ pub fn analyze_with_summaries(
     tables: Option<&SummaryTables>,
     config: Option<&InvariantConfig>,
 ) -> Result<ProcedureReport, DriverError> {
+    let alias = run_alias_analysis(std::slice::from_ref(graph));
     let adapted = if summaries.is_empty() && memory_pure.is_empty() {
         adapt(graph)?
     } else {
-        adapt_with_purity_and_summaries(graph, memory_pure, summaries)?
+        adapt_with_purity_and_summaries(graph, memory_pure, summaries, &alias)?
     };
     let precomputed_owned = tables
         .and_then(|tables| {

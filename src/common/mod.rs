@@ -1,5 +1,6 @@
 pub mod abstract_cfg;
 pub mod adapter;
+pub mod alias_analysis;
 pub mod assertions;
 pub mod errors;
 pub mod formula;
