@@ -1,0 +1,33 @@
+# SV-COMP categories relevant to Smash-plus-ultra
+#
+# Format: one subdirectory path per line, relative to the sv-benchmarks root.
+# Lines starting with '#' and blank lines are ignored.
+#
+# Selection criteria
+# ------------------
+# We target integer / loop / control-flow programs only:
+#   - no floating-point (checker reports UNKNOWN for float IR)
+#   - no heap allocation (malloc/new — Step 4 pending)
+#   - no concurrency (out of scope)
+#   - property: unreach-call (reachability of __VERIFIER_error)
+#
+# Start with a small slice per category; comment out categories that produce
+# too many UNKNOWN results until the relevant feature is implemented.
+
+# Pure integer loop programs — best fit for our loop invariant synthesis.
+c/ReachSafety-Loops
+
+# Integer control-flow without loops — exercises acyclic path reasoning.
+c/ReachSafety-ControlFlow
+
+# ECA (Extended Component Automata) — state-machine integer programs.
+# Moderate complexity; uncomment once Loops is stable.
+# c/ReachSafety-ECA
+
+# Bit-vector benchmarks — partially supported (integer subset only).
+# Uncomment once broader cast / bitwise coverage is added.
+# c/ReachSafety-BitVectors
+
+# Array programs with integer indices — exercises our memory model.
+# Many benchmarks need heap model (Step 4) so expect high UNKNOWN rate.
+# c/ReachSafety-Arrays
