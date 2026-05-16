@@ -29,10 +29,18 @@ modules. Instead:
 
 - node and edge identifiers
 - abstract nodes and edges
-- transfer effects
+- transfer effects (including `HavocRegions` for targeted region havocing)
 - weakest-precondition / strongest-postcondition helpers
 - single-exit normalization
 - topological-order and back-edge helpers used by the cyclic checker
+
+`alias_analysis.rs`
+
+- field-sensitive, flow-insensitive Andersen points-to analysis
+- run once per module (or per function) before lowering
+- produces `AliasResult` mapping each SSA pointer to its abstract locations
+- consumed by `resolve_memory_effects` to resolve pointer operations the
+  local `PointerEnv` cannot handle
 
 `adapter.rs`
 
@@ -40,7 +48,8 @@ modules. Instead:
 - records assertion sites
 - maps `phi` nodes to predecessor-edge assignments
 - lowers branches to edge guards
-- rewrites memory effects through the integer-array model
+- rewrites memory effects through the integer-array model, using `AliasResult`
+  as a fallback for unresolved `PointerStore`/`PointerLoad` operations
 - infers memory-pure functions
 - infers direct-call return summaries and reuses them
 
@@ -82,6 +91,7 @@ modules. Instead:
 `driver.rs`
 
 - module-level orchestration
+- runs whole-module alias analysis before the summary loop
 - fixed-point style return-summary accumulation
 - loop-invariant precomputation and caching
 - report construction for procedures

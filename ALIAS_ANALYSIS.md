@@ -1,29 +1,32 @@
-# Alias Analysis Design
+# Alias Analysis
 
-This document describes the planned alias analysis pass for the may/must
-verification tool.  Alias analysis is the prerequisite for the heap memory
-model (Step 4): without it, every store through an unresolved pointer must
-conservatively havoc *all* heap regions, making the solver unable to maintain
-any fact about heap-allocated data across an unknown write.
+This document describes the alias analysis pass implemented in
+`src/common/alias_analysis.rs`.  Alias analysis is the prerequisite for the
+heap memory model (Step 4): without it, every store through an unresolved
+pointer must conservatively havoc *all* heap regions, making the solver unable
+to maintain any fact about heap-allocated data across an unknown write.
 
 ---
 
 ## Motivation
 
-The current `resolve_memory_effects` pass in `adapter.rs` builds a `PointerEnv`
-by tracking pointer provenance through `alloca`, `GEP`, `bitcast`, and pointer
-parameter seeding.  When a store target cannot be resolved (e.g. a pointer
-loaded from a heap cell), the effect is left as a raw `Store` — invisible to
-the WP engine.  For heap objects this means:
+`resolve_memory_effects` in `adapter.rs` builds a `PointerEnv` by tracking
+pointer provenance through `alloca`, `GEP`, `bitcast`, and pointer parameter
+seeding.  When a pointer operation's target cannot be resolved from the local
+`PointerEnv` (e.g. a pointer loaded from a heap cell, or a store through a
+pointer received as an argument to an inlined helper), the effect was
+previously left as a raw `Store`/`PointerLoad` — invisible to the WP engine.
+For heap objects this means:
 
-- every `malloc` result that is stored somewhere becomes an unresolved store
-  target on retrieval, losing all information about the written value; and
-- the only sound fallback is to havoc all heap regions, making any assertion
-  about heap-allocated data produce `UNKNOWN`.
+- every `malloc` result stored into a slot and later loaded becomes an
+  unresolved load target, losing all information about the written value; and
+- the only sound fallback is to treat the pointer as having unknown provenance,
+  producing `UNKNOWN` for any downstream assertion.
 
 Alias analysis computes a **points-to map** — for each SSA pointer name, the
 set of abstract memory regions it may point to — which lets `resolve_memory_effects`
-limit havocing to only the regions a pointer may actually alias.
+use AA as a fallback to resolve the region when the local env does not have
+enough information.
 
 ---
 
@@ -151,37 +154,44 @@ to heap pointers exactly as to stack allocas.
 
 ---
 
-## Solver
+## Implementation
 
-### Data structures
+### Data structures (`src/common/alias_analysis.rs`)
 
 ```rust
-// src/common/alias_analysis.rs  (new file)
-
 /// An abstract memory location, identified by its region name.
 #[derive(Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
 pub struct AbstractLoc(pub String);
 
+impl AbstractLoc {
+    /// Returns the abstract location for struct field `field` of this location.
+    pub fn field(&self, field: u32) -> Self;
+}
+
 pub struct AliasResult {
     /// Points-to sets for every SSA pointer name seen in the IR.
     pts: HashMap<String, BTreeSet<AbstractLoc>>,
-    /// For each abstract region, the set of abstract locations
-    /// ever stored into it as pointer values (needed for PointerLoad).
-    pts_mem: HashMap<AbstractLoc, BTreeSet<AbstractLoc>>,
+    /// For each abstract region name, the set of abstract locations
+    /// ever stored into it as pointer values (needed to resolve PointerLoad).
+    pts_mem: HashMap<String, BTreeSet<AbstractLoc>>,
 }
 
 impl AliasResult {
-    /// May two abstract region names alias (i.e. be pointed to by the
-    /// same pointer)?
+    /// May two abstract region names alias (i.e. be pointed to by the same pointer)?
     pub fn may_alias_regions(&self, r1: &str, r2: &str) -> bool;
 
-    /// Which abstract locations does this SSA pointer name point to?
+    /// The set of abstract locations that SSA pointer `ptr` may point to.
     pub fn points_to(&self, ptr: &str) -> &BTreeSet<AbstractLoc>;
 
-    /// Which abstract locations may be stored inside region r
-    /// as pointer values?
-    pub fn stored_into(&self, r: &str) -> &BTreeSet<AbstractLoc>;
+    /// The set of abstract locations ever stored into `region` as pointer values.
+    pub fn stored_into(&self, region: &str) -> &BTreeSet<AbstractLoc>;
+
+    /// Iterator over region names in `pts(ptr)`.
+    pub fn pointed_regions(&self, ptr: &str) -> impl Iterator<Item = &str>;
 }
+
+/// Run the whole-module alias analysis and return an AliasResult.
+pub fn run_alias_analysis(graphs: &[FunctionGraph]) -> AliasResult;
 ```
 
 ### Worklist algorithm
@@ -237,64 +247,61 @@ reduce it further if needed.
 
 ---
 
-## Integration with the Existing Pipeline
+## Integration with the Pipeline
 
 ### Where AA runs
 
-A new function `run_alias_analysis(graphs: &[FunctionGraph]) -> AliasResult`
-is called once in `driver.rs::analyze_module_with_llm` **before** the
-summary-accumulation loop.  It receives the same `FunctionGraph` slice already
-available at that point and performs a whole-program constraint solve.
+`run_alias_analysis` is called in two places:
 
-```rust
-// driver.rs::analyze_module_with_llm  (new lines, before the summaries loop)
-let alias_result = common::alias_analysis::run_alias_analysis(graphs);
-```
+1. **`driver.rs::analyze_module_with_llm`** — once on the entire module, before
+   the summary-accumulation loop.  The result is shared across all
+   `adapt_with_purity_and_summaries` calls for that module.
 
-The `AliasResult` is then threaded into `adapt_with_purity_and_summaries`:
-
-```rust
-adapt_with_purity_and_summaries(graph, memory_pure, &summaries, &alias_result)
-```
+2. **`driver.rs::analyze_with_summaries`** — on the single `FunctionGraph`
+   being lowered, for callers that bypass `analyze_module_with_llm`.  The
+   per-function AA is a sound over-approximation of the full module result.
 
 ### How `resolve_memory_effects` uses `AliasResult`
 
-**Unresolved `Store { target, value }`** (store through a pointer not in
-`PointerEnv`):
+**Unresolved `PointerStore { target_slot, value_ptr }`** (the stored pointer
+`value_ptr` is not in the `PointerEnv`):
 
 ```
-havoc_set = alias_result.points_to(target)
-for r in havoc_set:
-    emit  HavocRegions { regions: [r] }   // targeted, not global havoc
-```
-
-**Unresolved `PointerLoad { target_ptr, source_slot }`** (load of a pointer
-from a region not directly in `PointerEnv`):
-
-```
-candidates = ⋃ { alias_result.stored_into(r) | r ∈ alias_result.points_to(source_slot) }
-if |candidates| == 1:
-    bind target_ptr → sole candidate at offset 0
+locs = alias.points_to(value_ptr)
+if |locs| == 1:
+    bind target_slot → sole region at offset 0
 else:
-    introduce a symbolic choice over candidates (or leave unresolved → UNKNOWN)
+    leave target_slot unbound  // ambiguous or unknown → conservative
 ```
 
-**Heap call site naming** — the constraint generator assigns a stable integer
-id `C` to each `call @malloc` / `call @operator_new` instruction encountered
-during the pre-scan of `FunctionGraph::vertices`.  Both the AA and the adapter
-use this same map so `heap$callC` names are consistent.
+**Unresolved `PointerLoad { target_ptr, source_slot }`** (the source slot is
+not in the `PointerEnv`):
 
-### New `TransferEffect` variant
+```
+candidate_regions = pts(source_slot)          // where source_slot points
+stored = ⋃ { stored_into(r) | r ∈ candidate_regions }
+if |stored| == 1:
+    bind target_ptr → sole region at offset 0
+else:
+    leave target_ptr unbound  // ambiguous or unknown → conservative
+```
+
+When `pts` is empty (pointer provenance unknown) the effect stays a `Nop` and
+the downstream analysis may produce `UNKNOWN` — the same as the pre-AA
+behaviour.
+
+### `HavocRegions` transfer effect
 
 ```rust
-/// Havoc a specific list of regions (rather than all memory).
-/// WP: for each region r, replace r with a fresh unconstrained variable.
+/// Havoc a specific list of memory regions.
+/// WP: drops top-level And conjuncts that mention any listed region;
+///     other formula shapes mentioning the region become True.
 HavocRegions { regions: Vec<String> }
 ```
 
-This replaces the coarse `CallMemoryEffect::HavocMemory` for stores whose
-target regions are known from AA.  WP drops only the memory constraints
-involving the listed regions; all other regions are preserved.
+This is used when a store target resolves to a known set of regions but the
+stored value is not a simple constant, allowing targeted rather than global
+havocing.
 
 ---
 

@@ -114,10 +114,12 @@ impl AliasResult {
         self.points_to(ptr).iter().map(|l| l.0.as_str())
     }
 
+    /// Inserts `loc` into `pts(target)`.  Returns `true` if the set grew.
     fn insert_pts(&mut self, target: &str, loc: AbstractLoc) -> bool {
         self.pts.entry(target.to_string()).or_default().insert(loc)
     }
 
+    /// Inserts `loc` into `pts_mem(region)`.  Returns `true` if the set grew.
     fn insert_pts_mem(&mut self, region: &str, loc: AbstractLoc) -> bool {
         self.pts_mem
             .entry(region.to_string())
@@ -152,32 +154,54 @@ enum Constraint {
 
 // ── Naming helpers (mirror adapter.rs, no import needed) ─────────────────────
 
+/// Returns the SSA variable name as used in the abstract environment: `fn$<display>`.
+///
+/// Mirrors `adapter::local_name` so that AA-produced names are directly
+/// comparable with `PointerEnv` keys.
 fn local_name(fn_name: &str, instr: Instruction) -> String {
     format!("{fn_name}${}", instr.display_name())
 }
 
+/// Returns the external region name for the `idx`-th pointer parameter of `fn_name`.
+///
+/// Mirrors `adapter::ext_region_name`.
 fn ext_region(fn_name: &str, idx: usize) -> String {
     format!("{fn_name}$__ext_{idx}")
 }
 
+/// Returns the stack region name for the `idx`-th `alloca` in `fn_name`.
+///
+/// Mirrors the region assigned by `adapter.rs` during its first pass over vertices.
 fn alloca_region(fn_name: &str, idx: usize) -> String {
     format!("{fn_name}$stack{idx}")
 }
 
+/// Returns the global region name for a global-variable reference instruction.
+///
+/// Mirrors `adapter.rs`'s `"global${display_name}"` convention.
 fn global_region(instr: Instruction) -> String {
     format!("global${}", instr.display_name())
 }
 
+/// Returns the heap region name for the allocation call at `call_site_id`.
+///
+/// Each `malloc`/`new` call site gets a unique, stable region so that
+/// different allocation sites remain distinguishable by the analysis.
 fn heap_region(call_site_id: usize) -> String {
     format!("heap$call{call_site_id}")
 }
 
+/// Returns `true` if `instr` has a pointer result type.
 fn is_ptr(instr: Instruction) -> bool {
     matches!(instr.get_type().map(|t| t.kind()), Some(TypeKind::Pointer))
 }
 
+/// Returns `true` if `name` is a standard heap-allocation function.
+///
+/// Recognized names cover the C stdlib allocators (`malloc`, `calloc`,
+/// `realloc`) and the Itanium C++ ABI allocation entry points (`_Znwm`,
+/// `_Znam`, and their nothrow variants).
 fn is_alloc_callee(name: &str) -> bool {
-    // Standard allocation functions.
     matches!(
         name,
         "malloc"
@@ -192,6 +216,17 @@ fn is_alloc_callee(name: &str) -> bool {
 
 // ── Constraint generation ─────────────────────────────────────────────────────
 
+/// Walks every instruction in `graphs` and emits the Andersen constraints
+/// that its pointer operations imply.
+///
+/// The five constraint kinds and the instructions that generate them are
+/// described in the [`Constraint`] documentation.  The alloca numbering and
+/// region-name conventions mirror `adapter.rs` exactly so that the resulting
+/// [`AliasResult`] is directly usable by `resolve_memory_effects`.
+///
+/// A module-wide monotonic `call_site_id` counter ensures that each
+/// `malloc`/`new` call site receives a unique, stable [`heap_region`] name
+/// even across functions.
 fn collect_constraints(graphs: &[FunctionGraph]) -> Vec<Constraint> {
     let mut constraints = Vec::new();
     // Monotonically-increasing call-site counter across the whole module so
@@ -393,9 +428,19 @@ fn collect_constraints(graphs: &[FunctionGraph]) -> Vec<Constraint> {
 /// Run the worklist fixpoint over `constraints` and return the saturated
 /// [`AliasResult`].
 ///
+/// # Algorithm
+///
+/// 1. Seed `pts` from all [`Constraint::Seed`] entries.
+/// 2. Build a reverse index `source → constraint indices` so that when
+///    `pts(p)` grows, only the constraints that depend on `p` are re-queued.
+/// 3. Initialise the worklist with every constraint whose source already has a
+///    non-empty `pts` set (the seeded pointers).
+/// 4. Repeatedly pop a constraint and apply it; if any `pts`/`pts_mem` set
+///    grows, push the newly-affected constraints back onto the worklist.
+///
 /// Termination is guaranteed because the pts lattice is finite (bounded by
-/// the number of distinct abstract locations) and each iteration adds at
-/// least one new element.
+/// the number of distinct abstract locations in the module) and each
+/// worklist step adds at least one element that was not there before.
 fn solve(constraints: Vec<Constraint>) -> AliasResult {
     let mut result = AliasResult::default();
 
@@ -603,13 +648,21 @@ fn solve(constraints: Vec<Constraint>) -> AliasResult {
 
 /// Run the whole-module alias analysis on `graphs` and return an [`AliasResult`].
 ///
-/// Call this once before `adapt_with_purity_and_summaries` in the driver so
-/// that `resolve_memory_effects` can use the points-to information to:
+/// This is the public entry point. It chains [`collect_constraints`] and
+/// [`solve`], and is called by the driver before the summary-inference loop
+/// and by [`analyze_with_summaries`] for single-function analysis.
 ///
-/// - emit targeted `MemoryStore` effects instead of leaving unresolved pointer
-///   stores as silent no-ops;
-/// - bind `PointerLoad` results to the set of things stored into the
-///   source region.
+/// The resulting [`AliasResult`] is consumed by `resolve_memory_effects`
+/// (inside `adapt_with_purity_and_summaries`) to handle pointer operations
+/// that the local `PointerEnv` could not resolve:
+///
+/// - **`PointerStore`**: if `pts(value_ptr)` is a singleton, `target_slot`
+///   is bound to that region in the env.
+/// - **`PointerLoad`**: if the union of `pts_mem(r)` for all `r ∈ pts(source_slot)`
+///   is a singleton, `target_ptr` is bound to that region.
+///
+/// When the points-to set is empty or ambiguous the effect remains a `Nop`
+/// and the downstream analysis treats the pointer as unresolved (conservative).
 pub fn run_alias_analysis(graphs: &[FunctionGraph]) -> AliasResult {
     let constraints = collect_constraints(graphs);
     solve(constraints)

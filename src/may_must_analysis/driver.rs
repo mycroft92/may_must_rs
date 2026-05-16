@@ -152,30 +152,9 @@ pub fn analyze_function_graph(
 
 /// Analyse every function in an LLVM module and return a [`ModuleReport`].
 ///
-/// This is the primary entry point for whole-module verification.  It
-/// orchestrates the following passes in order:
-///
-/// 1. Collect external callee names and load any manually-provided summaries
-///    from the [`CandidateProvider`].
-/// 2. Iteratively infer return summaries for all in-module functions (up to
-///    `graphs.len()` rounds to handle mutual calls).
-/// 3. Convert return summaries to must/not-may entries in [`SummaryTables`].
-/// 4. Pre-compute and cache loop invariants for every looping function via
-///    [`discover_loop_invariants`].
-/// 5. Run [`analyze_with_summaries`] for each function and collect reports.
-/// Analyse every function in an LLVM module and return a [`ModuleReport`].
-///
-/// This is the primary entry point for whole-module verification.  It
-/// orchestrates the following passes in order:
-///
-/// 1. Collect external callee names and load any manually-provided summaries
-///    from the [`CandidateProvider`].
-/// 2. Iteratively infer return summaries for all in-module functions (up to
-///    `graphs.len()` rounds to handle mutual calls).
-/// 3. Convert return summaries to must/not-may entries in [`SummaryTables`].
-/// 4. Pre-compute and cache loop invariants for every looping function via
-///    [`discover_loop_invariants`].
-/// 5. Run [`analyze_with_summaries`] for each function and collect reports.
+/// Convenience wrapper that runs with a default [`InvariantConfig`] and no
+/// external candidate provider.  See [`analyze_module_with_llm`] for the
+/// full pipeline description.
 pub fn analyze_module(
     graphs: &[FunctionGraph],
     memory_pure: &BTreeSet<String>,
@@ -184,6 +163,11 @@ pub fn analyze_module(
     analyze_module_with_provider(graphs, memory_pure, &NoProvider, oracle)
 }
 
+/// Analyse every function in an LLVM module, using `provider` for external
+/// summaries, and return a [`ModuleReport`].
+///
+/// Convenience wrapper around [`analyze_module_with_llm`] that supplies a
+/// default [`InvariantConfig`].
 pub fn analyze_module_with_provider(
     graphs: &[FunctionGraph],
     memory_pure: &BTreeSet<String>,
@@ -199,6 +183,23 @@ pub fn analyze_module_with_provider(
     )
 }
 
+/// Full whole-module analysis entry point.
+///
+/// Orchestrates the following passes in order:
+///
+/// 0. Run [`run_alias_analysis`] once on the entire module.  The resulting
+///    [`AliasResult`] is shared across all lowering calls so that
+///    `resolve_memory_effects` can resolve pointer operations that the local
+///    `PointerEnv` alone cannot handle.
+/// 1. Load manually-provided summaries from `provider` for any callee not
+///    defined in the module.
+/// 2. Iteratively infer [`ReturnSummary`] entries for all in-module functions
+///    (up to `graphs.len()` rounds to converge mutual calls).
+/// 3. Convert inferred summaries to must/not-may entries in [`SummaryTables`].
+/// 4. Pre-compute and cache loop invariants for every looping function via
+///    [`discover_loop_invariants`].
+/// 5. Run [`analyze_with_summaries`] for each function using `inv_config` to
+///    control the invariant search, and collect per-procedure reports.
 pub fn analyze_module_with_llm(
     graphs: &[FunctionGraph],
     memory_pure: &BTreeSet<String>,
@@ -316,6 +317,19 @@ pub fn analyze_function_graph_with_purity(
     )
 }
 
+/// Lower and verify a single function, returning a [`ProcedureReport`].
+///
+/// This is the per-function workhorse called by both [`analyze_module_with_llm`]
+/// and the standalone `analyze_function_graph*` helpers.
+///
+/// The function runs [`run_alias_analysis`] on `graph` alone before lowering.
+/// When called from the full module analysis the per-function AA is a subset
+/// of the module-wide one; it is still sound (flow-insensitive AA over a
+/// subset of the IR is an over-approximation of the same constraints).
+///
+/// If `tables` supplies pre-computed loop invariants for this function they
+/// are used directly; otherwise [`discover_loop_invariants`] is called.
+/// When `config` is `None`, the default invariant-search configuration is used.
 pub fn analyze_with_summaries(
     graph: &FunctionGraph,
     memory_pure: &BTreeSet<String>,

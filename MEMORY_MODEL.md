@@ -155,8 +155,10 @@ programs with complex aliasing.
 **Free / delete.** `free(p)` havoces the region `p` points to.  No
 use-after-free reasoning; well-typed programs are assumed.
 
-**Prerequisite.** An alias analysis pass before lowering is needed to avoid
-unnecessary havocing.
+**Prerequisite (complete).** The alias analysis pass (`src/common/alias_analysis.rs`)
+is implemented and wired into the lowering pipeline.  `resolve_memory_effects` uses
+`AliasResult` to bind `PointerStore`/`PointerLoad` operations that the local
+`PointerEnv` cannot resolve.  See `ALIAS_ANALYSIS.md` for the full design.
 
 ### Interaction with the bidirectional analysis
 
@@ -179,7 +181,7 @@ reachable-state formula begins with `True` for heap.
 | Aliasing          | distinct by default     | call-site abstraction     |
 | Unknown store     | havoces one region      | havoces all heap regions  |
 | Deallocation      | end of scope (implicit) | `free` havoces region     |
-| Prerequisite      | none                    | alias analysis pass       |
+| Prerequisite      | none                    | alias analysis (done — see `ALIAS_ANALYSIS.md`) |
 
 ---
 

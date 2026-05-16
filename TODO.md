@@ -59,8 +59,12 @@ allocas. Plan: treat each `malloc` call site as a fresh named region
 havocing all heap regions at unknown pointer stores. This is sound but may
 produce `UNKNOWN` for programs that alias heap regions.
 
-Prerequisite: alias analysis pass before lowering so the adapter knows which
-heap pointers can alias.
+**Prerequisite complete:** the alias analysis pass (`src/common/alias_analysis.rs`)
+is implemented and wired into the lowering pipeline.  `resolve_memory_effects`
+now uses `AliasResult` to bind pointer operations that the local `PointerEnv`
+cannot resolve.  The remaining work is wiring `heap$callC` region names into
+the adapter so that `malloc` call sites produce `Seed` constraints in the AA
+and the lowered CFG contains concrete `MemoryStore` effects for heap writes.
 
 ### Step 5 — Virtual dispatch
 

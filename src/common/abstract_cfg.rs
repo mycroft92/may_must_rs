@@ -894,6 +894,8 @@ fn formula_mentions_region(region: &str, formula: &Formula) -> bool {
     }
 }
 
+/// Returns `true` if `term` references the named memory region anywhere in its
+/// structure (as `Memory::Var(region)` inside a `select` term).
 fn term_mentions_region(region: &str, term: &Term) -> bool {
     match term {
         Term::Int(_) | Term::Real(_) | Term::Var(_) => false,
@@ -908,6 +910,7 @@ fn term_mentions_region(region: &str, term: &Term) -> bool {
     }
 }
 
+/// Returns `true` if `memory` is, or recursively contains, the named region.
 fn memory_mentions_region(region: &str, memory: &Memory) -> bool {
     match memory {
         Memory::Var(name) => name == region,

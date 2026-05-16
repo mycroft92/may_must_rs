@@ -184,9 +184,12 @@ src/common/llvm_utils/program_graph.rs raw instruction-level FunctionGraph build
 src/common/source.rs                   SourceLocation type (file, line, column)
 src/common/formula.rs                  terms, predicates, memory arrays, SMT model types
 src/common/abstract_cfg.rs             abstract CFG, TransferEffect variants, WP/SP
+src/common/alias_analysis.rs           field-sensitive flow-insensitive Andersen alias
+                                        analysis; run once per module before lowering
 src/common/adapter.rs                  FunctionGraph → AdaptedProcedure lowering
                                         (GEP offsets, per-field struct regions,
                                          pointer environment resolution,
+                                         AA-assisted PointerStore/PointerLoad binding,
                                          return summary injection, memcpy unrolling)
 src/common/oracle.rs                   SMT feasibility / implication (Z3 boundary)
 src/may_must_analysis/node_summary.rs  per-node (reach, state) summaries
@@ -198,8 +201,8 @@ src/may_must_analysis/chc.rs           Constrained Horn Clause encoding and Z3 S
                                         solver integration for loop invariants
 src/may_must_analysis/backward.rs      assertion checking, loop invariant synthesis
                                         (algorithmic → CHC → Houdini → LLM CEGIS)
-src/may_must_analysis/driver.rs        module orchestration, bottom-up summary
-                                        accumulation, observer-invariant synthesis
+src/may_must_analysis/driver.rs        module orchestration, whole-module AA, bottom-up
+                                        summary accumulation, observer-invariant synthesis
 src/may_must_analysis/summaries.rs     SummaryTables and MustSummary data structures
 src/may_must_analysis/providers.rs     external/manual summary provider seam
 src/may_must_analysis/llm_provider.rs  LLM-guided CEGIS candidate generation
@@ -231,9 +234,9 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | Source locations in assertion reports (requires `-g`) | ✅ |
 | Readable counterexamples grouped by function | ✅ |
 | Floating-point lowering | ❌ |
-| Heap-allocated struct reasoning (`malloc` / `new`) | ❌ (Step 4) |
+| Heap-allocated struct reasoning (`malloc` / `new`) | ❌ (Step 4 — AA complete; adapter wiring pending) |
 | General cyclic callee summaries (non-observer patterns) | ❌ |
-| Alias analysis | ❌ (Step 4 prerequisite) |
+| Alias analysis (flow-insensitive, field-sensitive Andersen) | ✅ |
 | Virtual dispatch | ❌ (Step 5) |
 | Broader cast / instruction coverage | partial |
 

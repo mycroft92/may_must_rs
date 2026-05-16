@@ -9,11 +9,19 @@
    removes `may_assert` from the visible instruction graph and records each
    assertion as an `AssertSite`.
 
+2.5. `common::alias_analysis::run_alias_analysis`
+   runs field-sensitive, flow-insensitive Andersen alias analysis on the full
+   module (called once by the driver before the summary loop, and once per
+   function by `analyze_with_summaries`).  The `AliasResult` is threaded into
+   all `adapt_with_purity_and_summaries` calls.
+
 3. `analysis::adapter::adapt[_with_purity_and_summaries]`
    lowers one `FunctionGraph` into:
    - an `AbstractCfg`
    - a list of lowered assertion sites
    - instruction-to-node bookkeeping
+   `resolve_memory_effects` uses the `AliasResult` as a fallback when the local
+   `PointerEnv` cannot resolve a `PointerStore` or `PointerLoad` target.
 
 4. `analysis::driver`
    infers and reuses direct-call return summaries across the module, and

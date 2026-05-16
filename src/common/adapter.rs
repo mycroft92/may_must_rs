@@ -205,9 +205,16 @@ pub fn adapt_with_purity(
 
 /// Full lowering entry point.
 ///
-/// Combines purity information and a registry of already-computed callee summaries to
-/// produce a maximally precise [`AdaptedProcedure`].  This is the function called by the
-/// driver once summaries for upstream callees are available.
+/// Combines purity information, a registry of already-computed callee summaries,
+/// and whole-module alias analysis results to produce a maximally precise
+/// [`AdaptedProcedure`].  This is the function called by the driver once summaries
+/// for upstream callees are available.
+///
+/// The `alias` argument is produced by [`run_alias_analysis`] and is forwarded to
+/// [`resolve_memory_effects`] so that pointer operations that cannot be resolved
+/// from the local `PointerEnv` alone are given a best-effort binding via
+/// points-to information.  Pass `&AliasResult::default()` when no AA result is
+/// available (e.g. in isolated unit tests).
 ///
 /// The pipeline is:
 /// 1. Assign each `alloca` instruction a fresh local stack region name (`fn$stack0`, …).
@@ -216,7 +223,8 @@ pub fn adapt_with_purity(
 /// 4. Append PHI-node incoming-value assignments to CFG edges via [`lower_phi_edge_effects`].
 /// 5. Extract `may_assert` call sites as [`AssertionSite`]s.
 /// 6. Ensure the CFG has a single exit node.
-/// 7. Build the pointer environment and rewrite memory effects via [`resolve_memory_effects`].
+/// 7. Build the pointer environment and rewrite memory effects via [`resolve_memory_effects`],
+///    using `alias` to resolve any pointer operations the local env cannot handle.
 /// 8. Inject callee summaries as `Obligation` effects via [`apply_pending_return_summaries`].
 /// 9. Expand `llvm.memcpy`/`llvm.memset` intrinsics via [`apply_pending_memcpy_effects`].
 pub fn adapt_with_purity_and_summaries(
@@ -1224,21 +1232,23 @@ fn assertion_location(site: &crate::common::llvm_utils::program_graph::AssertSit
 /// best-effort approximation).  For each node's effects:
 ///
 /// - `Alloca` → recorded in the env mapping the local pointer name to the new stack region.
-/// - `GetElementPtr` → the child pointer inherits the parent's region with an adjusted
-///   offset.
-/// - `Load` on a pointer whose binding is known → rewritten to `Assign(select(region,
-///   offset))`.  Real-typed loads use a scalar slot variable instead of an array select.
+/// - `GetElementPtr` → the child pointer inherits the parent's region with an adjusted offset.
+/// - `Load` on a pointer whose binding is known → rewritten to `Assign(select(region, offset))`.
+///   Real-typed loads use a scalar slot variable instead of an array select.
 /// - `Store` on a known pointer → rewritten to `MemoryStore(region, offset, value)`.
 ///   Real-typed stores become a scalar slot `Assign`.
-/// - `PointerStore`/`PointerLoad`/`PointerAlias` → update the env to propagate the
-///   pointed-to region; the instruction itself becomes `Nop` because the address-level
-///   operation has no direct formula interpretation.
+/// - `PointerStore { target_slot, value_ptr }` → if `value_ptr` is in the env, binds
+///   `target_slot` to the same region.  If not in the env, falls back to `alias`:
+///   when `pts(value_ptr)` is a singleton the unique region is bound; otherwise
+///   `target_slot` is left unresolved (conservative).
+/// - `PointerLoad { target_ptr, source_slot }` → if `source_slot` is in the env, binds
+///   `target_ptr` to the same region.  If not in the env, falls back to `alias`:
+///   the union of `pts_mem(r)` for each `r ∈ pts(source_slot)` is taken; when the
+///   union is a singleton that region is bound; otherwise `target_ptr` is left unresolved.
+/// - `PointerAlias` → copies the binding from source to target, then becomes `Nop`.
 ///
-/// Effects that reference pointers not yet in the environment are passed through unchanged;
-/// the higher-level analysis treats them as unresolved and applies a conservative havoc.
-///
-/// Returns the final [`PointerEnv`] so that callee-summary and memcpy injection passes can
-/// resolve the actual regions for pointer arguments (see [`apply_pending_return_summaries`]
+/// Returns the final [`PointerEnv`] so that the callee-summary and memcpy injection passes
+/// can resolve actual regions for pointer arguments (see [`apply_pending_return_summaries`]
 /// and [`apply_pending_memcpy_effects`]).
 fn resolve_memory_effects(
     cfg: &mut AbstractCfg,
