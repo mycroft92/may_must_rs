@@ -229,6 +229,19 @@ pub enum TransferEffect {
     Obligation(Formula),
     /// A no-op placeholder. WP: identity on `post`.
     Nop,
+    /// LLVM `ptrtoint` instruction: materialize the flat integer address of a
+    /// pointer.  Resolved in Phase 2 to `Assign { target, Term::Int(base+off) }`
+    /// using the [`FlatLayout`]; left as Nop if the source pointer is unresolved.
+    /// WP treats any unresolved residual as a no-op (target remains free).
+    PtrToInt { target: Var, source_ptr: String },
+    /// LLVM `inttoptr` instruction: recover a pointer binding from a flat
+    /// integer address.  Resolved in Phase 2 by looking up the address in the
+    /// [`FlatLayout`] and binding the result pointer in the [`PointerEnv`].
+    /// WP treats any unresolved residual as a no-op.
+    IntToPtr {
+        target_ptr: String,
+        source_name: String,
+    },
     /// An opaque call whose memory effect is captured by [`CallMemoryEffect`].
     /// `PreservesMemory` → WP is transparent; `HavocMemory` → caller
     /// should havoce memory before applying WP (currently handled at the
@@ -976,7 +989,9 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
         | TransferEffect::PointerAlias { .. }
         | TransferEffect::Call { .. }
         | TransferEffect::Load { .. }
-        | TransferEffect::Store { .. } => post.clone(),
+        | TransferEffect::Store { .. }
+        | TransferEffect::PtrToInt { .. }
+        | TransferEffect::IntToPtr { .. } => post.clone(),
         TransferEffect::HavocRegions { regions } => {
             let mut result = post.clone();
             for region in regions {
@@ -1025,7 +1040,9 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
         | TransferEffect::Store { .. }
         | TransferEffect::MemoryStore { .. }
         | TransferEffect::Call { .. }
-        | TransferEffect::HavocRegions { .. } => pre.clone(),
+        | TransferEffect::HavocRegions { .. }
+        | TransferEffect::PtrToInt { .. }
+        | TransferEffect::IntToPtr { .. } => pre.clone(),
         TransferEffect::Assign { target, value } => match value {
             AssignValue::Term(term) => Formula::and(
                 pre.clone(),

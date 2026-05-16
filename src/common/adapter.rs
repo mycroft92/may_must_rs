@@ -37,6 +37,7 @@ use crate::common::abstract_cfg::{
     TransferEffect, TransferFn,
 };
 use crate::common::alias_analysis::AliasResult;
+use crate::common::flat_layout::{eval_flat_addr, FlatLayout};
 use crate::common::formula::{Formula, Memory, Rational, Sort, Term, Var};
 use crate::common::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TargetData, TypeKind};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
@@ -248,6 +249,28 @@ pub fn adapt_with_purity_and_summaries(
         }
     }
 
+    // Build flat address layout: stack allocas first, then ext pointer params,
+    // then globals (discovered by scanning all operands).  Globals not seen here
+    // are added lazily in resolve_memory_effects when they appear as operands.
+    let mut flat = FlatLayout::new();
+    for instruction in &graph.vertices {
+        if let Some(region) = allocation_regions.get(instruction) {
+            flat.add_region(region.clone());
+        }
+    }
+    for &param_index in &graph.pointer_param_indices {
+        flat.add_region(ext_region_name(function_name, param_index));
+    }
+    for instruction in &graph.vertices {
+        for i in 0..instruction.get_operand_count() {
+            if let Some(op) = instruction.get_operand(i) {
+                if op.is_global_variable_ref() && is_pointer_value(op) {
+                    flat.add_region(format!("global${}", op.display_name()));
+                }
+            }
+        }
+    }
+
     let mut cfg = AbstractCfg::new(start.print());
     cfg.set_entry_transfer(lower_node_transfer(
         function_name,
@@ -309,7 +332,7 @@ pub fn adapt_with_purity_and_summaries(
     lower_assumes(function_name, graph, &mut cfg, &instruction_nodes)?;
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-    let final_env = resolve_memory_effects(&mut cfg, graph, function_name, alias);
+    let final_env = resolve_memory_effects(&mut cfg, graph, function_name, alias, &mut flat);
     apply_pending_return_summaries(
         &mut cfg,
         graph,
@@ -1218,6 +1241,24 @@ fn lower_node_transfer(
                 }
             }
         }
+        InstructionOpcode::PtrToInt => {
+            if let Some(op) = instruction.get_operand(0) {
+                if let Ok(target) = assigned_var(function_name, instruction) {
+                    effects.push(TransferEffect::PtrToInt {
+                        target,
+                        source_ptr: pointer_name(function_name, op),
+                    });
+                }
+            }
+        }
+        InstructionOpcode::IntToPtr => {
+            if let Some(op) = instruction.get_operand(0) {
+                effects.push(TransferEffect::IntToPtr {
+                    target_ptr: pointer_name(function_name, instruction),
+                    source_name: local_name(function_name, op),
+                });
+            }
+        }
         InstructionOpcode::Switch | InstructionOpcode::IndirectBr => {}
         InstructionOpcode::Invoke => {
             return Err(AdapterError::UnsupportedInstruction(instruction.print()));
@@ -1484,11 +1525,16 @@ fn resolve_memory_effects(
     graph: &FunctionGraph,
     function_name: &str,
     alias: &AliasResult,
+    flat: &mut FlatLayout,
 ) -> PointerEnv {
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
     let order = cfg
         .topological_order_excluding(&excluded)
         .unwrap_or_else(|| cfg.node_ids().collect::<Vec<_>>());
+
+    // Side table: integer SSA var name → flat address, for inttoptr recovery.
+    // Populated when PtrToInt is resolved; propagated through arithmetic Assigns.
+    let mut flat_int_vars: HashMap<String, i64> = HashMap::new();
 
     let mut env = PointerEnv::default();
     for &param_index in &graph.pointer_param_indices {
@@ -1657,6 +1703,46 @@ fn resolve_memory_effects(
                         env.bind(target.clone(), field_region, Term::int(0));
                     }
                     rewritten.push(TransferEffect::Nop);
+                }
+                TransferEffect::PtrToInt { target, source_ptr } => {
+                    let resolved = env.get(&source_ptr).and_then(|binding| {
+                        if let Term::Int(offset) = &binding.offset {
+                            flat.flat_addr(&binding.region, *offset).map(|addr| addr)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(addr) = resolved {
+                        flat_int_vars.insert(target.name().to_string(), addr);
+                        rewritten.push(TransferEffect::Assign {
+                            target,
+                            value: AssignValue::Term(Term::int(addr)),
+                        });
+                    } else {
+                        rewritten.push(TransferEffect::Nop);
+                    }
+                }
+                TransferEffect::IntToPtr {
+                    target_ptr,
+                    source_name,
+                } => {
+                    if let Some(&addr) = flat_int_vars.get(&source_name) {
+                        if let Some((region, offset)) = flat.region_at(addr) {
+                            env.bind(target_ptr, region.to_string(), Term::int(offset));
+                        }
+                    }
+                    rewritten.push(TransferEffect::Nop);
+                }
+                TransferEffect::Assign {
+                    ref target,
+                    value: AssignValue::Term(ref term),
+                } => {
+                    // Propagate flat addresses through arithmetic so that
+                    // ptrtoint → add/sub → inttoptr chains (container_of) resolve.
+                    if let Some(addr) = eval_flat_addr(term, &flat_int_vars) {
+                        flat_int_vars.insert(target.name().to_string(), addr);
+                    }
+                    rewritten.push(effect);
                 }
                 other => rewritten.push(other),
             }

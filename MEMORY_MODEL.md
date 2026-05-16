@@ -97,6 +97,96 @@ single-inheritance classes are transparent at the IR level.
 
 ---
 
+## Flat Address Layout — ptrtoint / inttoptr (done)
+
+### Problem
+
+LLVM programs, especially CIL-lowered C, routinely convert pointers to integers
+for equality tests and pointer arithmetic:
+
+```llvm
+%a  = ptrtoint ptr %p to i32        ; pointer → integer address
+%b  = ptrtoint ptr %q to i32
+%eq = icmp eq %a, %b                ; pointer equality via integer comparison
+
+%f  = ptrtoint ptr %field to i32    ; container_of pattern
+%s  = add i32 %f, -4               ; subtract field offset → struct base
+%p  = inttoptr i64 %s to ptr        ; recover enclosing struct pointer
+```
+
+Without a concrete address model these were `UnsupportedInstruction` errors.
+Modelling addresses as free symbolic constants introduces **false equalities**:
+Z3 can set `addr_A = 0` and `addr_B = 2`, making `(region A, offset 3)` and
+`(region B, offset 1)` both evaluate to `3`.
+
+### Encoding
+
+Each named region is assigned a concrete, non-overlapping integer base address
+(`src/common/flat_layout.rs`):
+
+```
+base(region_0) = 0
+base(region_1) = STRIDE          (STRIDE = 4096)
+base(region_2) = 2 × STRIDE
+…
+```
+
+Regions are registered in a fixed order during the `adapt_procedure` pre-pass:
+stack allocas (in vertex order), then ext pointer params, then global variables
+(first-reference order).
+
+**`ptrtoint ptr %p to iN`** — where `%p → (region, offset)` in `PointerEnv`:
+
+```
+→  Assign { result, Term::Int(base(region) + offset) }
+```
+
+The result is a **concrete integer constant** — no free Z3 variables, no false
+equalities possible.
+
+**`inttoptr iN %x to ptr`** — where `%x` was produced by ptrtoint or
+subsequent constant arithmetic (`add`, `sub`, `mul`):
+
+```
+eval_flat_addr(%x, flat_int_vars) → addr
+flat_layout.region_at(addr)       → (region, offset)
+→  env.bind(result_ptr, region, Term::Int(offset))
+```
+
+Arithmetic on integer variables is propagated through a `flat_int_vars` side
+table so that the full `ptrtoint → add/sub → inttoptr` chain resolves.
+
+If the integer value is not statically evaluable (e.g., loaded from memory as
+`select(region, k)`), the `inttoptr` result is left unbound — conservative,
+may produce `UNKNOWN` but never unsound.
+
+### Guarantees
+
+- `flat_addr(A, i) ≠ flat_addr(B, j)` for any two distinct regions `A ≠ B`
+  and offsets `i, j` with `|i|, |j| < STRIDE`. No false pointer equalities.
+- The stride does not imply adjacency: two consecutive regions in the layout
+  are not assumed to be adjacent in memory. Arithmetic that crosses region
+  boundaries (e.g. pointer arithmetic past the end of an allocation) is left
+  unresolved.
+
+### Limitation
+
+Pointers stored as integers and reloaded from memory are not tracked:
+
+```c
+int x;
+unsigned addr = (unsigned)&x;   // ptrtoint → concrete flat addr ✓
+store_to_memory(addr);          // addr written to a memory cell
+unsigned v = load_from_memory();// v = select(region, k) — not in flat_int_vars
+int *p = (int *)v;              // inttoptr left unbound → UNKNOWN
+```
+
+This covers the linked-list pattern where `next`/`prev` are stored as integers
+in struct fields.  Full support requires combining the flat layout with the heap
+model (Step 4) and symbolic evaluation of memory-loaded integer addresses.
+
+---
+
 ## Heap Memory Model (Step 4 — planned)
 
 ### Problem

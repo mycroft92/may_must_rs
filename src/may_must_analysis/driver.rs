@@ -1495,4 +1495,17 @@ mod tests {
                 .any(|summary| summary.function == "max_of_5"));
         });
     }
+
+    #[test]
+    fn ptrtoint_distinct_stack_addrs_verified() {
+        // Two distinct stack allocas must get distinct flat addresses.
+        // ptrtoint of each produces a concrete integer; the assertion
+        // addr_a != addr_b is trivially true under the flat layout model.
+        with_bc_graphs("ptrtoint_compare", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "test_distinct_stack_addrs"), 1);
+        });
+    }
 }

@@ -3,6 +3,7 @@ pub mod adapter;
 pub mod alias_analysis;
 pub mod assertions;
 pub mod errors;
+pub mod flat_layout;
 pub mod formula;
 pub mod llvm_utils;
 pub mod oracle;
