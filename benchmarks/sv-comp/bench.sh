@@ -30,7 +30,7 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 CATEGORIES_FILE="$SCRIPT_DIR/categories.txt"
 LIMIT=0
 COMMIT=0
-SV_URL="git@gitlab.com:sosy-lab/benchmarking/sv-benchmarks.git"
+SV_URL="https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
 
 # ---------------------------------------------------------------------------
 # Argument parsing

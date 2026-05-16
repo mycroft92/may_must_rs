@@ -36,7 +36,7 @@ If you want to keep the sv-benchmarks clone around for repeated runs:
 ```sh
 # 1 — Clone sv-benchmarks (sparse, ~100 MB for two categories):
 git clone --depth 1 --filter=blob:none --sparse \
-    git@gitlab.com:sosy-lab/benchmarking/sv-benchmarks.git \
+    https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git \
     /path/to/sv-benchmarks
 cd /path/to/sv-benchmarks
 git sparse-checkout set properties c/ReachSafety-Loops c/ReachSafety-ControlFlow
