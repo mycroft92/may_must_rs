@@ -91,24 +91,24 @@ extern int __may_nondet_raw(void);
  * 2^32−1 or 2^64−1 doesn't fit in a signed SMT integer without care;
  * non-negativity is the critical constraint for soundness). */
 #define nondet_uint() \
-    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); _v; })
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); _v; })
 #define nondet_ulong() \
-    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); _v; })
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); _v; })
 
 /* Small unsigned types — full range constraints since they fit in i64. */
 #define nondet_uchar() \
-    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); type_bound(_v <= 255); _v; })
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); assume(_v <= 255); _v; })
 #define nondet_ushort() \
-    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= 0); type_bound(_v <= 65535); _v; })
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= 0); assume(_v <= 65535); _v; })
 
 /* Small signed types — full range constraints. */
 #define nondet_char() \
-    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= -128); type_bound(_v <= 127); _v; })
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= -128); assume(_v <= 127); _v; })
 #define nondet_short() \
-    __extension__({ int _v = __may_nondet_raw(); type_bound(_v >= -32768); type_bound(_v <= 32767); _v; })
+    __extension__({ int _v = __may_nondet_raw(); assume(_v >= -32768); assume(_v <= 32767); _v; })
 
 /* Boolean — constrained to {0, 1}. */
 #define nondet_bool() \
-    __extension__({ int _v = __may_nondet_raw(); type_bound(_v == 0 || _v == 1); _v; })
+    __extension__({ int _v = __may_nondet_raw(); assume(_v == 0 || _v == 1); _v; })
 
 #endif /* VERIFICATION_H */

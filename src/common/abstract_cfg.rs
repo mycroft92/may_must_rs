@@ -289,6 +289,22 @@ impl TransferFn {
             .fold(post.clone(), |acc, effect| wp_one(effect, &acc))
     }
 
+    /// Hoare-style WP for the inductiveness check only.
+    ///
+    /// Identical to [`wp`] except that `Assume(c)` contributes `c → post`
+    /// instead of `c ∧ post`.  This prevents fresh call-return variables (e.g.
+    /// from `nondet_uint()` inside a loop condition) from appearing as
+    /// unreachable conjuncts in the inductiveness obligation, which would
+    /// otherwise make every candidate invariant fail.
+    ///
+    /// TypeBound effects are still identity (same as in regular WP).
+    pub fn wp_inductive(&self, post: &Formula) -> Formula {
+        self.effects
+            .iter()
+            .rev()
+            .fold(post.clone(), |acc, effect| wp_one_inductive(effect, &acc))
+    }
+
     /// Compute the strongest postcondition of `pre` through this transfer function.
     ///
     /// Effects are processed in forward program order. Assignments add
@@ -986,6 +1002,13 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
             &Memory::store(Memory::var(region), offset.clone(), value.clone()),
             post,
         ),
+    }
+}
+
+fn wp_one_inductive(effect: &TransferEffect, post: &Formula) -> Formula {
+    match effect {
+        TransferEffect::Assume(condition) => Formula::implies(condition.clone(), post.clone()),
+        other => wp_one(other, post),
     }
 }
 

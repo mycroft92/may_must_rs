@@ -447,6 +447,7 @@ pub fn check_loop_invariant_verbose(
         None,
         false,
         &[],
+        false,
     ) else {
         return InvariantCheckResult::InitiationFailed;
     };
@@ -475,6 +476,7 @@ pub fn check_loop_invariant_verbose(
         Some(&info.body),
         true,
         inner,
+        true,
     ) else {
         return InvariantCheckResult::InductivenessFailed;
     };
@@ -510,6 +512,7 @@ pub fn check_loop_invariant_verbose(
             Some(&info.body),
             true,
             inner,
+            false,
         ) else {
             return InvariantCheckResult::ExitClosureFailed {
                 exit_edge: *exit_edge,
@@ -826,6 +829,7 @@ fn backward_states(
     restrict_to: Option<&BTreeSet<CfgNodeId>>,
     ignore_body_guards: bool,
     inner: InnerInvariants<'_>,
+    inductive_assume: bool,
 ) -> Option<BTreeMap<CfgNodeId, Formula>> {
     let order = cfg.topological_order_excluding(excluded_edges)?;
     let mut states = cfg
@@ -869,7 +873,14 @@ fn backward_states(
                 edge.guard.clone()
             };
             let post_at_source = Formula::and(guard, edge_pre);
-            let pre_at_source = cfg.node(edge.source).ok()?.transfer.wp(&post_at_source);
+            let pre_at_source = if inductive_assume {
+                cfg.node(edge.source)
+                    .ok()?
+                    .transfer
+                    .wp_inductive(&post_at_source)
+            } else {
+                cfg.node(edge.source).ok()?.transfer.wp(&post_at_source)
+            };
             let existing = states.get(&edge.source).cloned().unwrap_or(Formula::False);
             states.insert(edge.source, Formula::or(existing, pre_at_source));
         }

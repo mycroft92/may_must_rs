@@ -8,6 +8,7 @@ Called by bench.sh; not intended for direct use.
 import argparse
 import csv
 import os
+import re
 from collections import defaultdict
 from datetime import datetime
 
@@ -130,8 +131,8 @@ def build_section(rows: list[dict], date: str, commit: str, note: str) -> str:
     return "\n".join(lines)
 
 
-def update_results_md(results_path: str, new_section: str) -> None:
-    """Prepend new_section after the file header, before previous run sections."""
+def update_results_md(results_path: str, new_section: str, keep: int = 2) -> None:
+    """Prepend new_section after the file header, keeping only `keep` run sections total."""
     if os.path.exists(results_path):
         existing = open(results_path, encoding="utf-8").read()
     else:
@@ -139,20 +140,28 @@ def update_results_md(results_path: str, new_section: str) -> None:
             "# SV-COMP Benchmark Results\n\n"
             "Newest run first.  Each section shows verdict counts per category "
             "and flags any soundness or completeness anomalies.\n\n"
+            "> **Note**: This file is only updated on the `stable` branch (via CI).\n"
+            "> Do not commit benchmark runs from `main`.\n\n"
             "---\n\n"
         )
 
     # Split at the first `---` separator (end of header block).
-    # Insert the new section right after it.
     marker = "\n---\n"
     idx = existing.find(marker)
     if idx == -1:
-        # No separator yet — just append.
-        updated = existing.rstrip() + "\n\n" + new_section
+        header = existing.rstrip() + "\n"
+        run_sections = []
     else:
+        header = existing[: idx + len(marker)]
+        # Each run section is delimited by "\n---\n"; collect them.
         after_header = existing[idx + len(marker):]
-        updated = existing[: idx + len(marker)] + "\n" + new_section + after_header
+        run_sections = [s for s in re.split(r'\n---\n', after_header) if s.strip()]
 
+    # Prepend new section; keep only the newest `keep` runs.
+    run_sections = [new_section.rstrip()] + run_sections
+    run_sections = run_sections[:keep]
+
+    updated = header + "\n" + "\n\n---\n\n".join(run_sections) + "\n\n---\n\n"
     open(results_path, "w", encoding="utf-8").write(updated)
 
 

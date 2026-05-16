@@ -20,7 +20,8 @@ on:
   push:
     branches: [ "stable" ]
 
-# Allow the workflow to push the updated RESULTS.md back to main.
+# Allow the workflow to push the updated RESULTS.md back to stable.
+# RESULTS.md is only maintained on stable; do not run bench.sh on main.
 permissions:
   contents: write
 

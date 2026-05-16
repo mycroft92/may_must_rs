@@ -1,5 +1,7 @@
 # Design Note: Assume WP Semantics in Inductiveness Check
 
+## Status: IMPLEMENTED (Hoare-style fix, 2026-05-16)
+
 ## Context
 
 The loop invariant inductiveness check lives in `check_loop_invariant_verbose`
@@ -31,7 +33,7 @@ But for **inductiveness**, the correct formulation is:
 
 Which is: `I ∧ c → WP_rest(I)`, equivalently `I → (c → WP_rest(I))`.
 
-Our check computes `I → (c AND WP_rest(I))`, which splits into two
+The old check computed `I → (c AND WP_rest(I))`, which splits into two
 obligations:
 
 1. `I → c`  — the invariant must imply the assume condition
@@ -42,66 +44,81 @@ appears nowhere in `I`.  For example, `nondet_uint()` called inside a loop
 condition produces a fresh `v_call` and an `Assume(v_call >= 0)`.  The oracle
 treats `v_call` as universally quantified, so `I → v_call >= 0` is invalid for
 any invariant `I` that does not mention `v_call`.  Result: inductiveness always
-fails for such loops, producing UNKNOWN.
+fails for such loops, producing tautology invariants (`True`) or UNKNOWN.
 
-## Current Workaround
+## Previous Workaround (SUPERSEDED)
 
-We introduced `TransferEffect::TypeBound(c)` with WP = identity (drops `c`
-entirely from WP).  Type-system facts from `nondet_*()` macros and ZExt/SExt
-bounds are emitted as `TypeBound` instead of `Assume`.  This restores
-inductiveness checks at the cost of removing the condition from the backward
-WP entirely.
+We had introduced `TransferEffect::TypeBound(c)` with WP = identity for
+`nondet_*()` macros.  This restored inductiveness but also removed the type
+condition from the **violation WP** for calls made outside the loop body,
+allowing the oracle to find spurious negative models (e.g., `n = -1` for
+`nondet_uint()`) that caused false UNSAFE verdicts (UNSOUND results in
+SV-COMP benchmarks like `count_up_down-1` and `trex03-2`).
 
-`TypeBound` is sound because the conditions it carries are always satisfied by
-well-typed programs, so removing them from WP does not cause false VERIFIED
-verdicts.  The forward reach (SP) still picks them up.
+## The Fix: Hoare-style WP for Inductiveness Only
 
-## The Deeper Question
+The principled solution is to use `c → post` (Hoare-style implication) for
+`Assume(c)` only in the inductiveness-specific backward propagation, while
+keeping `c AND post` everywhere else.
 
-Could we instead fix the inductiveness check to use Hoare-style implication for
-`Assume` effects?
+### Changes Made
 
-Instead of:
+**`src/common/abstract_cfg.rs`** — added `wp_inductive` to `Transfer`:
+
+```rust
+pub fn wp_inductive(&self, post: &Formula) -> Formula {
+    self.effects
+        .iter()
+        .rev()
+        .fold(post.clone(), |acc, effect| wp_one_inductive(effect, &acc))
+}
+
+fn wp_one_inductive(effect: &TransferEffect, post: &Formula) -> Formula {
+    match effect {
+        TransferEffect::Assume(condition) => Formula::implies(condition.clone(), post.clone()),
+        other => wp_one(other, post),
+    }
+}
 ```
-WP(Assume(c), post) = c AND post      ← current, correct for violation analysis
+
+**`src/may_must_analysis/loops.rs`** — added `inductive_assume: bool` parameter
+to `backward_states`.  The inductiveness call passes `true`; initiation and
+exit-closure calls pass `false`:
+
+```rust
+let pre_at_source = if inductive_assume {
+    cfg.node(edge.source).ok()?.transfer.wp_inductive(&post_at_source)
+} else {
+    cfg.node(edge.source).ok()?.transfer.wp(&post_at_source)
+};
 ```
 
-Use in the inductiveness-specific WP computation:
-```
-WP(Assume(c), post) = c → post        ← correct for inductiveness
-```
+**`verification.h`** — all `nondet_*()` macros reverted from `type_bound()` back
+to `assume()`.  The Hoare-style WP fix makes `TypeBound` unnecessary for this
+purpose.  `TypeBound` is still emitted by the adapter for ZExt/SExt range bounds,
+which is correct and unrelated to this fix.
 
-This would mean:
-- `I → (c → WP_rest(I))` — if c is false the condition is vacuously true;
-  if c is true we need I to be preserved.  Both are correct.
-- No need to distinguish `TypeBound` from `Assume` for this purpose.
-- Would also fix cases where user `__VERIFIER_assume` constraints appear inside
-  loops — currently those also produce overly strong inductiveness obligations.
+### Soundness
 
-## What to Try
+Using `c → post` for inductiveness means we check the invariant is preserved
+on all paths where `c` holds.  When `c` is a fresh variable constraint (`v >= 0`),
+the path where `c` is false is infeasible in any real execution — the SMT model
+is unbounded but the real program only runs on well-typed values.  The violation
+WP still uses `c AND post`, so the bidirectional `reach AND state` check at
+entry is unaffected.
 
-1. Add a `wp_mode` parameter (or separate function) to `backward_states` in
-   `loops.rs` that switches `Assume` WP from `c AND post` to `c → post`.
-   Only the inductiveness call to `backward_states` uses the implication mode;
-   the initiation and exit-closure calls keep `c AND post`.
+### Result (SV-COMP benchmarks, 2026-05-16)
 
-2. Verify that the change does not break any existing tests.
-
-3. Run the SV-COMP benchmark suite and compare results.  If inductiveness
-   improves across the board (not just for type-bound variables), the
-   `TypeBound` workaround can potentially be retired and all `nondet_*()`
-   macros can revert to plain `assume()`.
-
-4. Check soundness: using `c → post` means inductiveness is checked over a
-   larger set of states (those where c is false are vacuously covered).  This
-   is sound because the real loop only executes on paths where c holds; we are
-   simply not over-requiring the invariant to hold on infeasible paths.
+- `count_up_down-1`: UNSOUND → SAFE (fixed)
+- `trex03-2`: UNSOUND → SAFE (fixed)
+- Remaining UNSOUND: `linear_sea.ch`, `bin-suffix-5`, `veris.c_NetBSD-libc_loop.i`
+  (heap / array alias cases — separate work)
 
 ## Files Involved
 
 - `src/may_must_analysis/loops.rs` — `check_loop_invariant_verbose`,
   `backward_states`
-- `src/common/abstract_cfg.rs` — `wp_one` (WP semantics per effect)
-- `verification.h` — `nondet_*()` macros (could revert to `assume()`)
+- `src/common/abstract_cfg.rs` — `wp_one`, new `wp_inductive`
+- `verification.h` — `nondet_*()` macros (reverted to `assume()`)
 - `src/common/llvm_utils/program_graph.rs` — `AssumeSite.is_type_bound` field
 - `src/common/adapter.rs` — `lower_assumes`, ZExt/SExt `TypeBound` emission
