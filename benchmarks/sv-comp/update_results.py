@@ -38,7 +38,7 @@ def build_table(rows: list[dict]) -> str:
     totals: dict[str, int] = defaultdict(int)
 
     for row in rows:
-        cat = row.get("category", "unknown")
+        cat = row.get("directory", row.get("category", "unknown"))
         v   = bucket(row.get("verdict", "UNKNOWN"))
         counts[cat][v] += 1
         totals[v] += 1
@@ -87,11 +87,11 @@ def soundness_check(rows: list[dict]) -> list[str]:
         exp = row.get("expected", "").lower()
         v   = bucket(row.get("verdict", "UNKNOWN"))
         f   = row.get("file", "?")
-        cat = row.get("category", "")
+        d   = row.get("directory", row.get("category", ""))
         if exp == "safe" and v == "UNSAFE":
-            issues.append(f"  - UNSOUND: `{cat}/{f}` expected SAFE, got UNSAFE")
+            issues.append(f"  - UNSOUND: `{d}/{f}` expected SAFE, got UNSAFE")
         elif exp == "unsafe" and v == "SAFE":
-            issues.append(f"  - MISSED:  `{cat}/{f}` expected UNSAFE, got SAFE")
+            issues.append(f"  - MISSED:  `{d}/{f}` expected UNSAFE, got SAFE")
     return issues
 
 

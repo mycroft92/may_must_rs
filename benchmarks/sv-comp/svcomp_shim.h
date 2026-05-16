@@ -25,6 +25,18 @@
  * that control never reaches this point. */
 #define __VERIFIER_error() may_assert((_Bool)0)
 
+/* Many benchmarks use __VERIFIER_assert(cond) instead of (or in addition to)
+ * __VERIFIER_error().  It is typically defined as a function that calls
+ * reach_error() / __VERIFIER_error() when cond is false.  We replace every
+ * call site with may_assert so the checker sees it as a verification
+ * obligation.  convert.py strips the function definition to avoid conflicts. */
+#define __VERIFIER_assert(cond) may_assert((_Bool)(cond))
+
+/* reach_error() is a helper called by __VERIFIER_assert; with the function
+ * definition stripped by convert.py the macro replacement here is a no-op
+ * (the call sites disappear through __VERIFIER_assert expansion). */
+#define reach_error() may_assert((_Bool)0)
+
 /* Path feasibility: assume(cond) prunes paths where cond is false. */
 #define __VERIFIER_assume(cond) assume((_Bool)(cond))
 

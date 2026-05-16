@@ -30,27 +30,19 @@ import sys
 # Patterns for lines / blocks we want to strip
 # ---------------------------------------------------------------------------
 
-# extern declaration of __VERIFIER_error (any __attribute__ suffix allowed)
-_RE_EXTERN_ERROR = re.compile(
-    r"^\s*extern\s+void\s+__VERIFIER_error\s*\(", re.MULTILINE
-)
-
-# extern declaration of __VERIFIER_assume
-_RE_EXTERN_ASSUME = re.compile(
-    r"^\s*extern\s+void\s+__VERIFIER_assume\s*\(", re.MULTILINE
-)
-
-# extern declaration of __VERIFIER_assert (rare but present in some suites)
-_RE_EXTERN_ASSERT_VERIFIER = re.compile(
-    r"^\s*extern\s+void\s+__VERIFIER_assert\s*\(", re.MULTILINE
-)
+# extern declarations that conflict with the macros in svcomp_shim.h
+_EXTERN_STRIP_PATTERNS = [
+    re.compile(r"^\s*extern\s+void\s+__VERIFIER_error\s*\("),
+    re.compile(r"^\s*extern\s+void\s+__VERIFIER_assume\s*\("),
+    re.compile(r"^\s*extern\s+void\s+__VERIFIER_assert\s*\("),
+    re.compile(r"^\s*extern\s+void\s+reach_error\s*\("),
+]
 
 
 def _strip_line_if(line: str) -> bool:
     """Return True if this single line should be dropped entirely."""
-    stripped = line.strip()
-    for pat in (_RE_EXTERN_ERROR, _RE_EXTERN_ASSUME, _RE_EXTERN_ASSERT_VERIFIER):
-        if pat.match(stripped) or pat.search(line):
+    for pat in _EXTERN_STRIP_PATTERNS:
+        if pat.search(line):
             return True
     return False
 
@@ -71,14 +63,14 @@ def _strip_function_body(lines: list[str], start: int) -> int:
     return i
 
 
-# Matches the opening of a __VERIFIER_error function definition (non-extern).
+# Function definitions to strip (bodies replaced by shim macros).
 # Handles: `void __VERIFIER_error(void) {`, `void __VERIFIER_error() {`, etc.
-_RE_FN_DEF_ERROR = re.compile(
-    r"^\s*void\s+__VERIFIER_error\s*\("
-)
-_RE_FN_DEF_ASSUME = re.compile(
-    r"^\s*void\s+__VERIFIER_assume\s*\("
-)
+_FN_DEF_STRIP_PATTERNS = [
+    re.compile(r"^\s*void\s+__VERIFIER_error\s*\("),
+    re.compile(r"^\s*void\s+__VERIFIER_assume\s*\("),
+    re.compile(r"^\s*void\s+__VERIFIER_assert\s*\("),
+    re.compile(r"^\s*void\s+reach_error\s*\("),
+]
 
 
 def convert(src: str, shim_include: str) -> str:
@@ -106,8 +98,8 @@ def convert(src: str, shim_include: str) -> str:
             i += 1
             continue
 
-        # Drop standalone __VERIFIER_error / __VERIFIER_assume definitions.
-        if _RE_FN_DEF_ERROR.match(line) or _RE_FN_DEF_ASSUME.match(line):
+        # Drop standalone function definitions replaced by shim macros.
+        if any(pat.match(line) for pat in _FN_DEF_STRIP_PATTERNS):
             # The opening brace may be on this line or the next.
             if "{" in line:
                 i = _strip_function_body(lines, i)

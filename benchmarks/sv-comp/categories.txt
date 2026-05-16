@@ -1,33 +1,27 @@
-# SV-COMP categories relevant to Smash-plus-ultra
+# SV-COMP source directories for Smash-plus-ultra
 #
-# Format: one subdirectory path per line, relative to the sv-benchmarks root.
+# Format: one path per line, relative to the sv-benchmarks root.
+# Each path is a directory that contains *.c + *.yml pairs.
 # Lines starting with '#' and blank lines are ignored.
 #
-# Selection criteria
-# ------------------
-# We target integer / loop / control-flow programs only:
-#   - no floating-point (checker reports UNKNOWN for float IR)
-#   - no heap allocation (malloc/new — Step 4 pending)
-#   - no concurrency (out of scope)
-#   - property: unreach-call (reachability of __VERIFIER_error)
+# Only directories with integer / loop / control-flow programs are listed.
+# Directories are grouped by the .set file they come from.
 #
-# Start with a small slice per category; comment out categories that produce
-# too many UNKNOWN results until the relevant feature is implemented.
+# To discover more directories, inspect the .set files in the repo:
+#   c/Loops.set, c/ControlFlow.set, c/ECA.set, ...
 
-# Pure integer loop programs — best fit for our loop invariant synthesis.
-c/ReachSafety-Loops
+# --- c/Loops.set ---
+# Simple loops with integer counters — best fit for invariant synthesis.
+c/loops
+# Crafted loop patterns and variants.
+c/loop-crafted
+# Invariant-focused loop benchmarks.
+c/loop-invariants
 
-# Integer control-flow without loops — exercises acyclic path reasoning.
-c/ReachSafety-ControlFlow
-
-# ECA (Extended Component Automata) — state-machine integer programs.
-# Moderate complexity; uncomment once Loops is stable.
-# c/ReachSafety-ECA
-
-# Bit-vector benchmarks — partially supported (integer subset only).
-# Uncomment once broader cast / bitwise coverage is added.
-# c/ReachSafety-BitVectors
-
-# Array programs with integer indices — exercises our memory model.
-# Many benchmarks need heap model (Step 4) so expect high UNKNOWN rate.
-# c/ReachSafety-Arrays
+# --- c/ControlFlow.set ---
+# Simplified NT driver models — integer state machines, no heap.
+c/ntdrivers-simplified
+# Lock/unlock control-flow patterns.
+c/locks
+# Infeasible path programs — exercises assume() / path pruning.
+c/infeasible-control-flow
