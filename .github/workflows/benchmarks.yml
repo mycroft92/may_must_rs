@@ -1,0 +1,94 @@
+name: SV-COMP Benchmarks
+
+on:
+  # Run manually from the GitHub Actions UI with an optional file limit.
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Max files per directory (0 = all, 5 = quick smoke check)'
+        required: false
+        default: '0'
+
+  # Also run automatically every Sunday at 02:00 UTC.
+  schedule:
+    - cron: '0 2 * * 0'
+
+# Allow the workflow to push the updated RESULTS.md back to main.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            llvm-20 llvm-20-dev libclang-20-dev clang-20 libpolly-20-dev
+          echo "LLVM_SYS_201_PREFIX=/usr/lib/llvm-20" >> "$GITHUB_ENV"
+
+      - name: Install Z3
+        run: sudo apt-get install -y libz3-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+            ${{ runner.os }}-cargo-
+
+      - name: Build checker (release)
+        run: cargo build --release
+
+      - name: Run benchmarks
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '0' }}"
+          LIMIT_FLAG=""
+          [ "$LIMIT" -gt 0 ] && LIMIT_FLAG="--limit $LIMIT"
+          ./benchmarks/sv-comp/bench.sh $LIMIT_FLAG
+        env:
+          CLANG: clang-20
+
+      - name: Write job summary
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import re, os
+          text = open("benchmarks/sv-comp/RESULTS.md").read()
+          # Extract the first (newest) run section between the first two --- separators.
+          sections = re.split(r'\n---\n', text)
+          # sections[0] = header, sections[1] = newest run, sections[2+] = older
+          summary = sections[1].strip() if len(sections) > 1 else "_No results yet._"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## SV-COMP Benchmark Results\n\n")
+              f.write(summary + "\n")
+          PYEOF
+
+      - name: Commit RESULTS.md
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/sv-comp/RESULTS.md
+          # Only commit if something actually changed.
+          git diff --staged --quiet || \
+            git commit -m "Update SV-COMP benchmark results [skip ci]"
+          git push
