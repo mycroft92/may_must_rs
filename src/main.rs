@@ -21,7 +21,9 @@ const DEFAULT_LLM_MODEL: &str = "gpt-5.3";
 const DEFAULT_LLM_TRIES: usize = 5;
 
 fn main() {
+    let version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_HASH"), ")");
     let matches = command!()
+        .version(version)
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
         .arg(arg!(--"show-summaries" "Print inferred summaries"))
