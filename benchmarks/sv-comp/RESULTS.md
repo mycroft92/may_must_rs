@@ -8,6 +8,36 @@ and flags any soundness or completeness anomalies.
 
 ---
 
+## 2026-05-16 — `9a500d8`
+
+Run: all files
+
+| Category | SAFE | UNSAFE | UNKNOWN | ERROR | Wrong | Total |
+|---|---|---|---|---|---|---|
+| infeasible-control-flow | 10 | 0 | 0 | 0 | 0 | 10 |
+| locks | 0 | 0 | 13 | 0 | 0 | 13 |
+| loop-crafted | 3 | 1 | 5 | 0 | 0 | 9 |
+| loop-invariants | 9 | 1 | 0 | 0 | **2** | 10 |
+| loops | 20 | 10 | 33 | 0 | **8** | 63 |
+| **Total** | **42** | **12** | **51** | **0** | **10** | **105** |
+
+**Soundness / completeness flags:**
+  - MISSED:  `c/loops/array-2` expected UNSAFE, got SAFE
+  - UNSOUND: `c/loops/linear_sea.ch` expected SAFE, got UNSAFE
+  - MISSED:  `c/loops/ludcmp` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/nec20` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/sum01_bug02.i` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/sum04-1.i` expected UNSAFE, got SAFE
+  - UNSOUND: `c/loops/veris.c_NetBSD-libc_loop.i` expected SAFE, got UNSAFE
+  - MISSED:  `c/loops/verisec_OpenSER_cases1_stripFullBoth_arr.i` expected UNSAFE, got SAFE
+  - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
+  - MISSED:  `c/loop-invariants/linear-inequality-inv-b` expected UNSAFE, got SAFE
+
+---
+
+---
+
+
 ## 2026-05-16 — `6abb8bb`
 
 Run: all files
@@ -31,25 +61,6 @@ Run: all files
   - UNSOUND: `c/loops/veris.c_NetBSD-libc_loop.i` expected SAFE, got UNSAFE
   - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
 
----
-
-## 2026-05-16 — `fb42c7e`
-
-Run: all files
-
-| Category | SAFE | UNSAFE | UNKNOWN | ERROR | Total |
-|---|---|---|---|---|---|
-| infeasible-control-flow | 10 | 0 | 0 | 0 | 10 |
-| locks | 0 | 0 | 13 | 0 | 13 |
-| loop-crafted | 3 | 1 | 5 | 0 | 9 |
-| loop-invariants | 3 | 1 | 6 | 0 | 10 |
-| loops | 14 | 10 | 39 | 0 | 63 |
-| **Total** | **30** | **12** | **63** | **0** | **105** |
-
-**Soundness / completeness flags:**
-  - UNSOUND: `c/loops/linear_sea.ch` expected SAFE, got UNSAFE
-  - UNSOUND: `c/loops/veris.c_NetBSD-libc_loop.i` expected SAFE, got UNSAFE
-  - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
 
 ---
 
