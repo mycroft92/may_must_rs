@@ -7,49 +7,46 @@ categories and collect a per-file verdict summary.
 
 ## Quick start
 
-### 1 — Clone sv-benchmarks (once, outside this repo)
+### All-in-one (recommended)
+
+`bench.sh` sparse-clones sv-benchmarks, runs the checker, updates `RESULTS.md`,
+then deletes the clone.  No manual setup needed.
 
 ```sh
-git clone git@gitlab.com:sosy-lab/benchmarking/sv-benchmarks.git \
-    /path/to/sv-benchmarks
-```
-
-The repo is large; a shallow clone saves disk space:
-
-```sh
-git clone --depth 1 git@gitlab.com:sosy-lab/benchmarking/sv-benchmarks.git \
-    /path/to/sv-benchmarks
-```
-
-### 2 — Build the checker
-
-```sh
-# From the repo root:
+# From the repo root — builds the checker if needed:
 cargo build --release
+
+# Run all active categories (can take a while):
+./benchmarks/sv-comp/bench.sh
+
+# Quick sanity check — first 20 files per category:
+./benchmarks/sv-comp/bench.sh --limit 20
+
+# Commit the updated RESULTS.md automatically:
+./benchmarks/sv-comp/bench.sh --limit 20 --commit
 ```
 
-### 3 — Run
+`RESULTS.md` is updated in place (newest run first) and is committed to the
+repo so benchmark progress is tracked over time.
+
+### Manual (step-by-step)
+
+If you want to keep the sv-benchmarks clone around for repeated runs:
 
 ```sh
-./benchmarks/sv-comp/run.sh --benchmarks /path/to/sv-benchmarks
-```
+# 1 — Clone sv-benchmarks (sparse, ~100 MB for two categories):
+git clone --depth 1 --filter=blob:none --sparse \
+    git@gitlab.com:sosy-lab/benchmarking/sv-benchmarks.git \
+    /path/to/sv-benchmarks
+cd /path/to/sv-benchmarks
+git sparse-checkout set properties c/ReachSafety-Loops c/ReachSafety-ControlFlow
+cd -
 
-By default this runs every `.c` file in the categories listed in
-`categories.txt` and writes a CSV summary to `benchmarks/sv-comp/results.csv`.
+# 2 — Build the checker:
+cargo build --release
 
-Useful flags:
-
-```sh
-# Only the first 20 files per category (good for a quick sanity check):
+# 3 — Run:
 ./benchmarks/sv-comp/run.sh --benchmarks /path/to/sv-benchmarks --limit 20
-
-# Custom category list:
-./benchmarks/sv-comp/run.sh --benchmarks /path/to/sv-benchmarks \
-    --categories my_categories.txt
-
-# Write results to a different file:
-./benchmarks/sv-comp/run.sh --benchmarks /path/to/sv-benchmarks \
-    --csv /tmp/svcomp_results.csv
 ```
 
 ---
@@ -58,12 +55,15 @@ Useful flags:
 
 ```
 benchmarks/sv-comp/
-├── README.md          This file.
-├── categories.txt     Which benchmark subdirectories to run (one per line).
-├── svcomp_shim.h      Maps __VERIFIER_* sentinels to our intrinsics.
-├── convert.py         Transforms a single SV-COMP .c file for our checker.
-├── run.sh             Iterates over categories; compiles and checks each file.
-└── out/               Generated (gitignored) — converted sources and bitcode.
+├── README.md           This file.
+├── RESULTS.md          Benchmark results — updated each run, committed to repo.
+├── categories.txt      Which benchmark subdirectories to run (one per line).
+├── svcomp_shim.h       Maps __VERIFIER_* sentinels to our intrinsics.
+├── convert.py          Transforms a single SV-COMP .c file for our checker.
+├── bench.sh            All-in-one: clone → run → update RESULTS.md → delete clone.
+├── run.sh              Low-level: iterate categories, compile, check, write CSV.
+├── update_results.py   Parse CSV and prepend a new section to RESULTS.md.
+└── out/                Generated (gitignored) — converted sources and bitcode.
 ```
 
 ---
