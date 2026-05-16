@@ -1,5 +1,62 @@
 # TODO
 
+## Strategic Direction
+
+Broaden SV-COMP coverage (more categories, bitvector theory, richer instruction
+support) but **correctness gates coverage** — do not add support for a new feature
+if doing so requires an unsound approximation.  Ordering of priorities:
+
+1. **Fix unsound approximations first** — an analysis that silently emits a wrong
+   `Verified` on a benchmark that is actually unsafe is worse than one that emits
+   `UNKNOWN` or `ERROR`.
+2. **Extend instruction coverage** — instructions currently producing
+   `UnsupportedInstruction` errors should be modelled soundly (returning `UNKNOWN`
+   when the model is too weak) before new categories are attempted.
+3. **Broaden category/theory support** — bitvector arithmetic, new SV-COMP
+   categories, heap model — only after the above two layers are stable.
+
+## Soundness Debt (fix before broadening)
+
+These items can produce a **wrong `Verified`** on a program that is actually unsafe.
+Fix in order:
+
+- **`udiv`/`urem` treated as signed** — `udiv i32 a b` and `sdiv i32 a b` are both
+  lowered to `Term::div(lhs, rhs)`.  In the unbounded-Int model, if an operand is
+  negative (possible for values from unmodeled calls), the result differs from C
+  unsigned semantics.  Fix: inject `Assume(lhs >= 0)`, `Assume(rhs >= 0)`, and
+  `Assume(result >= 0)` for `udiv`; `Assume(lhs >= 0)` and `Assume(result >= 0)`
+  for `urem`.  This is analogous to the ZExt `>= 0` injection and equally cheap.
+
+- **Unsigned icmp collapsed to signed** — `get_icmp_predicate` in `llvm_wrap.rs`
+  maps `ult/ule/ugt/uge` to the same `</<=/>/>=` symbols as their signed
+  counterparts.  For operands the analysis can prove are non-negative this is
+  sound; for values from unmodeled calls or signed arithmetic it is not.  Fix:
+  either propagate a sign flag through the comparison and inject `>= 0` constraints
+  on operands of unsigned comparisons, or emit a conservative `UNKNOWN` when a
+  comparison operand cannot be proved non-negative.
+
+## Instruction Coverage (sound but lossy — produce ERROR/UNKNOWN today)
+
+- **Integer bitwise And/Or/Xor** — currently only lowered for `i1`-typed values
+  (mapped to Boolean `and`/`or`/`xor`).  Integer-width variants fall through to
+  `Nop`, leaving the result variable unconstrained → `UNKNOWN` for any program
+  that uses bitmask operations.  Fix: lower as `Rem(lhs, 2^w)` or emit an
+  `Assume(result >= 0 && result <= max(|lhs|, |rhs|))` as a conservative
+  overapproximation, then refine toward bitvector modelling later.
+
+- **Shifts (`Shl`, `LShr`, `AShr`)** — not in the opcode match → fall to the `_`
+  wildcard → `UnsupportedInstruction` error for any program that uses shifts.
+  Fix: lower `shl x, n` as `Mul(x, 2^n)` when `n` is a constant (sound for
+  non-negative `x`); `lshr`/`ashr` as `Div(x, 2^n)`.  Constant shifts cover the
+  majority of SV-COMP uses.
+
+## Long-term / Structural
+
+- **Integer overflow / wrap-around** — the unbounded-Int model does not wrap.
+  Programs that depend on two's-complement overflow (e.g. `INT_MAX + 1 < 0`
+  checks) are not correctly modelled.  Long-term fix: switch scalars to the SMT
+  BitVector theory, or add modular-arithmetic axioms selectively.
+
 ## Current Backlog
 
 - **type-based domain bounds in the adapter** — emit `TransferEffect::Assume`
