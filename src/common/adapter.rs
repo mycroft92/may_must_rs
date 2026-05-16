@@ -1154,6 +1154,10 @@ fn lower_node_transfer(
             }
         }
         InstructionOpcode::PHI | InstructionOpcode::Br => {}
+        InstructionOpcode::Unreachable => {
+            // Execution never reaches this point — precondition is False.
+            effects.push(TransferEffect::Assume(Formula::False));
+        }
         InstructionOpcode::Ret => {
             if let Some(ret_value) = instruction.get_operand(0) {
                 if sort_of_instruction_value(ret_value)? == Sort::Int {

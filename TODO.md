@@ -65,6 +65,12 @@ locks 13 · loops 33 · loop-crafted 5 · loop-invariants 0.
   Variable shift amounts leave the result unconstrained.  Bitvector-precise
   semantics deferred to long-term BitVector theory work.
 
+- **`unreachable` instruction** — DONE (`0.4.3`).  Emits `Assume(False)`, so
+  the backward precondition on any path reaching it is `False` (dead path).
+  Marks dead code following noreturn calls (`abort`, `__assert_fail`, `exit`).
+  Previously caused spurious `UnsupportedInstruction` errors and `UNKNOWN`
+  verdicts on functions that call these routines.
+
 ## Long-term / Structural
 
 - **Integer overflow / wrap-around** — the unbounded-Int model does not wrap.
