@@ -338,6 +338,22 @@ pub fn analyze_with_summaries(
     tables: Option<&SummaryTables>,
     config: Option<&InvariantConfig>,
 ) -> Result<ProcedureReport, DriverError> {
+    let max_size = config.map_or(500, |c| c.max_function_size);
+    if max_size > 0 && graph.vertices.len() > max_size {
+        return Ok(ProcedureReport {
+            procedure: graph.name.clone(),
+            assertions: Vec::new(),
+            failures: vec![format!(
+                "function too large ({} instructions > limit {}): skipped",
+                graph.vertices.len(),
+                max_size
+            )],
+            loop_count: 0,
+            instruction_count: graph.vertices.len(),
+            recursive: false,
+        });
+    }
+
     let alias = run_alias_analysis(std::slice::from_ref(graph));
     let adapted = if summaries.is_empty() && memory_pure.is_empty() {
         adapt(graph)?

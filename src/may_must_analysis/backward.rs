@@ -145,6 +145,9 @@ pub struct InvariantConfig {
     pub methods: Vec<InvariantMethod>,
     pub llm: Option<LlmInvariantConfig>,
     pub skip_algorithmic: bool,
+    /// Skip analysis of functions with more than this many instructions,
+    /// returning UNKNOWN immediately. 0 means unlimited.
+    pub max_function_size: usize,
 }
 
 impl Default for InvariantConfig {
@@ -153,6 +156,7 @@ impl Default for InvariantConfig {
             methods: Vec::new(),
             llm: None,
             skip_algorithmic: false,
+            max_function_size: 500,
         }
     }
 }
