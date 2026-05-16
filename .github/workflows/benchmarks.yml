@@ -13,9 +13,12 @@ on:
         required: false
         default: '0'
 
-  # Also run automatically every Sunday at 02:00 UTC.
+  # Also run automatically every Sunday at 02:00 UTC on the stable branch.
   schedule:
     - cron: '0 2 * * 0'
+
+  push:
+    branches: [ "stable" ]
 
 # Allow the workflow to push the updated RESULTS.md back to main.
 permissions:
