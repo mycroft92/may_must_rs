@@ -79,6 +79,11 @@ fn main() {
         matches.get_flag("debug-invariants"),
         matches.get_flag("diff-debug"),
     );
+    log::info!(
+        "Smash-plus-ultra v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_COMMIT_HASH")
+    );
     initialize_target();
 
     let input = matches.get_one::<String>("INPUT").unwrap();

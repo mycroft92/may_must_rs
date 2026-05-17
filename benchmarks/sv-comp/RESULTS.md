@@ -8,29 +8,27 @@ and flags any soundness or completeness anomalies.
 
 ---
 
-## 2026-05-17 — `307b0d4`
+## 2026-05-17 — `f785d26`
 
 Run: all files
 
 | Category | SAFE | UNSAFE | UNKNOWN | TIMEOUT | ERROR | Wrong | Total |
 |---|---|---|---|---|---|---|---|
 | infeasible-control-flow | 10 | 0 | 0 | 0 | 0 | 0 | 10 |
-| locks | 4 | 0 | 8 | 1 | 0 | 0 | 13 |
+| locks | 6 | 0 | 6 | 1 | 0 | 0 | 13 |
 | loop-crafted | 6 | 1 | 2 | 0 | 0 | 0 | 9 |
 | loop-invariants | 9 | 1 | 0 | 0 | 0 | **2** | 10 |
-| loops | 41 | 12 | 10 | 0 | 0 | **17** | 63 |
-| **Total** | **70** | **14** | **20** | **1** | **0** | **19** | **105** |
+| loops | 37 | 12 | 14 | 0 | 0 | **15** | 63 |
+| **Total** | **68** | **14** | **22** | **1** | **0** | **17** | **105** |
 
 **Soundness / completeness flags:**
   - MISSED:  `c/loops/array-2` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/compact` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/for_bounded_loop1` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/heavy-1` expected UNSAFE, got SAFE
-  - MISSED:  `c/loops/insertion_sort-1-2` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/invert_string-1` expected UNSAFE, got SAFE
   - UNSOUND: `c/loops/linear_sea.ch` expected SAFE, got UNSAFE
   - MISSED:  `c/loops/ludcmp` expected UNSAFE, got SAFE
-  - MISSED:  `c/loops/matrix-2-2` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/nec20` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/string-2.i` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/sum01_bug02.i` expected UNSAFE, got SAFE
@@ -47,26 +45,33 @@ Run: all files
 ---
 
 
-## 2026-05-16 — `9a500d8`
+## 2026-05-17 — `5a3d196`
 
 Run: all files
 
-| Category | SAFE | UNSAFE | UNKNOWN | ERROR | Wrong | Total |
-|---|---|---|---|---|---|---|
-| infeasible-control-flow | 10 | 0 | 0 | 0 | 0 | 10 |
-| locks | 0 | 0 | 13 | 0 | 0 | 13 |
-| loop-crafted | 3 | 1 | 5 | 0 | 0 | 9 |
-| loop-invariants | 9 | 1 | 0 | 0 | **2** | 10 |
-| loops | 20 | 10 | 33 | 0 | **8** | 63 |
-| **Total** | **42** | **12** | **51** | **0** | **10** | **105** |
+| Category | SAFE | UNSAFE | UNKNOWN | TIMEOUT | ERROR | Wrong | Total |
+|---|---|---|---|---|---|---|---|
+| infeasible-control-flow | 10 | 0 | 0 | 0 | 0 | 0 | 10 |
+| locks | 5 | 0 | 6 | 2 | 0 | 0 | 13 |
+| loop-crafted | 6 | 1 | 2 | 0 | 0 | 0 | 9 |
+| loop-invariants | 9 | 1 | 0 | 0 | 0 | **2** | 10 |
+| loops | 37 | 12 | 14 | 0 | 0 | **15** | 63 |
+| **Total** | **67** | **14** | **22** | **2** | **0** | **17** | **105** |
 
 **Soundness / completeness flags:**
   - MISSED:  `c/loops/array-2` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/compact` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/for_bounded_loop1` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/heavy-1` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/invert_string-1` expected UNSAFE, got SAFE
   - UNSOUND: `c/loops/linear_sea.ch` expected SAFE, got UNSAFE
   - MISSED:  `c/loops/ludcmp` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/nec20` expected UNSAFE, got SAFE
+  - MISSED:  `c/loops/string-2.i` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/sum01_bug02.i` expected UNSAFE, got SAFE
   - MISSED:  `c/loops/sum04-1.i` expected UNSAFE, got SAFE
+  - UNSOUND: `c/loops/terminator_02-2_abstracted` expected SAFE, got UNSAFE
+  - UNSOUND: `c/loops/trex03-2_abstracted` expected SAFE, got UNSAFE
   - UNSOUND: `c/loops/veris.c_NetBSD-libc_loop.i` expected SAFE, got UNSAFE
   - MISSED:  `c/loops/verisec_OpenSER_cases1_stripFullBoth_arr.i` expected UNSAFE, got SAFE
   - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
