@@ -277,18 +277,31 @@ initiation + inductiveness (exit closure skipped with `&BTreeMap::new()`).
 When `config.is_none()`, `precomputed_satisfy_exit_closure` is skipped entirely
 and the precomputed invariants are used directly.
 
-**Why this is sound:**
+**Why this is sound (conditional on a strong-enough invariant):**
 
 1. The observer invariants are proven inductive — every reachable header state
    satisfies them.  Injecting them into `reach` is a valid overapproximation.
-2. `run_backward` is the authoritative check.  If the invariant is too weak to
-   discharge the obligation, `run_backward` returns `Unknown` or `BugFound`,
-   not a false `Verified`.
+2. If the observer invariant is **strong enough to characterize the loop's exit
+   behaviour** relative to the observer assertion, `run_backward` correctly
+   discharges the obligation.  The invariant in `reach` at the header makes
+   `reach AND state` infeasible at the loop exit (the same effect that exit
+   closure would have verified explicitly), so the collapse of the backward
+   state through the loop initialization is correct, not spurious.
 3. Running `precomputed_satisfy_exit_closure` would likely fail for observer
    invariants (they are disjunctive — `counter <= k OR accumulator >= value` —
    not shaped to pass an exit-closure query).  A failure would fall through to
    `synthesize_loop_invariants`, which uses the same backward-state approach and
    would not find a better candidate.
+
+**Known soundness assumption:** if the observer invariant is *too weak* to
+block the violation at the loop exit (i.e., it would fail exit closure), then
+the exit-condition-vs-initialization collapse inside `run_backward` can produce
+a false `Verified` via the same mechanism described in §4.2.  The design relies
+on `observer_summary_invariants` producing invariants that are strong enough for
+this not to occur.  Weak counter-only invariants (e.g. `j >= 0` alone) are
+insufficient; the invariant must include the accumulator/result relationship
+(e.g. `j >= 0 AND result = f(array[0..j])`).  If this assumption is violated,
+the returned `ReturnSummary` may be unsound.
 
 **Why `precomputed_satisfy_exit_closure` is needed in the `config=Some` path:**
 
