@@ -60,6 +60,7 @@ use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::providers::LoopContext;
 use crate::may_must_analysis::rules::{Judgement, RuleEngine, RuleError};
 use crate::may_must_analysis::summaries::SummaryTables;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Final outcome of one assertion check together with supporting witness data.
@@ -145,6 +146,9 @@ pub struct InvariantConfig {
     pub methods: Vec<InvariantMethod>,
     pub llm: Option<LlmInvariantConfig>,
     pub skip_algorithmic: bool,
+    /// Skip analysis of functions with more than this many instructions,
+    /// returning UNKNOWN immediately. 0 means unlimited.
+    pub max_function_size: usize,
 }
 
 impl Default for InvariantConfig {
@@ -153,6 +157,7 @@ impl Default for InvariantConfig {
             methods: Vec::new(),
             llm: None,
             skip_algorithmic: false,
+            max_function_size: 500,
         }
     }
 }
@@ -687,8 +692,7 @@ fn first_accepted_candidate(
     assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
     accepted_inner: &[(CfgNodeId, Formula)],
 ) -> Option<Formula> {
-    for candidate in candidates {
-        let normalized = normalize_candidate(cfg, loop_info.header, candidate);
+    candidates.par_iter().find_map_any(|candidate| {
         let result = check_loop_invariant_verbose(
             loop_info,
             cfg,
@@ -697,6 +701,7 @@ fn first_accepted_candidate(
             assertion_postconditions,
             accepted_inner,
         );
+        let normalized = normalize_candidate(cfg, loop_info.header, candidate);
         log::debug!(
             target: "loop_invariant",
             "function {function} loop {} {} candidate {} => {}",
@@ -705,11 +710,8 @@ fn first_accepted_candidate(
             pretty_formula(&normalized),
             render_invariant_result(&result)
         );
-        if result == InvariantCheckResult::Accepted {
-            return Some(normalized);
-        }
-    }
-    None
+        (result == InvariantCheckResult::Accepted).then_some(normalized)
+    })
 }
 
 fn try_template_invariant() -> Option<Formula> {

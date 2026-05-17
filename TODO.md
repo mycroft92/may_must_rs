@@ -18,41 +18,26 @@ if doing so requires an unsound approximation.  Ordering of priorities:
 ## Soundness Debt (fix before broadening)
 
 These items can produce a **wrong `Verified`** on a program that is actually unsafe.
-Fix in order:
 
-- **`udiv`/`urem` treated as signed** — `udiv i32 a b` and `sdiv i32 a b` are both
-  lowered to `Term::div(lhs, rhs)`.  In the unbounded-Int model, if an operand is
-  negative (possible for values from unmodeled calls), the result differs from C
-  unsigned semantics.  Fix: inject `Assume(lhs >= 0)`, `Assume(rhs >= 0)`, and
-  `Assume(result >= 0)` for `udiv`; `Assume(lhs >= 0)` and `Assume(result >= 0)`
-  for `urem`.  This is analogous to the ZExt `>= 0` injection and equally cheap.
+- **`udiv`/`urem` treated as signed** — DONE.  `Assume(lhs >= 0)`, `Assume(rhs >= 0)`,
+  `Assume(result >= 0)` already injected for both `udiv` and `urem`.
 
-- **Unsigned icmp collapsed to signed** — `get_icmp_predicate` in `llvm_wrap.rs`
-  maps `ult/ule/ugt/uge` to the same `</<=/>/>=` symbols as their signed
-  counterparts.  For operands the analysis can prove are non-negative this is
-  sound; for values from unmodeled calls or signed arithmetic it is not.  Fix:
-  either propagate a sign flag through the comparison and inject `>= 0` constraints
-  on operands of unsigned comparisons, or emit a conservative `UNKNOWN` when a
-  comparison operand cannot be proved non-negative.
+- **Unsigned icmp collapsed to signed** — DONE (`0.4.2`).  Added `is_unsigned_icmp()`
+  to `llvm_wrap.rs`; adapter injects `Assume(lhs >= 0)` and `Assume(rhs >= 0)` before
+  any `ult`/`ule`/`ugt`/`uge` comparison so the unbounded-int model cannot admit
+  negative operands that bitvector semantics would treat as large unsigned values.
 
-## Known Benchmark Gaps (as of `1e7fb97`, 2026-05-16)
+## Known Benchmark Gaps (as of `ea8e6f5`, 2026-05-16)
 
 Reference: `benchmarks/sv-comp/RESULTS.md`, latest run.
-Totals: 51 UNKNOWN · 5 UNSOUND · 7 MISSED · 105 files.
+Totals: ~51 UNKNOWN · 3 UNSOUND · 7 MISSED · 105 files.
+(`count_up_down-1` and `trex03-2` fixed by Hoare-style inductiveness WP in `ea8e6f5`.)
 
 ### UNSOUND (wrong `Verified` on unsafe program — false safe)
 
-- `c/loops/count_up_down-1` — expected SAFE, got UNSAFE
 - `c/loops/linear_sea.ch` — expected SAFE, got UNSAFE
-- `c/loops/trex03-2` — expected SAFE, got UNSAFE
 - `c/loops/veris.c_NetBSD-libc_loop.i` — expected SAFE, got UNSAFE
 - `c/loop-invariants/bin-suffix-5` — expected SAFE, got UNSAFE
-
-`count_up_down-1` and `trex03-2` were previously fixed (in `970a9dd`) by
-ZExt/SExt `Assume` bounds in WP, but the `TypeBound` fix (which restores loop
-invariant synthesis) removes these from WP. The underlying root cause for
-these two is likely **unsigned icmp collapsed to signed** — fix that item
-first before revisiting.
 
 ### MISSED (wrong verdict on unsafe program)
 
@@ -70,18 +55,21 @@ locks 13 · loops 33 · loop-crafted 5 · loop-invariants 0.
 
 ## Instruction Coverage (sound but lossy — produce ERROR/UNKNOWN today)
 
-- **Integer bitwise And/Or/Xor** — currently only lowered for `i1`-typed values
-  (mapped to Boolean `and`/`or`/`xor`).  Integer-width variants fall through to
-  `Nop`, leaving the result variable unconstrained → `UNKNOWN` for any program
-  that uses bitmask operations.  Fix: lower as `Rem(lhs, 2^w)` or emit an
-  `Assume(result >= 0 && result <= max(|lhs|, |rhs|))` as a conservative
-  overapproximation, then refine toward bitvector modelling later.
+- **Integer bitwise And/Or/Xor** — DONE (`0.4.1`).  `And` with non-negative
+  constant mask emits `TypeBound(result >= 0 && result <= mask)`.  `Xor` with
+  constant `-1` (bitwise NOT) lowers to `result = -x - 1`.  `Or` leaves result
+  unconstrained (no useful bound without bitvector range info).
 
-- **Shifts (`Shl`, `LShr`, `AShr`)** — not in the opcode match → fall to the `_`
-  wildcard → `UnsupportedInstruction` error for any program that uses shifts.
-  Fix: lower `shl x, n` as `Mul(x, 2^n)` when `n` is a constant (sound for
-  non-negative `x`); `lshr`/`ashr` as `Div(x, 2^n)`.  Constant shifts cover the
-  majority of SV-COMP uses.
+- **Shifts (`Shl`, `LShr`, `AShr`)** — DONE (`0.4.1`).  Constant-amount shifts
+  lower to `Mul(x, 2^n)` / `Div(x, 2^n)`.  `LShr` adds a `TypeBound(result >= 0)`.
+  Variable shift amounts leave the result unconstrained.  Bitvector-precise
+  semantics deferred to long-term BitVector theory work.
+
+- **`unreachable` instruction** — DONE (`0.4.3`).  Emits `Assume(False)`, so
+  the backward precondition on any path reaching it is `False` (dead path).
+  Marks dead code following noreturn calls (`abort`, `__assert_fail`, `exit`).
+  Previously caused spurious `UnsupportedInstruction` errors and `UNKNOWN`
+  verdicts on functions that call these routines.
 
 ## Long-term / Structural
 
@@ -167,12 +155,34 @@ cannot resolve.  The remaining work is wiring `heap$callC` region names into
 the adapter so that `malloc` call sites produce `Seed` constraints in the AA
 and the lowered CFG contains concrete `MemoryStore` effects for heap writes.
 
-### Step 5 — Virtual dispatch
+### Step 5 — Virtual dispatch (done, `0.6.0`)
 
-`call %vtable_fn_ptr(...)` is an indirect call — no static callee name to
-look up. This requires a points-to / class-hierarchy analysis pass that maps
-each virtual call site to the set of possible concrete callees, then either:
-- inlines each candidate and checks under the union, or
-- builds per-class summaries and joins them at the call site.
+Indirect calls through vtable pointers (`call %vtable_fn_ptr(...)`) are now
+resolved to concrete callees at the lowering boundary:
 
-This is the most complex piece and is independent of Steps 1–4.
+1. **Module-wide vtable map** — `CallSummaryRegistry::scan_graph_vtables`
+   reads all vtable globals (handling Clang's `{ [N x ptr] }` struct wrapper)
+   and populates a `vtable_map: HashMap<region, Vec<Option<fn_name>>>`.
+
+2. **`ptr_at` side table** — `resolve_memory_effects` tracks
+   `ptr_at: HashMap<(region, concrete_offset), (region, Term)>` recording what
+   pointer is stored at each memory cell (e.g. the vptr store in a constructor
+   propagated via `ReturnSummary::ptr_writes`).
+
+3. **Vtable PointerLoad** — when loading a pointer from a cell that holds a
+   vtable region, the vtable map is consulted to insert the resolved function
+   name into `fn_ptr_vars`.
+
+4. **IndirectCall rewrite** — `TransferEffect::IndirectCall` is rewritten to
+   `TransferEffect::Call { callee }` once the callee is known.
+
+5. **Return summary application** — `apply_pending_return_summaries` now also
+   processes resolved indirect calls (second loop over CFG nodes), applying
+   callee return summaries exactly as for direct calls.
+
+6. **Field sub-region substitution** — `substitute_ext_regions` now does
+   prefix-match on `$f`-suffixed regions so that callee field access through
+   `ext_N$fK` maps to the caller's `actual_region$fK`.
+
+Test: `vtable_dispatch_verifies` — `Counter::get()` via virtual dispatch,
+assertion `v == 42` verified `Safe`.

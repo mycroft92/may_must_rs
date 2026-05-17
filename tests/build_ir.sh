@@ -30,8 +30,19 @@ if [ "$#" -eq 0 ]; then
 fi
 
 for src in "$@"; do
-    stem=$(basename "$src" .c)
-    "$clang_bin" $cflags -S -emit-llvm "$src" -o "$out_dir/$stem.ll"
-    "$clang_bin" $cflags -c -emit-llvm "$src" -o "$out_dir/$stem.bc"
+    case "$src" in
+        *.cpp|*.cc|*.cxx)
+            stem=$(basename "$src" | sed 's/\.[^.]*$//')
+            compiler="${clang_bin}++"
+            lang_flags="-std=c++17 -fno-rtti"
+            ;;
+        *)
+            stem=$(basename "$src" .c)
+            compiler="$clang_bin"
+            lang_flags=""
+            ;;
+    esac
+    "$compiler" $cflags ${lang_flags} -S -emit-llvm "$src" -o "$out_dir/$stem.ll"
+    "$compiler" $cflags ${lang_flags} -c -emit-llvm "$src" -o "$out_dir/$stem.bc"
     printf '%s -> %s, %s\n' "$src" "$out_dir/$stem.ll" "$out_dir/$stem.bc"
 done

@@ -13,8 +13,8 @@ from collections import defaultdict
 from datetime import datetime
 
 
-VERDICTS = ("SAFE", "UNSAFE", "UNKNOWN", "ERROR_COMPILE", "ERROR_CONVERT")
-VERDICT_COLS = ("SAFE", "UNSAFE", "UNKNOWN", "ERROR")   # display columns
+VERDICTS = ("SAFE", "UNSAFE", "UNKNOWN", "TIMEOUT", "ERROR_COMPILE", "ERROR_CONVERT")
+VERDICT_COLS = ("SAFE", "UNSAFE", "UNKNOWN", "TIMEOUT", "ERROR")   # display columns
 
 
 def load_csv(path: str) -> list[dict]:
@@ -29,7 +29,7 @@ def bucket(verdict: str) -> str:
     """Collapse ERROR_* variants into a single ERROR display bucket."""
     if verdict.startswith("ERROR"):
         return "ERROR"
-    return verdict if verdict in ("SAFE", "UNSAFE", "UNKNOWN") else "UNKNOWN"
+    return verdict if verdict in ("SAFE", "UNSAFE", "UNKNOWN", "TIMEOUT") else "UNKNOWN"
 
 
 def build_table(rows: list[dict]) -> str:
@@ -57,8 +57,8 @@ def build_table(rows: list[dict]) -> str:
         return cat.replace("c/ReachSafety-", "").replace("c/", "")
 
     lines = []
-    lines.append("| Category | SAFE | UNSAFE | UNKNOWN | ERROR | Wrong | Total |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| Category | SAFE | UNSAFE | UNKNOWN | TIMEOUT | ERROR | Wrong | Total |")
+    lines.append("|---|---|---|---|---|---|---|---|")
 
     for cat in sorted(counts):
         c = counts[cat]
@@ -70,6 +70,7 @@ def build_table(rows: list[dict]) -> str:
             f"| {c['SAFE']} "
             f"| {c['UNSAFE']} "
             f"| {c['UNKNOWN']} "
+            f"| {c['TIMEOUT']} "
             f"| {c['ERROR']} "
             f"| {wrong_cell} "
             f"| {total} |"
@@ -82,6 +83,7 @@ def build_table(rows: list[dict]) -> str:
         f"| **{totals['SAFE']}** "
         f"| **{totals['UNSAFE']}** "
         f"| **{totals['UNKNOWN']}** "
+        f"| **{totals['TIMEOUT']}** "
         f"| **{totals['ERROR']}** "
         f"| {total_wrong_cell} "
         f"| **{grand}** |"

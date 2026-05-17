@@ -37,23 +37,46 @@ use crate::common::abstract_cfg::{
     TransferEffect, TransferFn,
 };
 use crate::common::alias_analysis::AliasResult;
+use crate::common::flat_layout::{eval_flat_addr, FlatLayout};
 use crate::common::formula::{Formula, Memory, Rational, Sort, Term, Var};
 use crate::common::llvm_utils::llvm_wrap::{Instruction, InstructionOpcode, TargetData, TypeKind};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Heap allocator functions whose return value is treated as a fresh abstract region
+/// rather than an unresolved pointer.  Each call site gets a unique region name of the
+/// form `heap$<callee>@<N>` so distinct allocation sites remain distinguishable.
+///
+/// Only pure allocators that do not write to existing memory are listed here.
+/// `realloc` is intentionally excluded because it may free the old pointer and return
+/// either the same address or a new one, which requires a more complex model.
+const HEAP_ALLOCATORS: &[&str] = &[
+    "malloc",
+    "calloc",
+    "_Znwm",
+    "_Znam",
+    "__cxa_allocate_exception",
+];
+
 /// The result of lowering a single LLVM function to the abstract CFG representation.
 ///
 /// `instruction_nodes` maps each LLVM instruction to the [`CfgNodeId`] it was lowered into.
 /// This mapping is used after the fact by [`compute_return_summary`] and by the driver when
 /// it needs to associate analysis results with source locations.
+///
+/// `ptr_at` is the final pointer store-to-load forwarding map produced by
+/// [`resolve_memory_effects`].  It maps `(region, concrete_offset)` to the `(region, offset)`
+/// of the pointer value that was last stored at that memory cell.  Driver code uses this to
+/// extract [`PointerWriteEffect`]s for ext-region entries and populate the callee's
+/// [`ReturnSummary::ptr_writes`].
 #[derive(Clone, Debug)]
 pub struct AdaptedProcedure {
     pub name: String,
     pub cfg: AbstractCfg,
     pub assertions: Vec<AssertionSite>,
     pub instruction_nodes: HashMap<Instruction, CfgNodeId>,
+    pub ptr_at: HashMap<(String, i64), (String, Term)>,
 }
 
 /// A single `may_assert(cond)` call site within a function.
@@ -86,6 +109,29 @@ pub struct WriteEffectSummary {
     pub relation: Formula,
 }
 
+/// Records that a function stored a pointer value through one of its pointer parameters.
+///
+/// Semantics: the function wrote a pointer to `(target_region, target_offset)` into the
+/// memory cell at offset `param_offset` within the region corresponding to parameter
+/// `param_index`.
+///
+/// Example — constructor `_ZN7CounterC2Ev(this: *Counter)` stores the vtable pointer:
+/// ```text
+/// param_index = 0, param_offset = 0,
+/// target_region = "global$_ZTV7Counter", target_offset = Int(2)
+/// ```
+/// Applied in the caller: if the actual argument for param 0 resolves to
+/// `(heap$_Znwm@0, 0)`, the caller's `ptr_at` gains
+/// `(heap$_Znwm@0, 0) → (global$_ZTV7Counter, Int(2))`,
+/// enabling vtable fn-ptr resolution for subsequent virtual calls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PointerWriteEffect {
+    pub param_index: usize,
+    pub param_offset: i64,
+    pub target_region: String,
+    pub target_offset: Term,
+}
+
 /// An interprocedural summary of a function's return value and memory side effects.
 ///
 /// `relation` is a formula over the function's formal parameters (using their abstract names,
@@ -94,8 +140,12 @@ pub struct WriteEffectSummary {
 /// callee's behaviour needs to be spliced into the caller's CFG.
 ///
 /// `write_effects` records which pointer parameters the function may write through, together
-/// with the before/after memory relation for each modified region.  Currently the field is
-/// populated by the driver but the injection machinery reserves space for it here.
+/// with the before/after memory relation for each modified region.
+///
+/// `ptr_writes` records pointer store-to-load forwarding effects: for each pointer parameter
+/// through which the function stored a pointer, one [`PointerWriteEffect`] entry.  These are
+/// applied by [`resolve_memory_effects`] when processing the call site, updating the caller's
+/// `ptr_at` map so that subsequent `PointerLoad`s (e.g. vptr reads) resolve correctly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReturnSummary {
     pub function: String,
@@ -103,6 +153,7 @@ pub struct ReturnSummary {
     pub retval_name: String,
     pub relation: Formula,
     pub write_effects: Vec<WriteEffectSummary>,
+    pub ptr_writes: Vec<PointerWriteEffect>,
 }
 
 /// A keyed store of [`ReturnSummary`] values, one per callee function name.
@@ -119,12 +170,46 @@ pub struct ReturnSummary {
 pub struct CallSummaryRegistry {
     summaries: BTreeMap<String, ReturnSummary>,
     next_call_site: Cell<usize>,
+    /// Module-wide vtable map: global region name → function-pointer entries per slot.
+    /// Pre-built by scanning all function graphs before adaptation; merged into each
+    /// function's local vtable_fn_ptrs so cross-function vtable propagation works.
+    pub vtable_map: HashMap<String, Vec<Option<String>>>,
 }
 
 impl CallSummaryRegistry {
     /// Creates an empty registry with the call-site counter reset to zero.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Scans all operands of `graph` for global vtable references and populates the
+    /// module-wide vtable map.  Call this for every graph before starting adaptation so
+    /// that vtable entries discovered in one function (e.g. a constructor) are available
+    /// in all other functions that receive the vtable pointer via `ptr_writes`.
+    pub fn scan_graph_vtables(&mut self, graph: &FunctionGraph) {
+        for instruction in &graph.vertices {
+            for operand_idx in 0..instruction.get_operand_count() {
+                if let Some(op) = instruction.get_operand(operand_idx) {
+                    if let Some((global_name, _offset)) = op.as_const_gep_of_global() {
+                        let region = format!("global${global_name}");
+                        if !self.vtable_map.contains_key(&region) {
+                            if let Some(base_op) = op.get_operand(0) {
+                                if let Some(entries) = base_op.constant_fn_ptr_elements() {
+                                    self.vtable_map.insert(region, entries);
+                                }
+                            }
+                        }
+                    } else if op.is_global_variable_ref() {
+                        let region = format!("global${}", op.display_name());
+                        if !self.vtable_map.contains_key(&region) {
+                            if let Some(entries) = op.constant_fn_ptr_elements() {
+                                self.vtable_map.insert(region, entries);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Registers `summary`, keyed by `summary.function`.  Overwrites any existing entry for
@@ -248,12 +333,56 @@ pub fn adapt_with_purity_and_summaries(
         }
     }
 
+    // Pre-pass: assign unique heap regions to known allocator call sites whose
+    // result is a pointer.  Each call site gets heap$<callee>@<N> so that, e.g.,
+    // two calls to malloc in the same function produce distinct abstract regions.
+    let mut heap_alloc_regions = HashMap::<Instruction, String>::new();
+    let mut heap_index = 0usize;
+    for instruction in &graph.vertices {
+        if instruction.get_opcode() == InstructionOpcode::Call && is_pointer_value(*instruction) {
+            if let Some(callee) = instruction.get_called_function() {
+                if HEAP_ALLOCATORS.contains(&callee.as_str()) {
+                    let region = format!("{function_name}$heap${callee}@{heap_index}");
+                    heap_alloc_regions.insert(*instruction, region);
+                    heap_index += 1;
+                }
+            }
+        }
+    }
+
+    // Build flat address layout: stack allocas first, then heap allocations,
+    // then ext pointer params, then globals (discovered by scanning all operands).
+    // Globals not seen here are added lazily in resolve_memory_effects when they
+    // appear as operands.
+    let mut flat = FlatLayout::new();
+    for instruction in &graph.vertices {
+        if let Some(region) = allocation_regions.get(instruction) {
+            flat.add_region(region.clone());
+        }
+    }
+    for region in heap_alloc_regions.values() {
+        flat.add_region(region.clone());
+    }
+    for &param_index in &graph.pointer_param_indices {
+        flat.add_region(ext_region_name(function_name, param_index));
+    }
+    for instruction in &graph.vertices {
+        for i in 0..instruction.get_operand_count() {
+            if let Some(op) = instruction.get_operand(i) {
+                if op.is_global_variable_ref() && is_pointer_value(op) {
+                    flat.add_region(format!("global${}", op.display_name()));
+                }
+            }
+        }
+    }
+
     let mut cfg = AbstractCfg::new(start.print());
     cfg.set_entry_transfer(lower_node_transfer(
         function_name,
         start,
         memory_pure,
         &allocation_regions,
+        &heap_alloc_regions,
         &layout,
     )?);
     let mut instruction_nodes = HashMap::new();
@@ -268,6 +397,7 @@ pub fn adapt_with_purity_and_summaries(
             *instruction,
             memory_pure,
             &allocation_regions,
+            &heap_alloc_regions,
             &layout,
         )?;
         let node_id = cfg.add_node(instruction.print(), transfer);
@@ -309,11 +439,26 @@ pub fn adapt_with_purity_and_summaries(
     lower_assumes(function_name, graph, &mut cfg, &instruction_nodes)?;
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-    let final_env = resolve_memory_effects(&mut cfg, graph, function_name, alias);
+
+    // Build node→instruction reverse map so resolve_memory_effects can look up
+    // actual call arguments when applying callee ptr_writes.
+    let node_to_instruction: HashMap<CfgNodeId, Instruction> =
+        instruction_nodes.iter().map(|(&k, &v)| (v, k)).collect();
+
+    let (final_env, ptr_at) = resolve_memory_effects(
+        &mut cfg,
+        graph,
+        function_name,
+        alias,
+        &mut flat,
+        summaries,
+        &node_to_instruction,
+    );
     apply_pending_return_summaries(
         &mut cfg,
         graph,
         &instruction_nodes,
+        &node_to_instruction,
         function_name,
         summaries,
         &final_env,
@@ -331,6 +476,7 @@ pub fn adapt_with_purity_and_summaries(
         cfg,
         assertions,
         instruction_nodes,
+        ptr_at,
     })
 }
 
@@ -497,6 +643,57 @@ pub fn compute_return_summary(
         retval_name,
         relation,
         write_effects: Vec::new(),
+        ptr_writes: Vec::new(),
+    })
+}
+
+/// Extracts [`PointerWriteEffect`]s from the final `ptr_at` map of an adapted function.
+///
+/// Scans `ptr_at` for entries whose region matches one of the function's external parameter
+/// regions (`fn$__ext_N`).  Each such entry records that the function stored a pointer
+/// through that parameter, which is exported to callers via [`ReturnSummary::ptr_writes`].
+pub fn extract_ptr_writes(
+    graph: &FunctionGraph,
+    function_name: &str,
+    ptr_at: &HashMap<(String, i64), (String, Term)>,
+) -> Vec<PointerWriteEffect> {
+    let mut writes = Vec::new();
+    for &param_index in &graph.pointer_param_indices {
+        let ext_region = ext_region_name(function_name, param_index);
+        for ((region, param_offset), (target_region, target_offset)) in ptr_at {
+            if *region == ext_region {
+                writes.push(PointerWriteEffect {
+                    param_index,
+                    param_offset: *param_offset,
+                    target_region: target_region.clone(),
+                    target_offset: target_offset.clone(),
+                });
+            }
+        }
+    }
+    writes
+}
+
+/// Produces a [`ReturnSummary`] carrying only pointer write effects when
+/// [`compute_return_summary`] returns `None` (e.g. void-returning or pointer-returning
+/// functions whose retval doesn't appear in any integer formula).
+///
+/// Returns `None` if no pointer writes were recorded for any parameter region.
+pub fn ptr_write_summary_if_any(
+    graph: &FunctionGraph,
+    adapted: &AdaptedProcedure,
+) -> Option<ReturnSummary> {
+    let ptr_writes = extract_ptr_writes(graph, &adapted.name, &adapted.ptr_at);
+    if ptr_writes.is_empty() {
+        return None;
+    }
+    Some(ReturnSummary {
+        function: adapted.name.clone(),
+        formal_parameters: formal_parameter_names(graph, &adapted.name),
+        retval_name: synthetic_retval_name(&adapted.name),
+        relation: Formula::True,
+        write_effects: Vec::new(),
+        ptr_writes,
     })
 }
 
@@ -761,6 +958,9 @@ fn lower_gep(
 ///   synthetic return-value variable.
 /// - **`call`**: if the callee is not `may_assert`, produce a `Call` effect with
 ///   `PreservesMemory` when the callee is in `memory_pure`, otherwise `HavocMemory`.
+///   Exception: calls to known heap allocators (`malloc`, `calloc`, etc.) that have a
+///   pointer-typed result produce `HeapAlloc` instead and no `Call` effect, since
+///   allocators do not write to existing memory regions.
 /// - **`fneg`**: produces a negation `Assign`.
 /// - **`bitcast` / `addrspacecast`** on pointer values: produce `PointerAlias`.
 /// - **`switch`**, **`indirectbr`**: produce no effects (guards are approximated as `True`).
@@ -773,6 +973,7 @@ fn lower_node_transfer(
     instruction: Instruction,
     memory_pure: &BTreeSet<String>,
     allocation_regions: &HashMap<Instruction, String>,
+    heap_alloc_regions: &HashMap<Instruction, String>,
     layout: &TargetData,
 ) -> Result<TransferFn, AdapterError> {
     let mut effects = Vec::<TransferEffect>::new();
@@ -870,6 +1071,20 @@ fn lower_node_transfer(
                     .get_fcmp_predicate()
                     .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?
             };
+            // For unsigned integer comparisons (ult/ule/ugt/uge) the operands are
+            // always non-negative in the unsigned interpretation.  Inject Assume
+            // constraints so the unbounded-int model doesn't admit negative
+            // operands, which would give signed-comparison results instead.
+            if instruction.is_unsigned_icmp() {
+                effects.push(TransferEffect::Assume(Formula::ge(
+                    lhs.clone(),
+                    Term::int(0),
+                )));
+                effects.push(TransferEffect::Assume(Formula::ge(
+                    rhs.clone(),
+                    Term::int(0),
+                )));
+            }
             let predicate = match predicate_name {
                 "==" => Formula::eq(lhs, rhs),
                 "!=" => Formula::not(Formula::eq(lhs, rhs)),
@@ -884,11 +1099,95 @@ fn lower_node_transfer(
                 value: AssignValue::Predicate(predicate),
             });
         }
+        InstructionOpcode::Shl | InstructionOpcode::LShr | InstructionOpcode::AShr => {
+            if sort_of_instruction_value(instruction)? == Sort::Bool {
+                return Ok(TransferFn::new(effects));
+            }
+            let target = assigned_var(function_name, instruction)?;
+            let lhs = lower_numeric_value(
+                function_name,
+                instruction
+                    .get_operand(0)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?,
+            )?;
+            let shift_instr = instruction
+                .get_operand(1)
+                .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
+            if let Some(shift) = shift_instr.as_constant_int() {
+                if shift >= 0 && shift < 63 {
+                    let factor = 1i64 << shift;
+                    let term = if instruction.get_opcode() == InstructionOpcode::Shl {
+                        Term::mul(lhs, Term::int(factor))
+                    } else {
+                        Term::div(lhs, Term::int(factor))
+                    };
+                    effects.push(TransferEffect::Assign {
+                        target: target.clone(),
+                        value: AssignValue::Term(term),
+                    });
+                    if instruction.get_opcode() == InstructionOpcode::LShr {
+                        // Logical right shift fills with zero bits; result is always non-negative.
+                        effects.push(TransferEffect::TypeBound(Formula::ge(
+                            Term::Var(target),
+                            Term::int(0),
+                        )));
+                    }
+                }
+            }
+            // Variable or large shift amount: leave target unconstrained.
+        }
         InstructionOpcode::And | InstructionOpcode::Or | InstructionOpcode::Xor => {
             let result_sort = sort_of_instruction_value(instruction)?;
             if result_sort != Sort::Bool {
+                // Integer-width variants: apply conservative approximations where possible.
+                let target = assigned_var(function_name, instruction)?;
+                let op0 = instruction
+                    .get_operand(0)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
+                let op1 = instruction
+                    .get_operand(1)
+                    .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
+                match instruction.get_opcode() {
+                    InstructionOpcode::And => {
+                        // x & c where c >= 0: result is in [0, c].
+                        // Bitwise AND with a non-negative mask can only clear bits, never set
+                        // bits beyond what c already has.
+                        let mask = op1.as_constant_int().or_else(|| op0.as_constant_int());
+                        if let Some(c) = mask.filter(|&c| c >= 0) {
+                            let t = Term::Var(target);
+                            effects.push(TransferEffect::TypeBound(Formula::ge(
+                                t.clone(),
+                                Term::int(0),
+                            )));
+                            effects.push(TransferEffect::TypeBound(Formula::le(t, Term::int(c))));
+                        }
+                    }
+                    InstructionOpcode::Xor => {
+                        // `xor x, -1` is the canonical LLVM bitwise NOT: result = -x - 1.
+                        let (is_not, operand) = if op1.as_constant_int() == Some(-1) {
+                            (true, op0)
+                        } else if op0.as_constant_int() == Some(-1) {
+                            (true, op1)
+                        } else {
+                            (false, op0)
+                        };
+                        if is_not {
+                            if let Ok(lhs) = lower_numeric_value(function_name, operand) {
+                                effects.push(TransferEffect::Assign {
+                                    target,
+                                    value: AssignValue::Term(Term::sub(
+                                        Term::sub(Term::int(0), lhs),
+                                        Term::int(1),
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                    _ => {} // Or: no useful bound without range information
+                }
                 return Ok(TransferFn::new(effects));
             }
+            // i1 Bool case: lower bitwise ops to logical connectives.
             let target = assigned_var(function_name, instruction)?;
             let lhs = lower_bool_value(
                 function_name,
@@ -1056,6 +1355,10 @@ fn lower_node_transfer(
             }
         }
         InstructionOpcode::PHI | InstructionOpcode::Br => {}
+        InstructionOpcode::Unreachable => {
+            // Execution never reaches this point — precondition is False.
+            effects.push(TransferEffect::Assume(Formula::False));
+        }
         InstructionOpcode::Ret => {
             if let Some(ret_value) = instruction.get_operand(0) {
                 if sort_of_instruction_value(ret_value)? == Sort::Int {
@@ -1067,19 +1370,46 @@ fn lower_node_transfer(
             }
         }
         InstructionOpcode::Call => {
-            let callee = instruction
-                .get_called_function()
-                .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
-            if callee != "may_assert" {
-                let memory_effect = if memory_pure.contains(&callee) {
-                    CallMemoryEffect::PreservesMemory
-                } else {
-                    CallMemoryEffect::HavocMemory
-                };
-                effects.push(TransferEffect::Call {
-                    callee: callee.clone(),
-                    memory_effect,
-                });
+            match instruction.get_called_function() {
+                None => {
+                    // Indirect call through a function pointer (e.g. virtual dispatch).
+                    // The callee value is the last LLVM operand of the call instruction.
+                    // `resolve_memory_effects` will attempt to resolve this to a concrete
+                    // callee via a vtable lookup; if that fails it is treated conservatively.
+                    if let Some(callee_op) =
+                        instruction.get_operand(instruction.get_operand_count().saturating_sub(1))
+                    {
+                        let callee_ptr = local_name(function_name, callee_op);
+                        effects.push(TransferEffect::IndirectCall {
+                            callee_ptr,
+                            memory_effect: CallMemoryEffect::HavocMemory,
+                        });
+                    }
+                }
+                Some(callee) if callee == "may_assert" => {
+                    // Stripped by program_graph.rs; no node-local effect.
+                }
+                Some(callee) => {
+                    if let Some(region) = heap_alloc_regions.get(&instruction) {
+                        // Known allocator returning a fresh pointer: bind the result to a
+                        // unique heap region instead of emitting a Call with HavocMemory.
+                        // Allocators do not write to any existing memory region.
+                        effects.push(TransferEffect::HeapAlloc {
+                            result_ptr: pointer_name(function_name, instruction),
+                            region: region.clone(),
+                        });
+                    } else {
+                        let memory_effect = if memory_pure.contains(&callee) {
+                            CallMemoryEffect::PreservesMemory
+                        } else {
+                            CallMemoryEffect::HavocMemory
+                        };
+                        effects.push(TransferEffect::Call {
+                            callee: callee.clone(),
+                            memory_effect,
+                        });
+                    }
+                }
             }
         }
         InstructionOpcode::FNeg => {
@@ -1114,6 +1444,24 @@ fn lower_node_transfer(
                         source: pointer_name(function_name, op),
                     });
                 }
+            }
+        }
+        InstructionOpcode::PtrToInt => {
+            if let Some(op) = instruction.get_operand(0) {
+                if let Ok(target) = assigned_var(function_name, instruction) {
+                    effects.push(TransferEffect::PtrToInt {
+                        target,
+                        source_ptr: pointer_name(function_name, op),
+                    });
+                }
+            }
+        }
+        InstructionOpcode::IntToPtr => {
+            if let Some(op) = instruction.get_operand(0) {
+                effects.push(TransferEffect::IntToPtr {
+                    target_ptr: pointer_name(function_name, instruction),
+                    source_name: local_name(function_name, op),
+                });
             }
         }
         InstructionOpcode::Switch | InstructionOpcode::IndirectBr => {}
@@ -1346,33 +1694,136 @@ fn assertion_location(site: &crate::common::llvm_utils::program_graph::AssertSit
 /// Builds the [`PointerEnv`] for the function and rewrites abstract memory effects in the
 /// CFG to concrete array-theory terms.
 ///
-/// This is the heart of the memory model.  The pass works in two phases:
+/// This is the heart of the memory model.  It translates the symbolic pointer
+/// environment — which maps LLVM SSA pointer names to `(region, offset)` pairs — into
+/// concrete `MemoryStore` and `select(region, offset)` expressions that the WP engine can
+/// reason about directly.
 ///
-/// **Phase 1 – seed the environment.**
-/// Pointer parameters are mapped to fresh "external" regions (`fn$__ext_N`) with offset 0.
-/// Global variable references encountered in the instruction operands are mapped to
-/// per-global regions (`global$<name>`).
+/// The pass works in two phases:
 ///
-/// **Phase 2 – forward dataflow rewrite.**
-/// The CFG nodes are visited in topological order (back-edges are excluded to break cycles;
-/// if a full topological order is unavailable the original node order is used as a
-/// best-effort approximation).  For each node's effects:
+/// ---
 ///
-/// - `Alloca` → recorded in the env mapping the local pointer name to the new stack region.
-/// - `GetElementPtr` → the child pointer inherits the parent's region with an adjusted offset.
-/// - `Load` on a pointer whose binding is known → rewritten to `Assign(select(region, offset))`.
-///   Real-typed loads use a scalar slot variable instead of an array select.
-/// - `Store` on a known pointer → rewritten to `MemoryStore(region, offset, value)`.
-///   Real-typed stores become a scalar slot `Assign`.
-/// - `PointerStore { target_slot, value_ptr }` → if `value_ptr` is in the env, binds
-///   `target_slot` to the same region.  If not in the env, falls back to `alias`:
-///   when `pts(value_ptr)` is a singleton the unique region is bound; otherwise
-///   `target_slot` is left unresolved (conservative).
-/// - `PointerLoad { target_ptr, source_slot }` → if `source_slot` is in the env, binds
-///   `target_ptr` to the same region.  If not in the env, falls back to `alias`:
-///   the union of `pts_mem(r)` for each `r ∈ pts(source_slot)` is taken; when the
-///   union is a singleton that region is bound; otherwise `target_ptr` is left unresolved.
-/// - `PointerAlias` → copies the binding from source to target, then becomes `Nop`.
+/// ## Phase 1 — Seed the environment
+///
+/// Before visiting any instruction, the env is pre-populated with all pointer bindings
+/// that are known from the function signature and module-level information:
+///
+/// - **Pointer parameters** (`fn$%param`): each parameter at a `pointer_param_index` is
+///   bound to a fresh *external region* `fn$__ext_N` at offset 0.  External regions model
+///   memory that lives in the *caller's* frame; the callee can read and write through them
+///   but cannot know their absolute address.  The region name is stable so callee summaries
+///   can later be instantiated at the call site via region substitution.
+///
+/// - **Global variable references**: any operand in the function body that refers to a
+///   global variable with pointer type is bound to a per-global region `global$<name>` at
+///   offset 0.  Globals are scanned eagerly here (before the node traversal) so that a
+///   reference in an early instruction does not depend on traversal order.
+///
+/// ---
+///
+/// ## Phase 2 — Forward dataflow rewrite
+///
+/// CFG nodes are visited in *topological order*, excluding detected back-edges (to avoid
+/// a chicken-and-egg dependency on the result of the traversal itself).  If no valid
+/// topological order exists (e.g. irreducible CFG), the original node order is used as a
+/// best-effort approximation.  For each node, the existing abstract effects are consumed
+/// and replaced with a rewritten list according to the following rules:
+///
+/// ### Allocation effects — establish new region bindings
+///
+/// - **`Alloca { target, region }`** — the stack alloca names a fresh region.  `target`
+///   (the LLVM SSA pointer name) is bound to `(region, 0)` in the env.  The effect is
+///   kept as-is; WP treats it as a no-op but it serves as a readable record of the
+///   allocation in the CFG.
+///
+/// - **`HeapAlloc { result_ptr, region }`** — a call to a known allocator (`malloc`,
+///   `calloc`, etc.) that was assigned a unique heap region during the pre-pass.
+///   `result_ptr` is bound to `(region, 0)` in the env and `region` is registered in the
+///   `FlatLayout` so that a subsequent `ptrtoint` of the result gets a concrete integer
+///   address distinct from all stack and global regions.  The effect is kept as-is; WP
+///   treats it as a no-op.
+///
+/// ### Pointer arithmetic — propagate bindings through GEP
+///
+/// - **`GetElementPtr { target, base, offset }`** — if `base` is already in the env, the
+///   child pointer `target` inherits the same region with the offset incremented:
+///   `target → (base.region, base.offset + offset)`.  If `base` is not in the env the GEP
+///   is kept unchanged and the target remains unresolved.  Effect is kept as-is (no-op for
+///   WP).
+///
+/// - **`StructFieldGep { target, base, field_index }`** — instead of adjusting the offset
+///   inside the base region, a dedicated per-field *sub-region* is created:
+///   `target → ("<base.region>$f<field_index>", 0)`.  This gives each struct field its own
+///   independent array so the backward analysis can distinguish `node->x` from `node->y`
+///   without needing array-theory element-level reasoning.  Effect becomes `Nop`.
+///
+/// ### Scalar loads and stores — materialise select/store expressions
+///
+/// - **`Load { target, source }`** (non-pointer result) — if `source` is in the env,
+///   rewritten to `Assign { target, select(region, offset) }`.  The `select` term is the
+///   SMT array-read operation; the backward WP will later reduce it when a preceding
+///   `MemoryStore` at the same region and offset is in scope.  Real-typed (floating-point)
+///   loads use a named scalar slot variable `<region>$slot_real` instead of an array
+///   select, since the solver's real theory does not have array support.  If `source` is
+///   not in the env, the original `Load` effect is kept unchanged (target remains free).
+///
+/// - **`Store { target, value }`** (non-pointer value) — if `target` is in the env,
+///   rewritten to `MemoryStore { region, offset, value }`.  WP will later substitute the
+///   array `region := store(region, offset, value)` in the postcondition.  Real-typed
+///   stores become a scalar slot `Assign`.  If `target` is not in the env the original
+///   `Store` effect is kept unchanged (the write is invisible to WP).
+///
+/// ### Pointer-valued loads and stores — propagate env bindings
+///
+/// - **`PointerStore { target_slot, value_ptr }`** — stores a pointer into a pointer-typed
+///   memory cell (e.g. `node->next = other_node`).  If `value_ptr` is in the env, its
+///   `(region, offset)` binding is copied to `target_slot` so that a subsequent
+///   `PointerLoad` from the same slot can recover the pointed-to region.  If `value_ptr`
+///   is *not* in the env, the alias analysis fallback is tried: if `pts(value_ptr)` is a
+///   singleton the unique region is bound; if ambiguous or unknown `target_slot` is left
+///   unresolved.  Effect becomes `Nop` (no WP effect — pointer identity is not a first-
+///   class formula term).
+///
+/// - **`PointerLoad { target_ptr, source_slot }`** — loads a pointer from a pointer-typed
+///   memory cell.  If `source_slot` is in the env, its binding is copied to `target_ptr`.
+///   If `source_slot` is not in the env, the alias analysis fallback collects all abstract
+///   locations stored into every region that `source_slot` may point to
+///   (`⋃ pts_mem(r) for r ∈ pts(source_slot)`); when the union is a singleton that region
+///   is bound; otherwise `target_ptr` is left unresolved.  Effect becomes `Nop`.
+///
+/// - **`PointerAlias { target, source }`** — copies the binding from `source` to `target`
+///   without any arithmetic, then becomes `Nop`.  Produced by `bitcast` and
+///   `addrspacecast` on pointer values.
+///
+/// ### Flat-address arithmetic — ptrtoint / inttoptr round-trips
+///
+/// - **`PtrToInt { target, source_ptr }`** — if `source_ptr` is in the env *and* its
+///   offset is a concrete integer, the flat address `base(region) + offset` is looked up
+///   in the [`FlatLayout`] and the result is emitted as `Assign { target, Int(addr) }`.
+///   The resolved address is also recorded in a side table `flat_int_vars` so that
+///   subsequent arithmetic on `target` can propagate the concrete value.  If the pointer
+///   is unresolved, the effect becomes `Nop` (target remains unconstrained).
+///
+/// - **`IntToPtr { target_ptr, source_name }`** — the inverse: if `source_name` is in
+///   `flat_int_vars` (i.e., was produced by a `ptrtoint` of a known pointer), the flat
+///   address is decoded via [`FlatLayout::region_at`] and `target_ptr` is bound to the
+///   resulting `(region, offset)` pair in the env.  This resolves container-of style
+///   patterns where a pointer is converted to an integer, offset by a struct field
+///   displacement, then converted back.  Effect always becomes `Nop`.
+///
+/// - **`Assign { target, Term }`** — arithmetic on integer-sorted variables is passed
+///   through unmodified, but if the right-hand side can be evaluated to a concrete flat
+///   address (via `eval_flat_addr`), the result is also recorded in `flat_int_vars` so
+///   that ptrtoint + arithmetic + inttoptr chains resolve correctly.
+///
+/// ### Unresolvable effects — kept as-is
+///
+/// Any effect that does not match the above patterns (e.g. a `Load` whose source pointer
+/// is not in the env, a `Call` with `HavocMemory`, an `Assume`, etc.) is pushed into the
+/// rewritten list unchanged.  Downstream passes either handle them conservatively or leave
+/// the corresponding variable unconstrained.
+///
+/// ---
 ///
 /// Returns the final [`PointerEnv`] so that the callee-summary and memcpy injection passes
 /// can resolve actual regions for pointer arguments (see [`apply_pending_return_summaries`]
@@ -1382,11 +1833,38 @@ fn resolve_memory_effects(
     graph: &FunctionGraph,
     function_name: &str,
     alias: &AliasResult,
-) -> PointerEnv {
+    flat: &mut FlatLayout,
+    summaries: &CallSummaryRegistry,
+    node_to_instruction: &HashMap<CfgNodeId, Instruction>,
+) -> (PointerEnv, HashMap<(String, i64), (String, Term)>) {
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
     let order = cfg
         .topological_order_excluding(&excluded)
         .unwrap_or_else(|| cfg.node_ids().collect::<Vec<_>>());
+
+    // Side table: integer SSA var name → flat address, for inttoptr recovery.
+    // Populated when PtrToInt is resolved; propagated through arithmetic Assigns.
+    let mut flat_int_vars: HashMap<String, i64> = HashMap::new();
+
+    // Side table: SSA name → concrete function name, for virtual dispatch.
+    // Populated when a PointerLoad from a vtable region at a concrete index resolves
+    // to a known function pointer; consumed when an IndirectCall uses that name.
+    let mut fn_ptr_vars: HashMap<String, String> = HashMap::new();
+
+    // Vtable map: global region name → list of function names per vtable slot.
+    // Seeded from the module-wide registry (populated by scan_graph_vtables before
+    // adaptation) so vtable entries discovered in one function (e.g. a constructor)
+    // are available here even if the current function never directly references the
+    // vtable global.  Extended further during the per-instruction operand scan below.
+    let mut vtable_fn_ptrs: HashMap<String, Vec<Option<String>>> =
+        summaries.vtable_map.clone();
+
+    // Pointer store-to-load forwarding map.
+    // ptr_at[(R, k)] = (VR, VO) means: the memory cell at (region R, offset k)
+    // currently holds a pointer to (VR, VO).  Populated by PointerStore; consulted
+    // by PointerLoad before falling back to the conservative region alias.
+    // Callee ptr_writes (from ReturnSummary) are merged here when a Call is processed.
+    let mut ptr_at: HashMap<(String, i64), (String, Term)> = HashMap::new();
 
     let mut env = PointerEnv::default();
     for &param_index in &graph.pointer_param_indices {
@@ -1404,9 +1882,35 @@ fn resolve_memory_effects(
             if let Some(op) = instruction.get_operand(operand_idx) {
                 if op.is_global_variable_ref() && is_pointer_value(op) {
                     let ptr_name = local_name(function_name, op);
+                    let region = format!("global${}", op.display_name());
                     if env.get(&ptr_name).is_none() {
-                        let region = format!("global${}", op.display_name());
-                        env.bind(ptr_name, region, Term::int(0));
+                        env.bind(ptr_name, region.clone(), Term::int(0));
+                    }
+                    // Build vtable map for this global if not already done.
+                    if !vtable_fn_ptrs.contains_key(&region) {
+                        if let Some(entries) = op.constant_fn_ptr_elements() {
+                            vtable_fn_ptrs.insert(region, entries);
+                        }
+                    }
+                } else if let Some((global_name, offset)) = op.as_const_gep_of_global() {
+                    // ConstantExpr GEP of a global: e.g. the vptr value stored in a
+                    // constructor (`getelementptr @_ZTV3Foo, 0, 2`).  Bind the expression's
+                    // name so that PointerStore can propagate the vtable region through
+                    // the PointerEnv.
+                    let ptr_name = local_name(function_name, op);
+                    if env.get(&ptr_name).is_none() {
+                        let region = format!("global${global_name}");
+                        flat.add_region(region.clone());
+                        // Build vtable map for the base global too.
+                        if !vtable_fn_ptrs.contains_key(&region) {
+                            // Re-fetch the global's fn-ptr entries via the operand's base.
+                            if let Some(base_op) = op.get_operand(0) {
+                                if let Some(entries) = base_op.constant_fn_ptr_elements() {
+                                    vtable_fn_ptrs.insert(region.clone(), entries);
+                                }
+                            }
+                        }
+                        env.bind(ptr_name, region, Term::int(offset));
                     }
                 }
             }
@@ -1425,6 +1929,14 @@ fn resolve_memory_effects(
                 TransferEffect::Alloca { target, region } => {
                     env.bind(target.clone(), region.clone(), Term::int(0));
                     rewritten.push(TransferEffect::Alloca { target, region });
+                }
+                TransferEffect::HeapAlloc { result_ptr, region } => {
+                    // Bind the call result pointer to the fresh heap region and register
+                    // it in the flat layout so ptrtoint of a heap pointer gets a concrete
+                    // integer address distinct from all stack/global regions.
+                    flat.add_region(region.clone());
+                    env.bind(result_ptr.clone(), region.clone(), Term::int(0));
+                    rewritten.push(TransferEffect::HeapAlloc { result_ptr, region });
                 }
                 TransferEffect::GetElementPtr {
                     target,
@@ -1498,17 +2010,30 @@ fn resolve_memory_effects(
                     target_slot,
                     value_ptr,
                 } => {
-                    if let Some(binding) = env.get(&value_ptr).cloned() {
-                        env.bind(target_slot.clone(), binding.region, binding.offset);
-                    } else {
-                        // AA fallback: if value_ptr points to exactly one abstract
-                        // location, propagate that binding to target_slot.
-                        let locs = alias.points_to(&value_ptr);
-                        if locs.len() == 1 {
-                            let region = locs.iter().next().unwrap().0.clone();
-                            env.bind(target_slot.clone(), region, Term::int(0));
+                    // Record what pointer is stored at the memory cell that target_slot
+                    // points to.  This is the ptr_at map: ptr_at[(R, k)] = (VR, VO).
+                    // We do NOT rebind env[target_slot] — the slot's own location in
+                    // memory is unchanged; only the content stored there changes.
+                    if let Some(slot_binding) = env.get(&target_slot).cloned() {
+                        if let Some(k) = slot_binding.offset.try_as_constant_int() {
+                            if let Some(val_binding) = env.get(&value_ptr).cloned() {
+                                ptr_at.insert(
+                                    (slot_binding.region, k),
+                                    (val_binding.region, val_binding.offset),
+                                );
+                            } else {
+                                // AA fallback: if value_ptr's target region is uniquely known,
+                                // use it as the stored pointer value.
+                                let locs = alias.points_to(&value_ptr);
+                                if locs.len() == 1 {
+                                    let region = locs.iter().next().unwrap().0.clone();
+                                    ptr_at.insert(
+                                        (slot_binding.region, k),
+                                        (region, Term::int(0)),
+                                    );
+                                }
+                            }
                         }
-                        // If ambiguous or unknown, leave target_slot unbound (conservative).
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
@@ -1517,7 +2042,41 @@ fn resolve_memory_effects(
                     source_slot,
                 } => {
                     if let Some(binding) = env.get(&source_slot).cloned() {
-                        env.bind(target_ptr, binding.region, binding.offset);
+                        // Step 1: consult ptr_at — if someone previously stored a pointer
+                        // into the memory cell that source_slot points to, use that stored
+                        // pointer as the binding for target_ptr.  This resolves the vptr
+                        // load pattern: *obj (object region) → stored vtable region.
+                        let resolved_via_ptr_at =
+                            if let Some(k) = binding.offset.try_as_constant_int() {
+                                ptr_at.get(&(binding.region.clone(), k)).cloned()
+                            } else {
+                                None
+                            };
+
+                        if let Some((stored_region, stored_offset)) = resolved_via_ptr_at {
+                            // The memory cell holds a pointer to (stored_region, stored_offset).
+                            // Set env[target_ptr] so that a subsequent PointerLoad can do the
+                            // vtable fn-ptr check at that region/offset.
+                            env.bind(target_ptr, stored_region, stored_offset);
+                        } else {
+                            // Step 2: no ptr_at entry — vtable fn-ptr lookup directly on the
+                            // source binding (existing behavior for direct vtable loads).
+                            let mut resolved_as_fn_ptr = false;
+                            if let Some(idx) = binding.offset.try_as_constant_int() {
+                                if let Some(entries) = vtable_fn_ptrs.get(&binding.region) {
+                                    let i = idx as usize;
+                                    if let Some(Some(fn_name)) = entries.get(i) {
+                                        fn_ptr_vars.insert(target_ptr.clone(), fn_name.clone());
+                                        resolved_as_fn_ptr = true;
+                                    }
+                                }
+                            }
+                            if !resolved_as_fn_ptr {
+                                // Conservative fallback: treat source_slot's binding as the
+                                // loaded pointer's binding (SSA-level alias approximation).
+                                env.bind(target_ptr, binding.region, binding.offset);
+                            }
+                        }
                     } else {
                         // AA fallback: collect all abstract locations stored into every
                         // region that source_slot may point to.  If the union is a single
@@ -1539,6 +2098,25 @@ fn resolve_memory_effects(
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
+                TransferEffect::IndirectCall {
+                    callee_ptr,
+                    memory_effect,
+                } => {
+                    // Try to resolve the indirect call to a concrete callee via the
+                    // fn_ptr_vars side table (populated by vtable PointerLoad above).
+                    if let Some(callee) = fn_ptr_vars.get(&callee_ptr) {
+                        rewritten.push(TransferEffect::Call {
+                            callee: callee.clone(),
+                            memory_effect,
+                        });
+                    } else {
+                        // Unresolved indirect call: keep as-is for conservative handling.
+                        rewritten.push(TransferEffect::IndirectCall {
+                            callee_ptr,
+                            memory_effect,
+                        });
+                    }
+                }
                 TransferEffect::PointerAlias { target, source } => {
                     if let Some(binding) = env.get(&source).cloned() {
                         env.bind(target.clone(), binding.region, binding.offset);
@@ -1556,6 +2134,82 @@ fn resolve_memory_effects(
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
+                TransferEffect::PtrToInt { target, source_ptr } => {
+                    let resolved = env.get(&source_ptr).and_then(|binding| {
+                        if let Term::Int(offset) = &binding.offset {
+                            flat.flat_addr(&binding.region, *offset).map(|addr| addr)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(addr) = resolved {
+                        flat_int_vars.insert(target.name().to_string(), addr);
+                        rewritten.push(TransferEffect::Assign {
+                            target,
+                            value: AssignValue::Term(Term::int(addr)),
+                        });
+                    } else {
+                        rewritten.push(TransferEffect::Nop);
+                    }
+                }
+                TransferEffect::IntToPtr {
+                    target_ptr,
+                    source_name,
+                } => {
+                    if let Some(&addr) = flat_int_vars.get(&source_name) {
+                        if let Some((region, offset)) = flat.region_at(addr) {
+                            env.bind(target_ptr, region.to_string(), Term::int(offset));
+                        }
+                    }
+                    rewritten.push(TransferEffect::Nop);
+                }
+                TransferEffect::Assign {
+                    ref target,
+                    value: AssignValue::Term(ref term),
+                } => {
+                    // Propagate flat addresses through arithmetic so that
+                    // ptrtoint → add/sub → inttoptr chains (container_of) resolve.
+                    if let Some(addr) = eval_flat_addr(term, &flat_int_vars) {
+                        flat_int_vars.insert(target.name().to_string(), addr);
+                    }
+                    rewritten.push(effect);
+                }
+                TransferEffect::Call {
+                    ref callee,
+                    memory_effect: _,
+                } => {
+                    // Apply callee ptr_writes to the caller's ptr_at map.
+                    // This propagates pointer stores done by the callee (e.g. a constructor
+                    // storing the vptr) through the call boundary so that subsequent
+                    // PointerLoads in this function can resolve them.
+                    if let Some(summary) = summaries.get(callee) {
+                        if !summary.ptr_writes.is_empty() {
+                            if let Some(&instr) = node_to_instruction.get(&node_id) {
+                                let actual_args = instr.get_call_args();
+                                for pw in &summary.ptr_writes {
+                                    if let Some(actual) = actual_args.get(pw.param_index) {
+                                        let arg_name = local_name(function_name, *actual);
+                                        if let Some(arg_binding) = env.get(&arg_name).cloned() {
+                                            if let Some(base) =
+                                                arg_binding.offset.try_as_constant_int()
+                                            {
+                                                let caller_offset = base + pw.param_offset;
+                                                ptr_at.insert(
+                                                    (arg_binding.region.clone(), caller_offset),
+                                                    (
+                                                        pw.target_region.clone(),
+                                                        pw.target_offset.clone(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    rewritten.push(effect);
+                }
                 other => rewritten.push(other),
             }
         }
@@ -1565,7 +2219,7 @@ fn resolve_memory_effects(
         }
     }
 
-    env
+    (env, ptr_at)
 }
 
 fn scalar_memory_slot_var(region: &str, offset: &Term, sort: Sort) -> Option<Var> {
@@ -1601,10 +2255,17 @@ fn apply_pending_return_summaries(
     cfg: &mut AbstractCfg,
     graph: &FunctionGraph,
     instruction_nodes: &HashMap<Instruction, CfgNodeId>,
+    node_to_instruction: &HashMap<CfgNodeId, Instruction>,
     function_name: &str,
     summaries: &CallSummaryRegistry,
     final_env: &PointerEnv,
 ) -> Result<(), AdapterError> {
+    // Collect (node_id, callee, instruction) for all call sites that have a known summary.
+    // This includes both direct calls (from the LLVM instruction) and indirect calls that
+    // were resolved to a concrete callee by resolve_memory_effects via vtable lookup.
+    let mut pending: Vec<(CfgNodeId, String, Instruction)> = Vec::new();
+
+    // Direct calls: derive callee from the LLVM instruction.
     for instruction in &graph.vertices {
         if instruction.get_opcode() != InstructionOpcode::Call {
             continue;
@@ -1612,10 +2273,54 @@ fn apply_pending_return_summaries(
         let Some(callee) = instruction.get_called_function() else {
             continue;
         };
-        let Some(summary) = summaries.get(&callee) else {
+        if summaries.get(&callee).is_none() {
+            continue;
+        }
+        let Some(&node_id) = instruction_nodes.get(instruction) else {
             continue;
         };
-        let Some(&node_id) = instruction_nodes.get(instruction) else {
+        pending.push((node_id, callee, *instruction));
+    }
+
+    // Resolved indirect calls: derive callee from the CFG node's Call effect (set during
+    // resolve_memory_effects when a vtable indirect call was resolved).
+    let node_ids: Vec<CfgNodeId> = cfg.node_ids().collect();
+    for node_id in node_ids {
+        // Only process nodes whose corresponding LLVM instruction was an indirect call
+        // (i.e., get_called_function() == None).  Direct calls are already handled above.
+        let Some(&instr) = node_to_instruction.get(&node_id) else {
+            continue;
+        };
+        if instr.get_opcode() != InstructionOpcode::Call {
+            continue;
+        }
+        if instr.get_called_function().is_some() {
+            continue; // Already handled as a direct call above.
+        }
+        // Find the resolved callee from the node's Call effects.
+        let Ok(node) = cfg.node(node_id) else {
+            continue;
+        };
+        let Some(callee) = node.transfer.effects.iter().find_map(|e| {
+            if let TransferEffect::Call { callee, .. } = e {
+                Some(callee.clone())
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+        if summaries.get(&callee).is_none() {
+            continue;
+        }
+        // Avoid duplicates (shouldn't happen but be safe).
+        if !pending.iter().any(|(nid, _, _)| *nid == node_id) {
+            pending.push((node_id, callee, instr));
+        }
+    }
+
+    for (node_id, callee, instruction) in pending {
+        let Some(summary) = summaries.get(&callee) else {
             continue;
         };
 
@@ -1630,7 +2335,7 @@ fn apply_pending_return_summaries(
         }
         mapping.insert(
             summary.retval_name.clone(),
-            local_name(function_name, *instruction),
+            local_name(function_name, instruction),
         );
 
         let renamed = rename_callee_vars(&summary.relation, &mapping, &callee, &local_prefix);
@@ -2062,6 +2767,20 @@ fn substitute_ext_regions_term(term: &Term, region_map: &BTreeMap<String, (Strin
                         Term::add(base.clone(), rewritten_index),
                     );
                 }
+                // Prefix-match for field sub-regions created by StructFieldGep,
+                // e.g. "call_prefix$__ext_0$f1" when "call_prefix$__ext_0" is in region_map.
+                // Field sub-regions have their own 0-based indexing, so the parent base
+                // offset is not added — only the actual region name gains the suffix.
+                for (ext_key, (actual_region, _base)) in region_map {
+                    if let Some(suffix) = name.strip_prefix(ext_key.as_str()) {
+                        if suffix.starts_with('$') {
+                            return Term::select(
+                                Memory::var(format!("{actual_region}{suffix}")),
+                                rewritten_index,
+                            );
+                        }
+                    }
+                }
             }
             Term::select(
                 substitute_ext_regions_memory(memory, region_map),
@@ -2101,6 +2820,14 @@ fn substitute_ext_regions_memory(
             if let Some((actual_region, _)) = region_map.get(name) {
                 Memory::var(actual_region.clone())
             } else {
+                // Prefix-match for field sub-regions (same logic as in substitute_ext_regions_term).
+                for (ext_key, (actual_region, _)) in region_map {
+                    if let Some(suffix) = name.strip_prefix(ext_key.as_str()) {
+                        if suffix.starts_with('$') {
+                            return Memory::var(format!("{actual_region}{suffix}"));
+                        }
+                    }
+                }
                 Memory::var(name)
             }
         }
@@ -2343,6 +3070,7 @@ mod tests {
                         ),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 });
                 let adapted = adapt_with_purity_and_summaries(
                     &graphs[0],
@@ -2528,6 +3256,66 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_icmp_injects_nonneg_assumes_on_operands() {
+        with_graphs(
+            r#"
+                define i1 @test(i32 %a, i32 %b) {
+                entry:
+                    %v = icmp ult i32 %a, %b
+                    ret i1 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assumes: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assume(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    assumes.iter().filter(|s| s.contains(">= 0")).count(),
+                    2,
+                    "unsigned icmp should inject Assume >= 0 on both operands; got: {assumes:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn signed_icmp_does_not_inject_nonneg_assumes() {
+        with_graphs(
+            r#"
+                define i1 @test(i32 %a, i32 %b) {
+                entry:
+                    %v = icmp slt i32 %a, %b
+                    ret i1 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let has_assume = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .any(|e| matches!(e, TransferEffect::Assume(_)));
+                assert!(
+                    !has_assume,
+                    "signed icmp should not inject any Assume effects"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn sdiv_emits_no_range_assumes() {
         with_graphs(
             r#"
@@ -2576,6 +3364,7 @@ mod tests {
                         ),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 });
 
                 let adapted = adapt_with_purity_and_summaries(
@@ -2601,6 +3390,176 @@ mod tests {
                     .join("\n");
                 assert!(rendered.contains("main$call0$tmp"));
                 assert!(rendered.contains("main$call1$tmp"));
+            },
+        );
+    }
+
+    #[test]
+    fn shl_by_constant_lowers_to_multiply() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = shl i32 %x, 3
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assigns: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assign {
+                            value: AssignValue::Term(t),
+                            ..
+                        } = e
+                        {
+                            Some(t.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    assigns.iter().any(|s| s.contains("* 8")),
+                    "shl 3 should lower to multiply by 8; got: {assigns:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn lshr_by_constant_lowers_to_divide_with_nonneg_bound() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = lshr i32 %x, 2
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let effects: Vec<_> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .collect();
+                let has_div = effects.iter().any(|e| {
+                    matches!(e, TransferEffect::Assign { value: AssignValue::Term(t), .. }
+                        if t.to_string().contains("/ 4"))
+                });
+                let has_nonneg = effects.iter().any(
+                    |e| matches!(e, TransferEffect::TypeBound(f) if f.to_string().contains(">= 0")),
+                );
+                assert!(has_div, "lshr 2 should lower to divide by 4");
+                assert!(has_nonneg, "lshr result should have non-negative TypeBound");
+            },
+        );
+    }
+
+    #[test]
+    fn ashr_by_constant_lowers_to_divide_no_nonneg_bound() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = ashr i32 %x, 1
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let effects: Vec<_> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .collect();
+                let has_div = effects.iter().any(|e| {
+                    matches!(e, TransferEffect::Assign { value: AssignValue::Term(t), .. }
+                        if t.to_string().contains("/ 2"))
+                });
+                assert!(has_div, "ashr 1 should lower to divide by 2");
+            },
+        );
+    }
+
+    #[test]
+    fn and_with_nonneg_constant_emits_typebound_range() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = and i32 %x, 255
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let bounds: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::TypeBound(f) = e {
+                            Some(f.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    bounds.iter().any(|s| s.contains(">= 0")),
+                    "and with mask should emit lower bound; got: {bounds:?}"
+                );
+                assert!(
+                    bounds.iter().any(|s| s.contains("<= 255")),
+                    "and with mask 255 should emit upper bound; got: {bounds:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn xor_with_minus_one_lowers_to_bitwise_not() {
+        with_graphs(
+            r#"
+                define i32 @test(i32 %x) {
+                entry:
+                    %v = xor i32 %x, -1
+                    ret i32 %v
+                }
+            "#,
+            |graphs| {
+                let adapted = adapt(&graphs[0]).unwrap();
+                let assigns: Vec<String> = adapted
+                    .cfg
+                    .nodes()
+                    .values()
+                    .flat_map(|n| n.transfer.effects.iter())
+                    .filter_map(|e| {
+                        if let TransferEffect::Assign {
+                            value: AssignValue::Term(t),
+                            ..
+                        } = e
+                        {
+                            Some(t.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                // NOT x = (0 - x) - 1
+                assert!(
+                    assigns.iter().any(|s| s.contains("- 1")),
+                    "xor with -1 should lower to bitwise NOT; got: {assigns:?}"
+                );
             },
         );
     }

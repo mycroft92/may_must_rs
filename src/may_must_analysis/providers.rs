@@ -125,6 +125,7 @@ mod tests {
             retval_name: format!("{name}$__retval"),
             relation: Formula::True,
             write_effects: Vec::new(),
+            ptr_writes: Vec::new(),
         }
     }
 

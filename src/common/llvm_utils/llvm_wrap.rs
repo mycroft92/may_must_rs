@@ -1151,6 +1151,152 @@ impl Instruction {
         }
     }
 
+    /// If this value is a ConstantExpr `getelementptr` whose base is a global
+    /// variable and all indices are constant integers, return the global's display
+    /// name and the sum of all indices.
+    ///
+    /// This handles the pattern used for vtable pointers in C++ code:
+    /// ```llvm
+    /// store ptr getelementptr inbounds ([3 x ptr], ptr @_ZTV3Foo, i64 0, i64 2), ptr %vptr_slot
+    /// ```
+    /// where the stored value is a ConstantExpr GEP rather than a named SSA value.
+    /// In that case `as_const_gep_of_global()` returns `Some(("_ZTV3Foo", 2))`,
+    /// allowing `resolve_memory_effects` to bind the result to
+    /// `(global$_ZTV3Foo, 2)` in the `PointerEnv`.
+    pub fn as_const_gep_of_global(&self) -> Option<(String, i64)> {
+        unsafe {
+            // Must be a ConstantExpr with GEP opcode.
+            if LLVMIsAConstantExpr(self.0).is_null() {
+                return None;
+            }
+            let opcode = LLVMGetConstOpcode(self.0);
+            if opcode != llvm_sys::LLVMOpcode::LLVMGetElementPtr {
+                return None;
+            }
+            // Operand 0 is the base pointer; it must be a global variable.
+            let base = LLVMGetOperand(self.0, 0);
+            if base.is_null() || LLVMIsAGlobalVariable(base).is_null() {
+                return None;
+            }
+            let mut name_len = 0;
+            let name_ptr = LLVMGetValueName2(base, &mut name_len);
+            if name_ptr.is_null() || name_len == 0 {
+                return None;
+            }
+            let global_name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+            // Sum all index operands (operands 1..N-1 where the last operand is the
+            // callee for calls, but for ConstantExpr GEPs all non-base operands are
+            // indices).
+            let num_ops = LLVMGetNumOperands(self.0) as usize;
+            let mut total_offset: i64 = 0;
+            for i in 1..num_ops {
+                let idx = LLVMGetOperand(self.0, i as libc::c_uint);
+                if idx.is_null() || LLVMIsAConstantInt(idx).is_null() {
+                    return None; // Non-constant index — cannot evaluate statically.
+                }
+                total_offset += LLVMConstIntGetSExtValue(idx);
+            }
+            Some((global_name, total_offset))
+        }
+    }
+
+    /// Attempt to read the function-pointer elements of a global constant array.
+    ///
+    /// Vtables in C++ LLVM IR are emitted as global constant arrays of `ptr`:
+    /// ```llvm
+    /// @_ZTV3Foo = constant [3 x ptr] [ptr null, ptr @_ZTI3Foo, ptr @_ZN3Foo3barEv]
+    /// ```
+    ///
+    /// This method reads such an array and returns a `Vec` with one entry per
+    /// element.  An entry is `Some(name)` if the element is a direct function
+    /// reference (possibly through a `bitcast` constant expression), or `None`
+    /// for null pointers, RTTI pointers, and other non-function entries.
+    ///
+    /// Returns `None` if `self` is not a global variable or if its initializer
+    /// is not a constant array.  Also tried on `self.get_operand(0)` as a
+    /// fallback to handle `bitcast`/`getelementptr` wrappers.
+    pub fn constant_fn_ptr_elements(&self) -> Option<Vec<Option<String>>> {
+        self.constant_fn_ptr_elements_inner()
+            .or_else(|| self.get_operand(0)?.constant_fn_ptr_elements_inner())
+    }
+
+    fn constant_fn_ptr_elements_inner(&self) -> Option<Vec<Option<String>>> {
+        unsafe {
+            let arr = if !LLVMIsAGlobalVariable(self.0).is_null() {
+                let init = LLVMGetInitializer(self.0);
+                if init.is_null() {
+                    return None;
+                }
+                // Clang often wraps the vtable array in a struct: `{ [N x ptr] } { [...] }`.
+                // If the initializer is a ConstantArray, use it directly; otherwise try the
+                // first struct field (index 0), which is the array in the common single-field
+                // struct vtable layout.
+                if !LLVMIsAConstantArray(init).is_null() {
+                    init
+                } else {
+                    let field0 = LLVMGetAggregateElement(init, 0);
+                    if field0.is_null() || LLVMIsAConstantArray(field0).is_null() {
+                        return None;
+                    }
+                    field0
+                }
+            } else if !LLVMIsAConstantArray(self.0).is_null() {
+                self.0
+            } else {
+                return None;
+            };
+
+            let mut out = Vec::new();
+            let mut index = 0u32;
+            loop {
+                let elem = LLVMGetAggregateElement(arr, index);
+                if elem.is_null() {
+                    break;
+                }
+                // Direct function reference.
+                if !LLVMIsAFunction(elem).is_null() {
+                    let mut len = 0;
+                    let name = LLVMGetValueName2(elem, &mut len);
+                    out.push(if !name.is_null() && len > 0 {
+                        Some(CStr::from_ptr(name).to_string_lossy().into_owned())
+                    } else {
+                        None
+                    });
+                } else if !LLVMIsAConstantPointerNull(elem).is_null() {
+                    // Explicit null — common for the first vtable slot.
+                    out.push(None);
+                } else if !LLVMIsAConstantExpr(elem).is_null() {
+                    // ConstantExpr (e.g. bitcast of function to ptr) — try operand 0.
+                    // Only call LLVMGetOperand when elem is a ConstantExpr; calling it on
+                    // plain constants (ConstantInt, GlobalVariable, etc.) is unsafe.
+                    let inner = LLVMGetOperand(elem, 0);
+                    if !inner.is_null() && !LLVMIsAFunction(inner).is_null() {
+                        let mut len = 0;
+                        let name = LLVMGetValueName2(inner, &mut len);
+                        out.push(if !name.is_null() && len > 0 {
+                            Some(CStr::from_ptr(name).to_string_lossy().into_owned())
+                        } else {
+                            None
+                        });
+                    } else {
+                        // Bitcast of a non-function (e.g. RTTI pointer, offset-to-top).
+                        out.push(None);
+                    }
+                } else {
+                    // Other constant (integer, global variable reference, etc.) — not a
+                    // function pointer.
+                    out.push(None);
+                }
+                index += 1;
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+    }
+
     /// Return the comparison operator of an `icmp` instruction as a symbolic
     /// string (`"=="`, `"!="`, `"<"`, `"<="`, `">"`, `">="`), or `None` if
     /// this is not an `icmp`.
@@ -1172,6 +1318,24 @@ impl Instruction {
                 LLVMIntPredicate::LLVMIntULT | LLVMIntPredicate::LLVMIntSLT => Some("<"),
                 LLVMIntPredicate::LLVMIntULE | LLVMIntPredicate::LLVMIntSLE => Some("<="),
             }
+        }
+    }
+
+    /// Returns `true` if this is an `icmp` with an unsigned predicate
+    /// (`ult`, `ule`, `ugt`, `uge`).  `eq` and `ne` are sign-agnostic and
+    /// return `false`.
+    pub fn is_unsigned_icmp(&self) -> bool {
+        if self.get_opcode() != InstructionOpcode::ICmp {
+            return false;
+        }
+        unsafe {
+            matches!(
+                LLVMGetICmpPredicate(self.0),
+                LLVMIntPredicate::LLVMIntUGT
+                    | LLVMIntPredicate::LLVMIntUGE
+                    | LLVMIntPredicate::LLVMIntULT
+                    | LLVMIntPredicate::LLVMIntULE
+            )
         }
     }
 

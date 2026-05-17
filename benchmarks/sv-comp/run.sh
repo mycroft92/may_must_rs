@@ -16,6 +16,7 @@
 #   --checker-flags F  Extra flags passed to the checker (default: --no-dot).
 #   --csv FILE         Write results to this CSV file (default: results.csv).
 #   --mem-limit MB     Virtual memory cap per checker run in MiB (default: 0 = unlimited).
+#   --timeout S        Kill the checker after S seconds (default: 300; 0 = unlimited).
 #
 # Output
 # ------
@@ -37,6 +38,7 @@ CHECKER_FLAGS="--no-dot"
 CSV_FILE="$SCRIPT_DIR/results.csv"
 BENCHMARKS_DIR=""
 MEM_LIMIT_MB=0
+TIMEOUT_S=300
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
         --checker-flags) CHECKER_FLAGS="$2"; shift 2 ;;
         --csv)           CSV_FILE="$2"; shift 2 ;;
         --mem-limit)     MEM_LIMIT_MB="$2"; shift 2 ;;
+        --timeout)       TIMEOUT_S="$2";    shift 2 ;;
         -h|--help)
             sed -n '2,/^set -eu/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -134,17 +137,28 @@ check_one() {
         return
     fi
 
-    # Run checker; capture verdict.
+    # Run checker; capture verdict.  Exit code 124 means timeout(1) killed it.
     start_ms=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
+    checker_exit=0
     checker_out=$(
         if [ "$MEM_LIMIT_MB" -gt 0 ]; then
             ulimit -v $((MEM_LIMIT_MB * 1024)) 2>/dev/null || true
         fi
-        "$CHECKER" $CHECKER_FLAGS "$bc" 2>/dev/null || true
-    )
+        if [ "$TIMEOUT_S" -gt 0 ]; then
+            timeout "$TIMEOUT_S" "$CHECKER" $CHECKER_FLAGS "$bc" 2>/dev/null
+        else
+            "$CHECKER" $CHECKER_FLAGS "$bc" 2>/dev/null
+        fi
+    ) || checker_exit=$?
     end_ms=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
     elapsed_ms=$(( end_ms - start_ms ))
     time_s=$(python3 -c "print(f'{$elapsed_ms/1000:.2f}')" 2>/dev/null || echo "0.00")
+
+    if [ "$checker_exit" -eq 124 ]; then
+        printf '%-12s  %s\n' "TIMEOUT" "$(basename "$src")"
+        printf '%s,%s,%s,%s,%s\n' "$stem" "$src_dir" "$expected" "TIMEOUT" "$time_s" >> "$CSV_FILE"
+        return
+    fi
 
     verdict=$(printf '%s' "$checker_out" \
               | grep -i 'module verdict:' \

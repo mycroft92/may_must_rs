@@ -229,6 +229,19 @@ pub enum TransferEffect {
     Obligation(Formula),
     /// A no-op placeholder. WP: identity on `post`.
     Nop,
+    /// LLVM `ptrtoint` instruction: materialize the flat integer address of a
+    /// pointer.  Resolved in Phase 2 to `Assign { target, Term::Int(base+off) }`
+    /// using the [`FlatLayout`]; left as Nop if the source pointer is unresolved.
+    /// WP treats any unresolved residual as a no-op (target remains free).
+    PtrToInt { target: Var, source_ptr: String },
+    /// LLVM `inttoptr` instruction: recover a pointer binding from a flat
+    /// integer address.  Resolved in Phase 2 by looking up the address in the
+    /// [`FlatLayout`] and binding the result pointer in the [`PointerEnv`].
+    /// WP treats any unresolved residual as a no-op.
+    IntToPtr {
+        target_ptr: String,
+        source_name: String,
+    },
     /// An opaque call whose memory effect is captured by [`CallMemoryEffect`].
     /// `PreservesMemory` → WP is transparent; `HavocMemory` → caller
     /// should havoce memory before applying WP (currently handled at the
@@ -244,6 +257,24 @@ pub enum TransferEffect {
     /// top-level conjunction in `post` that mentions one of the listed regions,
     /// preserving constraints on non-aliasing regions.
     HavocRegions { regions: Vec<String> },
+    /// A heap allocation call (malloc, calloc, etc.) whose result pointer is
+    /// bound to a fresh abstract region named `region`.  Each call site gets a
+    /// distinct region (`heap$malloc@N`) so different allocation sites in the
+    /// same function remain distinguishable.  WP treats this as a no-op
+    /// (the region's contents are unconstrained by default).
+    HeapAlloc { result_ptr: String, region: String },
+    /// An indirect call through a function pointer (e.g. virtual dispatch).
+    ///
+    /// `callee_ptr` is the SSA name of the pointer-typed value being called.
+    /// During Phase 2 (`resolve_memory_effects`), if the function pointer can be
+    /// resolved to a concrete callee name via a vtable lookup, this effect is
+    /// rewritten to `Call { callee, memory_effect }`.  If unresolved it is left
+    /// as-is and treated conservatively: WP is transparent for `PreservesMemory`
+    /// and havoces memory for `HavocMemory`, same as `Call`.
+    IndirectCall {
+        callee_ptr: String,
+        memory_effect: CallMemoryEffect,
+    },
 }
 
 /// An ordered sequence of [`TransferEffect`]s that models the semantics of a
@@ -319,8 +350,8 @@ impl TransferFn {
             .fold(pre.clone(), |acc, effect| sp_one(effect, &acc))
     }
 
-    /// Build a [`PointerEnv`] by replaying only the `Alloca` and
-    /// `GetElementPtr` effects in this transfer function.
+    /// Build a [`PointerEnv`] by replaying only the `Alloca`, `HeapAlloc`,
+    /// and `GetElementPtr` effects in this transfer function.
     ///
     /// The resulting environment maps SSA pointer names to `(region, offset)`
     /// pairs and is used by the adapter to resolve load/store targets before
@@ -329,7 +360,11 @@ impl TransferFn {
         let mut env = PointerEnv::default();
         for effect in &self.effects {
             match effect {
-                TransferEffect::Alloca { target, region } => {
+                TransferEffect::Alloca { target, region }
+                | TransferEffect::HeapAlloc {
+                    result_ptr: target,
+                    region,
+                } => {
                     env.bind(target.clone(), region.clone(), Term::int(0));
                 }
                 TransferEffect::GetElementPtr {
@@ -969,14 +1004,18 @@ fn wp_one(effect: &TransferEffect, post: &Formula) -> Formula {
     match effect {
         TransferEffect::Nop
         | TransferEffect::Alloca { .. }
+        | TransferEffect::HeapAlloc { .. }
         | TransferEffect::GetElementPtr { .. }
         | TransferEffect::StructFieldGep { .. }
         | TransferEffect::PointerStore { .. }
         | TransferEffect::PointerLoad { .. }
         | TransferEffect::PointerAlias { .. }
         | TransferEffect::Call { .. }
+        | TransferEffect::IndirectCall { .. }
         | TransferEffect::Load { .. }
-        | TransferEffect::Store { .. } => post.clone(),
+        | TransferEffect::Store { .. }
+        | TransferEffect::PtrToInt { .. }
+        | TransferEffect::IntToPtr { .. } => post.clone(),
         TransferEffect::HavocRegions { regions } => {
             let mut result = post.clone();
             for region in regions {
@@ -1016,6 +1055,7 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
     match effect {
         TransferEffect::Nop
         | TransferEffect::Alloca { .. }
+        | TransferEffect::HeapAlloc { .. }
         | TransferEffect::GetElementPtr { .. }
         | TransferEffect::StructFieldGep { .. }
         | TransferEffect::PointerStore { .. }
@@ -1025,7 +1065,10 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
         | TransferEffect::Store { .. }
         | TransferEffect::MemoryStore { .. }
         | TransferEffect::Call { .. }
-        | TransferEffect::HavocRegions { .. } => pre.clone(),
+        | TransferEffect::IndirectCall { .. }
+        | TransferEffect::HavocRegions { .. }
+        | TransferEffect::PtrToInt { .. }
+        | TransferEffect::IntToPtr { .. } => pre.clone(),
         TransferEffect::Assign { target, value } => match value {
             AssignValue::Term(term) => Formula::and(
                 pre.clone(),

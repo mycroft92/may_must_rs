@@ -35,11 +35,13 @@
 
 #![allow(dead_code)]
 
+use rayon::prelude::*;
+
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, SourceLocation};
 use crate::common::adapter::{
     adapt, adapt_with_purity_and_summaries, collect_callee_names, compute_return_summary,
-    ext_region_name, synthetic_retval_name, AdaptedProcedure, AdapterError, AssertionSite,
-    CallSummaryRegistry, ReturnSummary,
+    ext_region_name, extract_ptr_writes, ptr_write_summary_if_any, synthetic_retval_name,
+    AdaptedProcedure, AdapterError, AssertionSite, CallSummaryRegistry, ReturnSummary,
 };
 use crate::common::alias_analysis::run_alias_analysis;
 use crate::common::formula::{Formula, Memory, Term, Var};
@@ -210,6 +212,14 @@ pub fn analyze_module_with_llm(
     let alias = run_alias_analysis(graphs);
     let mut summaries = CallSummaryRegistry::new();
 
+    // Pre-scan all graphs to build the module-wide vtable map.  This ensures that vtable
+    // entries discovered in one function (e.g. a C++ constructor that stores the vptr) are
+    // available in all other functions during adaptation, even if those functions never
+    // directly reference the vtable global.
+    for graph in graphs {
+        summaries.scan_graph_vtables(graph);
+    }
+
     let in_graph = graphs
         .iter()
         .map(|graph| graph.name.clone())
@@ -338,6 +348,22 @@ pub fn analyze_with_summaries(
     tables: Option<&SummaryTables>,
     config: Option<&InvariantConfig>,
 ) -> Result<ProcedureReport, DriverError> {
+    let max_size = config.map_or(500, |c| c.max_function_size);
+    if max_size > 0 && graph.vertices.len() > max_size {
+        return Ok(ProcedureReport {
+            procedure: graph.name.clone(),
+            assertions: Vec::new(),
+            failures: vec![format!(
+                "function too large ({} instructions > limit {}): skipped",
+                graph.vertices.len(),
+                max_size
+            )],
+            loop_count: 0,
+            instruction_count: graph.vertices.len(),
+            recursive: false,
+        });
+    }
+
     let alias = run_alias_analysis(std::slice::from_ref(graph));
     let adapted = if summaries.is_empty() && memory_pure.is_empty() {
         adapt(graph)?
@@ -352,22 +378,27 @@ pub fn analyze_with_summaries(
         .or_else(|| discover_loop_invariants(&adapted.cfg, &adapted.name, oracle));
     let precomputed = precomputed_owned.as_deref();
 
+    let site_results: Vec<_> = adapted.assertions.par_iter()
+        .map(|site| {
+            let result = if let Some(tables) = tables {
+                analyze_with_tables(
+                    &adapted.cfg,
+                    &adapted.name,
+                    site,
+                    oracle,
+                    tables,
+                    config,
+                    precomputed,
+                )
+            } else {
+                analyze(&adapted.cfg, site, oracle)
+            };
+            (site, result)
+        })
+        .collect();
     let mut assertions = Vec::new();
     let mut failures = Vec::new();
-    for site in &adapted.assertions {
-        let result = if let Some(tables) = tables {
-            analyze_with_tables(
-                &adapted.cfg,
-                &adapted.name,
-                site,
-                oracle,
-                tables,
-                config,
-                precomputed,
-            )
-        } else {
-            analyze(&adapted.cfg, site, oracle)
-        };
+    for (site, result) in site_results {
         match result {
             Ok(result) => assertions.push(result),
             Err(BackwardError::CyclicCfgUnsupported) => failures.push(format!(
@@ -396,8 +427,25 @@ fn infer_return_summary(
     adapted: &AdaptedProcedure,
     oracle: &Oracle,
 ) -> Option<ReturnSummary> {
-    compute_return_summary(graph, adapted)
+    let ptr_writes = extract_ptr_writes(graph, &adapted.name, &adapted.ptr_at);
+
+    let base = compute_return_summary(graph, adapted)
         .or_else(|| infer_cyclic_observer_summary(graph, adapted, oracle))
+        .or_else(|| {
+            // For functions whose return value has no integer formula (e.g. constructors
+            // returning void or an opaque pointer), still produce a summary if there are
+            // pointer write effects to propagate (e.g. vptr stores).
+            if ptr_writes.is_empty() {
+                None
+            } else {
+                ptr_write_summary_if_any(graph, adapted)
+            }
+        });
+
+    base.map(|mut s| {
+        s.ptr_writes = ptr_writes;
+        s
+    })
 }
 
 /// Infer a return summary for a looping function that observes an array argument.
@@ -480,6 +528,7 @@ fn infer_cyclic_observer_summary(
         retval_name,
         relation: Formula::and_all(relations),
         write_effects: Vec::new(),
+        ptr_writes: Vec::new(),
     })
 }
 
@@ -1111,12 +1160,17 @@ mod tests {
     fn compile_fixture(stem: &str) -> PathBuf {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = {
-            let direct = repo_root.join("tests").join(format!("{stem}.c"));
-            if direct.exists() {
-                direct
-            } else {
-                repo_root.join("tests/flow").join(format!("{stem}.c"))
-            }
+            // Try C source first, then C++ (both in tests/ and tests/flow/).
+            let candidates = [
+                repo_root.join("tests").join(format!("{stem}.c")),
+                repo_root.join("tests/flow").join(format!("{stem}.c")),
+                repo_root.join("tests").join(format!("{stem}.cpp")),
+                repo_root.join("tests/flow").join(format!("{stem}.cpp")),
+            ];
+            candidates
+                .into_iter()
+                .find(|p| p.exists())
+                .unwrap_or_else(|| repo_root.join("tests").join(format!("{stem}.c")))
         };
         let status = Command::new("sh")
             .arg("tests/build_ir.sh")
@@ -1296,6 +1350,7 @@ mod tests {
                         Term::add(Term::Var(Var::int("inc$%x")), Term::int(1)),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 });
                 let report = super::analyze_with_summaries(
                     &graphs[0],
@@ -1363,6 +1418,7 @@ mod tests {
                         Term::add(Term::Var(Var::int("inc$%x")), Term::int(1)),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 };
                 let provider = ManualProvider::new().with_function_summary(summary);
                 let reports =
@@ -1493,6 +1549,61 @@ mod tests {
                 .computed_summaries
                 .iter()
                 .any(|summary| summary.function == "max_of_5"));
+        });
+    }
+
+    #[test]
+    fn ptrtoint_distinct_stack_addrs_verified() {
+        // Two distinct stack allocas must get distinct flat addresses.
+        // ptrtoint of each produces a concrete integer; the assertion
+        // addr_a != addr_b is trivially true under the flat layout model.
+        with_bc_graphs("ptrtoint_compare", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "test_distinct_stack_addrs"), 1);
+        });
+    }
+
+    #[test]
+    fn vtable_dispatch_verifies() {
+        // Full end-to-end virtual dispatch: new Counter(), store vptr in constructor,
+        // load vptr in caller, resolve IndirectCall via ptr_at + vtable_fn_ptrs,
+        // apply Counter::get's return summary, discharge may_assert(v == 42).
+        //
+        // The ptr_at map (pointer store-to-load forwarding) propagates the vptr write
+        // from the C2 constructor through C1 to the caller, enabling the IndirectCall
+        // to resolve to _ZNK7Counter3getEv and the assertion to be Verified.
+        with_bc_graphs("vtable_dispatch", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let reports = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let main_report = reports
+                .reports
+                .iter()
+                .find(|r| r.procedure == "_Z20test_vtable_dispatchv")
+                .expect("test_vtable_dispatch function not found in reports");
+            assert_eq!(
+                main_report.verdict(),
+                SafetyVerdict::Safe,
+                "vtable dispatch should be Verified but got {:?}",
+                main_report.verdict()
+            );
+        });
+    }
+
+    #[test]
+    fn heap_distinct_malloc_sites_do_not_alias() {
+        // Two calls to malloc in the same function must produce distinct abstract
+        // regions so that a write through one pointer does not invalidate the
+        // constraint on the other.  Without per-call-site heap regions, both
+        // pointers would share one region and the store to *b would make the
+        // assertion *a == 1 unprovable.
+        with_bc_graphs("heap_distinct", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "heap_distinct"), 1);
         });
     }
 }
