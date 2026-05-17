@@ -35,9 +35,10 @@
 #![allow(dead_code)]
 
 use crate::common::abstract_cfg::{
-    AbstractCfg, AssignValue, CfgEdgeId, CfgNodeId, SourceLocation, TransferEffect,
+    AbstractCfg, AssignValue, CallMemoryEffect, CfgEdgeId, CfgNodeId, SourceLocation,
+    TransferEffect,
 };
-use crate::common::formula::{Formula, Sort, Term, Var};
+use crate::common::formula::{Formula, Memory, Sort, Term, Var};
 use crate::common::oracle::{Oracle, Validity};
 use crate::may_must_analysis::chc;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -439,23 +440,24 @@ pub fn check_loop_invariant_verbose(
     inner: InnerInvariants<'_>,
 ) -> InvariantCheckResult {
     let candidate = normalize_candidate(cfg, info.header, candidate);
-    let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
-    let Some(initiation_states) = backward_states(
-        cfg,
-        &[(info.header, Formula::not(candidate.clone()))],
-        &excluded,
-        None,
-        false,
-        &[],
-        false,
-    ) else {
-        return InvariantCheckResult::InitiationFailed;
-    };
-    let entry_violation = initiation_states
-        .get(&cfg.entry())
-        .cloned()
-        .unwrap_or(Formula::False);
-    match oracle.feasibility(&entry_violation) {
+
+    // Initiation: the candidate must hold the first time the loop header is
+    // entered.  We compute a forward over-approximation of the reach at the
+    // loop header (SP from the function entry through the acyclic skeleton with
+    // all back edges excluded, augmented with concrete store facts from the
+    // preheader).  The store facts are added as `select(region, k) = value`
+    // equations so the solver can determine initiation without needing to track
+    // functional memory expressions across the SMT boundary.
+    //
+    // This replaces the previous approach of propagating `NOT candidate`
+    // backward from the header with all back edges excluded globally.  That
+    // backward approach under-approximated reachability for later loops in
+    // multi-loop functions (earlier loops were forced to their 0-iteration exit
+    // path), which allowed absurd candidates like `!(i < length)` to pass
+    // initiation for loop 3 when loop 1 and 2 had already exited.
+    let reach_h = forward_reach_at_header(cfg, info.header, inner);
+    let initiation_violation = Formula::and(reach_h, Formula::not(candidate.clone()));
+    match oracle.feasibility(&initiation_violation) {
         Ok(crate::common::oracle::Feasibility::Feasible) => {
             return InvariantCheckResult::InitiationFailed;
         }
@@ -464,6 +466,10 @@ pub fn check_loop_invariant_verbose(
         }
         Ok(crate::common::oracle::Feasibility::Infeasible) => {}
     }
+
+    // Inductiveness and exit-closure checks restrict propagation to the loop
+    // body and exclude all back edges to prevent cycles within the body.
+    let excluded: BTreeSet<CfgEdgeId> = cfg.detect_back_edges().into_iter().collect();
 
     let Some(back_edge_requirement) = edge_source_requirement(cfg, info.back_edge, &candidate)
     else {
@@ -815,6 +821,252 @@ fn collect_int_constants_term(term: &Term, out: &mut Vec<i64>) {
     }
 }
 
+/// Compute a forward over-approximation of states at `header` on first entry.
+///
+/// Propagates SP (strongest postcondition) from the function entry through the
+/// acyclic CFG skeleton (all back edges excluded).  At inner/sibling loop
+/// headers that already have accepted invariants (from `inner`), the invariant
+/// is OR-seeded into the initial reach so that the code following those loops
+/// is not widened to `True`.
+///
+/// The result `R` satisfies: every state actually reachable at `header` on
+/// first entry (i.e. via a path that does not use `info.back_edge`) is a model
+/// of `R`.  This makes it suitable for the initiation check
+/// `R ∧ ¬candidate` infeasible ⟹ candidate holds at first entry.
+///
+/// # Approximation note
+///
+/// Sibling loops whose back edges are excluded contribute only their
+/// 0-iteration path to the reach, which is an under-approximation for variables
+/// the sibling loop modifies.  Seeding sibling headers with their invariants
+/// partially compensates: it adds the invariant as an additional OR-branch at
+/// the header, so subsequent code can propagate from a state where the invariant
+/// holds.  Variables that are unconditionally overwritten by the preheader code
+/// between the sibling loop and the current loop are unaffected by this
+/// approximation in practice.
+/// Concrete store facts accumulated during the forward SP pass.
+/// Maps `(region_name, constant_offset)` to the value last stored there.
+type StoreFacts = BTreeMap<(String, i64), Term>;
+
+/// Intersect two `StoreFacts` maps, keeping only entries that agree on value.
+fn intersect_store_facts(a: StoreFacts, b: StoreFacts) -> StoreFacts {
+    a.into_iter()
+        .filter(|(k, v)| b.get(k) == Some(v))
+        .collect()
+}
+
+/// Resolve any `Select(Var(region), Int(k))` sub-terms using concrete store facts.
+/// Other term shapes are returned unchanged.
+fn resolve_select_in_term(term: &Term, facts: &StoreFacts) -> Term {
+    match term {
+        Term::Select(memory, index) => {
+            if let Memory::Var(region) = memory.as_ref() {
+                if let Some(k) = index.try_as_constant_int() {
+                    if let Some(v) = facts.get(&(region.clone(), k)) {
+                        return v.clone();
+                    }
+                }
+            }
+            term.clone()
+        }
+        Term::Add(l, r) => Term::add(
+            resolve_select_in_term(l, facts),
+            resolve_select_in_term(r, facts),
+        ),
+        Term::Sub(l, r) => Term::sub(
+            resolve_select_in_term(l, facts),
+            resolve_select_in_term(r, facts),
+        ),
+        Term::Mul(l, r) => Term::mul(
+            resolve_select_in_term(l, facts),
+            resolve_select_in_term(r, facts),
+        ),
+        Term::Div(l, r) => Term::div(
+            resolve_select_in_term(l, facts),
+            resolve_select_in_term(r, facts),
+        ),
+        Term::Rem(l, r) => Term::rem(
+            resolve_select_in_term(l, facts),
+            resolve_select_in_term(r, facts),
+        ),
+        Term::Neg(inner) => Term::neg(resolve_select_in_term(inner, facts)),
+        Term::BoolToInt(_) | Term::Var(_) | Term::Int(_) | Term::Real(_) => term.clone(),
+    }
+}
+
+/// SP forward pass over a slice of effects, updating both the formula and the
+/// store-facts map.  `MemoryStore` effects with a constant offset are recorded
+/// in `facts` (rather than dropped as the default `sp_one` does), and
+/// subsequent `Assign { Select(...) }` effects resolve the load against the
+/// recorded facts, so the caller sees e.g. `cur = 0` rather than
+/// `cur = select(stack0, 0)` when the preheader contains `store 0, ptr %i`.
+fn apply_effects_sp(
+    effects: &[TransferEffect],
+    pre: &Formula,
+    facts: &mut StoreFacts,
+) -> Formula {
+    let mut formula = pre.clone();
+    for effect in effects {
+        match effect {
+            TransferEffect::MemoryStore { region, offset, value } => {
+                match offset.try_as_constant_int() {
+                    Some(k) => {
+                        let resolved = resolve_select_in_term(value, facts);
+                        facts.insert((region.clone(), k), resolved);
+                    }
+                    None => {
+                        facts.retain(|(r, _), _| r != region);
+                    }
+                }
+                // MemoryStore itself does not add to the formula; loads will resolve via facts.
+            }
+            TransferEffect::HavocRegions { regions } => {
+                for r in regions {
+                    facts.retain(|(rk, _), _| rk != r);
+                }
+            }
+            TransferEffect::Call { memory_effect, .. }
+            | TransferEffect::IndirectCall { memory_effect, .. } => {
+                if matches!(memory_effect, CallMemoryEffect::HavocMemory) {
+                    facts.clear();
+                }
+                // Call itself is transparent in SP (no formula change beyond memory havocing).
+            }
+            TransferEffect::Assign {
+                target,
+                value: AssignValue::Term(term),
+            } => {
+                let resolved = resolve_select_in_term(term, facts);
+                formula = Formula::and(
+                    formula,
+                    Formula::eq(Term::Var(target.clone()), resolved),
+                );
+            }
+            TransferEffect::Assign {
+                target,
+                value: AssignValue::Predicate(pred),
+            } => {
+                formula = Formula::and(
+                    formula,
+                    Formula::and(
+                        Formula::implies(Formula::Var(target.clone()), pred.clone()),
+                        Formula::implies(pred.clone(), Formula::Var(target.clone())),
+                    ),
+                );
+            }
+            TransferEffect::Assume(c)
+            | TransferEffect::TypeBound(c)
+            | TransferEffect::Obligation(c) => {
+                formula = Formula::and(formula, c.clone());
+            }
+            // All other effects (Nop, Alloca, GEP, PointerLoad/Store/Alias, etc.)
+            // are transparent in the forward SP.
+            _ => {}
+        }
+    }
+    formula
+}
+
+fn forward_reach_at_header(
+    cfg: &AbstractCfg,
+    header: CfgNodeId,
+    inner: InnerInvariants<'_>,
+) -> Formula {
+    let all_back_edges: BTreeSet<CfgEdgeId> = cfg.detect_back_edges().into_iter().collect();
+    let Some(order) = cfg.topological_order_excluding(&all_back_edges) else {
+        // CFG has an unexpected cycle; return True (vacuously accepting) so
+        // the caller falls back to InductivenessFailed rather than accepting
+        // an uninspected candidate.
+        return Formula::True;
+    };
+
+    let inner_map: BTreeMap<CfgNodeId, &Formula> = inner.iter().map(|(h, inv)| (*h, inv)).collect();
+
+    // reach[node] = SP formula at node's input (before the node's own effects).
+    let mut reach: BTreeMap<CfgNodeId, Formula> =
+        cfg.node_ids().map(|id| (id, Formula::False)).collect();
+    reach.insert(cfg.entry(), Formula::True);
+
+    // node_in_facts[node] = concrete store facts at node's INPUT (before its effects),
+    // computed as the intersection of facts along all incoming non-back-edge paths.
+    let mut node_in_facts: BTreeMap<CfgNodeId, StoreFacts> = BTreeMap::new();
+    node_in_facts.insert(cfg.entry(), StoreFacts::new());
+
+    // Seed inner/sibling loop headers: OR their invariant into the initial
+    // state so that downstream code can reason from a state where the
+    // invariant holds, not only from the 0-iteration path.
+    for (&h, &inv) in &inner_map {
+        let e = reach.entry(h).or_insert(Formula::False);
+        *e = Formula::or(e.clone(), inv.clone());
+    }
+
+    for &node in &order {
+        // Accumulated intersection of store facts from all active incoming paths.
+        let mut incoming_facts: Option<StoreFacts> = None;
+
+        for edge_id in cfg.incoming_edges(node) {
+            if all_back_edges.contains(&edge_id) {
+                continue;
+            }
+            let Ok(edge) = cfg.edge(edge_id) else {
+                continue;
+            };
+            let source_reach = reach.get(&edge.source).cloned().unwrap_or(Formula::False);
+            if source_reach == Formula::False {
+                continue;
+            }
+            let Ok(source_node) = cfg.node(edge.source) else {
+                continue;
+            };
+
+            // Start from the store facts at the source node's INPUT.
+            let source_in = node_in_facts.get(&edge.source).cloned().unwrap_or_default();
+
+            // Apply source-node effects: updates both formula and path_facts.
+            let mut path_facts = source_in;
+            let source_out =
+                apply_effects_sp(&source_node.transfer.effects, &source_reach, &mut path_facts);
+
+            // Apply edge guard, then edge effects (phi assignments etc.).
+            let guarded = Formula::and(source_out, edge.guard.clone());
+            let through_edge = apply_effects_sp(&edge.effects, &guarded, &mut path_facts);
+
+            // OR the formula contribution into this node's reach.
+            let existing = reach.get(&node).cloned().unwrap_or(Formula::False);
+            reach.insert(node, Formula::or(existing, through_edge));
+
+            // Intersect the path facts into the incoming_facts accumulator:
+            // at a join point we can only assert facts that hold on ALL incoming paths.
+            incoming_facts = Some(match incoming_facts {
+                None => path_facts,
+                Some(prev) => intersect_store_facts(prev, path_facts),
+            });
+        }
+
+        // Record the merged incoming facts for this node so successors can use them.
+        if let Some(facts) = incoming_facts {
+            node_in_facts.insert(node, facts);
+        }
+    }
+
+    // Return the reach at the HEADER OUTPUT (after the header's own effects).
+    // The initiation check in check_loop_invariant_verbose uses the unnormalized
+    // Candidates are normalized into header-input variable space by
+    // normalize_formula_with_defs (which substitutes header loads with
+    // select(region, k) terms).  So we return the header-INPUT formula augmented
+    // with store facts expressed as select(region, k) = value equations.  This
+    // puts the reach and the candidate in the same variable space so the solver
+    // can check initiation correctly.
+    let header_in = reach.get(&header).cloned().unwrap_or(Formula::True);
+    let header_in_facts = node_in_facts.get(&header).cloned().unwrap_or_default();
+    header_in_facts
+        .iter()
+        .fold(header_in, |f, ((region, offset), value)| {
+            let select_term = Term::select(Memory::var(region.clone()), Term::int(*offset));
+            Formula::and(f, Formula::eq(select_term, value.clone()))
+        })
+}
+
 /// Propagate a set of seed formulas backward through the CFG and return the
 /// resulting per-node state map.
 ///
@@ -947,6 +1199,56 @@ fn summarize_inner_loops(
 /// Collect all integer literal constants from the loop body.
 ///
 /// Scans all assignment targets and memory stores for integer literals, which
+/// Collect the memory regions and scalar variable names written by the loop body.
+///
+/// Returns two sets:
+/// - `regions`: every `MemoryStore { region }` target inside the loop body.
+/// - `vars`: every `Assign { target }` scalar variable name written inside the loop body.
+///
+/// Both node-level effects and edge-level phi-assignment effects between body nodes are
+/// included.  Used by the loop-relevance pre-filter in `precomputed_satisfy_exit_closure`
+/// to decide whether a loop can possibly affect a given exit postcondition.
+pub fn loop_write_regions_and_vars(
+    info: &LoopInfo,
+    cfg: &AbstractCfg,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut regions = BTreeSet::new();
+    let mut vars = BTreeSet::new();
+
+    let collect = |effects: &[TransferEffect],
+                   regions: &mut BTreeSet<String>,
+                   vars: &mut BTreeSet<String>| {
+        for effect in effects {
+            match effect {
+                TransferEffect::MemoryStore { region, .. } => {
+                    regions.insert(region.clone());
+                }
+                TransferEffect::Assign { target, .. } => {
+                    vars.insert(target.name().to_string());
+                }
+                _ => {}
+            }
+        }
+    };
+
+    for node_id in &info.body {
+        let Ok(node) = cfg.node(*node_id) else {
+            continue;
+        };
+        collect(&node.transfer.effects, &mut regions, &mut vars);
+        // Also collect phi-node assignments on edges between body nodes.
+        for edge_id in cfg.outgoing_edges(*node_id) {
+            let Ok(edge) = cfg.edge(edge_id) else {
+                continue;
+            };
+            if info.body.contains(&edge.target) {
+                collect(&edge.effects, &mut regions, &mut vars);
+            }
+        }
+    }
+    (regions, vars)
+}
+
 /// are used by [`houdini_candidates`] to construct bound templates.
 pub fn collect_loop_body_int_constants(info: &LoopInfo, cfg: &AbstractCfg) -> BTreeSet<i64> {
     let mut constants = BTreeSet::new();
