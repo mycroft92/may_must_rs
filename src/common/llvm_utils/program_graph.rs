@@ -138,6 +138,11 @@ pub struct FunctionGraph {
     /// Used by the adapter to construct a [`TargetData`] for accurate GEP
     /// offset calculation without needing to hold the LLVM `Module` reference.
     pub data_layout_str: String,
+    /// Maps alloca `Instruction` → source variable name, derived from
+    /// `#dbg_declare` records in the LLVM IR.  Used by the adapter to build
+    /// the `debug_names` map on [`AdaptedProcedure`].  Empty when compiled
+    /// without debug info (`-g`).
+    pub debug_names: HashMap<Instruction, String>,
 }
 
 impl<'a> Labeller<'a, Instruction, (Instruction, Instruction)> for FunctionGraph {
@@ -240,6 +245,7 @@ impl FunctionGraph {
             asserts: Vec::new(),
             assumes: Vec::new(),
             data_layout_str,
+            debug_names: function.collect_alloca_debug_names(),
         };
 
         let basic_blocks = function.get_all_basic_blocks();

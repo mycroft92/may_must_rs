@@ -77,6 +77,10 @@ pub struct AdaptedProcedure {
     pub assertions: Vec<AssertionSite>,
     pub instruction_nodes: HashMap<Instruction, CfgNodeId>,
     pub ptr_at: HashMap<(String, i64), (String, Term)>,
+    /// Maps abstract memory region names (e.g. `main$stack0`) to the source
+    /// variable name from LLVM debug info (e.g. `array`).  Empty when compiled
+    /// without `-g`.  Used only for human-readable debug output.
+    pub debug_names: HashMap<String, String>,
 }
 
 /// A single `may_assert(cond)` call site within a function.
@@ -471,12 +475,94 @@ pub fn adapt_with_purity_and_summaries(
         &final_env,
     )?;
 
+    // Build region_name → source_var_name map from LLVM debug info for human-readable output.
+    let mut debug_names: HashMap<String, String> = allocation_regions
+        .iter()
+        .filter_map(|(inst, region)| {
+            graph
+                .debug_names
+                .get(inst)
+                .map(|src| (region.clone(), src.clone()))
+        })
+        .collect();
+
+    // Also map scalar IR variable names → source names.
+    // For each `x = select(region, 0)` assignment in the CFG, if `region` has a known
+    // source name, record `x.name → source_name` so debug output shows e.g. `menor`
+    // instead of `main$%26`.
+    let scalar_names: HashMap<String, String> = cfg
+        .node_ids()
+        .flat_map(|id| {
+            let effects = cfg
+                .node(id)
+                .map(|n| n.transfer.effects.clone())
+                .unwrap_or_default();
+            effects.into_iter().filter_map(|eff| {
+                let TransferEffect::Assign {
+                    target,
+                    value: AssignValue::Term(t),
+                } = eff
+                else {
+                    return None;
+                };
+                let Term::Select(mem, idx) = t else {
+                    return None;
+                };
+                // Only scalar loads (offset == 0); array elements have variable offsets.
+                if *idx != Term::Int(0) {
+                    return None;
+                }
+                let Memory::Var(region) = *mem else {
+                    return None;
+                };
+                debug_names
+                    .get(&region)
+                    .map(|src| (target.name().to_string(), src.clone()))
+            })
+        })
+        .collect();
+    debug_names.extend(scalar_names);
+
+    // Also map values stored to named allocas at offset 0 → source name.
+    // Captures `store %call_result, ptr %named_var` so the call-return variable
+    // (e.g. `main$%12`) gets the same source label as the alloca (e.g. `len`).
+    let store_names: HashMap<String, String> = cfg
+        .node_ids()
+        .flat_map(|id| {
+            let effects = cfg
+                .node(id)
+                .map(|n| n.transfer.effects.clone())
+                .unwrap_or_default();
+            effects.into_iter().filter_map(|eff| {
+                let TransferEffect::MemoryStore {
+                    region,
+                    offset,
+                    value,
+                } = eff
+                else {
+                    return None;
+                };
+                if offset != Term::Int(0) {
+                    return None;
+                }
+                let Term::Var(var) = value else {
+                    return None;
+                };
+                debug_names
+                    .get(&region)
+                    .map(|src| (var.name().to_string(), src.clone()))
+            })
+        })
+        .collect();
+    debug_names.extend(store_names);
+
     Ok(AdaptedProcedure {
         name: graph.name.clone(),
         cfg,
         assertions,
         instruction_nodes,
         ptr_at,
+        debug_names,
     })
 }
 

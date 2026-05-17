@@ -721,6 +721,94 @@ impl fmt::Display for Formula {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Human-readable display with source variable name substitution
+// ---------------------------------------------------------------------------
+//
+// These methods substitute abstract region names (e.g. `main$stack0`) with
+// source variable names from LLVM debug info (e.g. `array`) so that
+// invariants, candidates, and reach/state formulas can be inspected more
+// easily during development.  The `names` map is produced by the adapter from
+// `#dbg_declare` records; it is empty when compiled without `-g`.
+
+impl Memory {
+    pub fn pretty(&self, names: &HashMap<String, String>) -> String {
+        match self {
+            Memory::Var(region) => names.get(region).cloned().unwrap_or_else(|| region.clone()),
+            Memory::Store(mem, idx, val) => {
+                format!(
+                    "(store {} {} {})",
+                    mem.pretty(names),
+                    idx.pretty(names),
+                    val.pretty(names)
+                )
+            }
+        }
+    }
+}
+
+impl Term {
+    pub fn pretty(&self, names: &HashMap<String, String>) -> String {
+        match self {
+            Term::Select(memory, index) => match memory.as_ref() {
+                Memory::Var(region) => {
+                    let src = names.get(region).map(|s| s.as_str()).unwrap_or(region);
+                    format!("{src}[{}]", index.pretty(names))
+                }
+                other => format!("(select {} {})", other.pretty(names), index.pretty(names)),
+            },
+            Term::Var(var) => {
+                // Strip function-name prefix (e.g. `main$%j` → `j`).
+                let n = &var.name;
+                if let Some(pos) = n.rfind("$%") {
+                    n[pos + 2..].to_string()
+                } else if let Some(pos) = n.rfind('$') {
+                    n[pos + 1..].to_string()
+                } else {
+                    n.clone()
+                }
+            }
+            Term::Int(v) => v.to_string(),
+            Term::Real(v) => v.to_string(),
+            Term::BoolToInt(f) => format!("bool_to_int({})", f.pretty(names)),
+            Term::Add(l, r) => format!("({} + {})", l.pretty(names), r.pretty(names)),
+            Term::Sub(l, r) => format!("({} - {})", l.pretty(names), r.pretty(names)),
+            Term::Mul(l, r) => format!("({} * {})", l.pretty(names), r.pretty(names)),
+            Term::Div(l, r) => format!("({} / {})", l.pretty(names), r.pretty(names)),
+            Term::Rem(l, r) => format!("({} % {})", l.pretty(names), r.pretty(names)),
+            Term::Neg(inner) => format!("(-{})", inner.pretty(names)),
+        }
+    }
+}
+
+impl Formula {
+    pub fn pretty(&self, names: &HashMap<String, String>) -> String {
+        match self {
+            Formula::True => "true".to_string(),
+            Formula::False => "false".to_string(),
+            Formula::Var(var) => var.name.clone(),
+            Formula::Not(inner) => format!("(!{})", inner.pretty(names)),
+            Formula::And(items) => {
+                let parts: Vec<_> = items.iter().map(|f| f.pretty(names)).collect();
+                format!("({})", parts.join(" && "))
+            }
+            Formula::Or(items) => {
+                let parts: Vec<_> = items.iter().map(|f| f.pretty(names)).collect();
+                format!("({})", parts.join(" || "))
+            }
+            Formula::Implies(l, r) => format!("({} => {})", l.pretty(names), r.pretty(names)),
+            Formula::Eq(l, r) => format!("({} == {})", l.pretty(names), r.pretty(names)),
+            Formula::MemoryEq(l, r) => {
+                format!("({} == {})", l.pretty(names), r.pretty(names))
+            }
+            Formula::Lt(l, r) => format!("({} < {})", l.pretty(names), r.pretty(names)),
+            Formula::Le(l, r) => format!("({} <= {})", l.pretty(names), r.pretty(names)),
+            Formula::Gt(l, r) => format!("({} > {})", l.pretty(names), r.pretty(names)),
+            Formula::Ge(l, r) => format!("({} >= {})", l.pretty(names), r.pretty(names)),
+        }
+    }
+}
+
 fn validate_memory(memory: &Memory) -> Result<(), FormulaError> {
     match memory {
         Memory::Var(_) => Ok(()),
