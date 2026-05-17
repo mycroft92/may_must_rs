@@ -50,17 +50,12 @@ Totals: ~51 UNKNOWN · 3 UNSOUND · 7 MISSED · 105 files.
 - `c/loops/verisec_OpenSER_cases1_stripFullBoth_arr.i`
 - `c/loop-invariants/linear-inequality-inv-b` — expected UNSAFE, got SAFE
 
-### UNKNOWN (sound but incomplete — safe programs we cannot verify)
-
-- `c/loops/array-1` — needs memory-relational invariant (`menor <= array[0]`)
-  to discharge the assertion; currently UNKNOWN (see Current Backlog)
-
 ### UNKNOWN breakdown by category
 
-locks 13 · loops 34 · loop-crafted 5 · loop-invariants 0.
-(array-1 moved from SAFE to UNKNOWN in v0.7.4 when the unsound precomputed
-invariant fast-path was removed; it was previously SAFE via the
-initialization-vs-exit collapse, not by a genuine proof.)
+locks 13 · loops 33 · loop-crafted 5 · loop-invariants 0.
+(`array-1` fixed in v0.9.0 by entry-safety candidate synthesis with Phase-B
+discharge — the inductive invariant `(j==0) || (array[0]>=menor)` is accepted
+without exit closure and the bidirectional check proves the assertion.)
 
 ## Instruction Coverage (sound but lossy — produce ERROR/UNKNOWN today)
 
@@ -89,33 +84,18 @@ initialization-vs-exit collapse, not by a genuine proof.)
 
 ## Current Backlog
 
-- **Memory-relational invariant templates** — the current Houdini/algorithmic
-  candidate generators only produce scalar arithmetic candidates (counter
-  bounds, predicate guards, variable pairs).  They cannot express relations
-  between memory regions such as `select(R1, i) <= select(R2, j)`.  This means
-  loops whose safety depends on an accumulated relationship between two memory
-  cells (e.g. `menor <= array[0]` in `array-1`) return UNKNOWN even though the
-  assertion is provably correct.
-
-  The fix: extend `houdini_candidates` (and/or a new `relational_candidates`
-  pass) to generate cross-region candidates from pairs of `select(region, k)`
-  terms that appear in the assertion postcondition or loop body.  For each
-  ordered pair `(T1, T2)` of such terms, emit `T1 <= T2`, `T1 >= T2`, and
-  `T1 < T2`.  Feed these through `check_loop_invariant_verbose` like scalar
-  candidates.
-
-  Expected impact:
-  - `c/loops/array-1` (SAFE, currently UNKNOWN): invariant `minor <= array[0]`
-    would pass initiation, inductiveness, and exit closure →`run_backward`
-    discharges the assertion → SAFE.
-  - `c/loops/array-2` (UNSAFE, currently UNKNOWN): the same invariant
-    `minor <= array[0]` correctly fails exit closure (assertion is
-    `array[0] > minor`, which is not blocked by `minor <= array[0]` when they
-    are equal) → synthesis produces no invariant → UNKNOWN / BugFound.
-
-  Performance note: the number of cross-region pairs can be large; restrict to
-  terms extracted from the specific `assertion_postconditions` to keep it
-  tractable.
+- **Memory-relational invariant templates** — `c/loops/array-1` is now SAFE
+  (v0.9.0) via entry-safety candidates: the generator mines `(j==0) || (array[0]>=menor)`
+  from the preheader store facts and the assertion postcondition, accepts it
+  inductively without exit closure, and the bidirectional check discharges the
+  obligation.  Remaining gap: a *cross-region relational* Houdini pass that
+  generates `select(R1,i) <= select(R2,j)` candidates from the assertion
+  postcondition would extend coverage to cases where the preheader facts are
+  not preserved (e.g. both counter and accumulator are nondeterministic).
+  Expected impact: `c/loops/array-2` (UNSAFE, currently UNKNOWN) — the
+  relational candidate `minor <= array[0]` would correctly fail exit closure
+  (the assertion is `array[0] > minor`, which is unsatisfied when they are
+  equal) → synthesis produces no invariant → BugFound.
 
 - **type-based domain bounds in the adapter** — emit `TransferEffect::Assume`
   range constraints directly in `lower_node_transfer` based on LLVM integer

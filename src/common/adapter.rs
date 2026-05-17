@@ -556,6 +556,18 @@ pub fn adapt_with_purity_and_summaries(
         .collect();
     debug_names.extend(store_names);
 
+    // Detect scalar regions: those accessed ONLY at offset 0 (never at variable or non-zero offsets).
+    // For these, add a "region|scalar" → name entry so Term::pretty can display them without subscript.
+    let array_regions = collect_array_regions(&cfg);
+    let scalar_entries: Vec<(String, String)> = debug_names
+        .iter()
+        .filter(|(region, _)| !region.contains('|') && !array_regions.contains(*region))
+        .map(|(region, name)| (format!("{region}|scalar"), name.clone()))
+        .collect();
+    for (key, val) in scalar_entries {
+        debug_names.insert(key, val);
+    }
+
     Ok(AdaptedProcedure {
         name: graph.name.clone(),
         cfg,
@@ -564,6 +576,64 @@ pub fn adapt_with_purity_and_summaries(
         ptr_at,
         debug_names,
     })
+}
+
+/// Collect the set of memory region names that are accessed at non-zero or non-constant offsets.
+///
+/// A region is considered an "array region" if it appears in any `MemoryStore` with a
+/// non-zero offset, or in any `Select` term with a non-constant or non-zero index.
+/// Regions that only appear with offset 0 are treated as scalars.
+fn collect_array_regions(cfg: &AbstractCfg) -> BTreeSet<String> {
+    let mut array_regions = BTreeSet::new();
+    for node_id in cfg.node_ids() {
+        if let Ok(node) = cfg.node(node_id) {
+            scan_effects_for_arrays(&node.transfer.effects, &mut array_regions);
+        }
+    }
+    for edge_id in cfg.edge_ids() {
+        if let Ok(edge) = cfg.edge(edge_id) {
+            scan_effects_for_arrays(&edge.effects, &mut array_regions);
+        }
+    }
+    array_regions
+}
+
+fn scan_effects_for_arrays(effects: &[TransferEffect], out: &mut BTreeSet<String>) {
+    for effect in effects {
+        match effect {
+            TransferEffect::MemoryStore { region, offset, .. } => {
+                if !matches!(offset, Term::Int(0)) {
+                    out.insert(region.clone());
+                }
+            }
+            TransferEffect::Assign {
+                value: AssignValue::Term(term),
+                ..
+            } => {
+                scan_term_for_arrays(term, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_term_for_arrays(term: &Term, out: &mut BTreeSet<String>) {
+    match term {
+        Term::Select(memory, index) => {
+            if let Memory::Var(region) = memory.as_ref() {
+                if !matches!(index.as_ref(), Term::Int(0)) {
+                    out.insert(region.clone());
+                }
+            }
+            scan_term_for_arrays(index, out);
+        }
+        Term::Add(l, r) | Term::Sub(l, r) | Term::Mul(l, r) | Term::Div(l, r) | Term::Rem(l, r) => {
+            scan_term_for_arrays(l, out);
+            scan_term_for_arrays(r, out);
+        }
+        Term::Neg(inner) => scan_term_for_arrays(inner, out),
+        Term::Var(_) | Term::Int(_) | Term::Real(_) | Term::BoolToInt(_) => {}
+    }
 }
 
 /// Infers which functions in `graphs` are memory-pure – i.e. they never write to memory,
