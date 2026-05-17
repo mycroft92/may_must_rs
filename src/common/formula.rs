@@ -369,12 +369,16 @@ impl Term {
             Term::Mul(l, r) => Some(l.try_as_constant_int()? * r.try_as_constant_int()?),
             Term::Div(l, r) => {
                 let d = r.try_as_constant_int()?;
-                if d == 0 { return None; }
+                if d == 0 {
+                    return None;
+                }
                 Some(l.try_as_constant_int()? / d)
             }
             Term::Rem(l, r) => {
                 let d = r.try_as_constant_int()?;
-                if d == 0 { return None; }
+                if d == 0 {
+                    return None;
+                }
                 Some(l.try_as_constant_int()? % d)
             }
             Term::Neg(inner) => Some(-inner.try_as_constant_int()?),

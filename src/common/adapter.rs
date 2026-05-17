@@ -1856,8 +1856,7 @@ fn resolve_memory_effects(
     // adaptation) so vtable entries discovered in one function (e.g. a constructor)
     // are available here even if the current function never directly references the
     // vtable global.  Extended further during the per-instruction operand scan below.
-    let mut vtable_fn_ptrs: HashMap<String, Vec<Option<String>>> =
-        summaries.vtable_map.clone();
+    let mut vtable_fn_ptrs: HashMap<String, Vec<Option<String>>> = summaries.vtable_map.clone();
 
     // Pointer store-to-load forwarding map.
     // ptr_at[(R, k)] = (VR, VO) means: the memory cell at (region R, offset k)
@@ -2027,10 +2026,7 @@ fn resolve_memory_effects(
                                 let locs = alias.points_to(&value_ptr);
                                 if locs.len() == 1 {
                                     let region = locs.iter().next().unwrap().0.clone();
-                                    ptr_at.insert(
-                                        (slot_binding.region, k),
-                                        (region, Term::int(0)),
-                                    );
+                                    ptr_at.insert((slot_binding.region, k), (region, Term::int(0)));
                                 }
                             }
                         }

@@ -27,12 +27,18 @@ fn main() {
         env!("GIT_COMMIT_HASH"),
         ")"
     );
+    println!(
+        "Smash-plus-ultra v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_COMMIT_HASH")
+    );
     let matches = command!()
         .version(version)
         .arg(arg!(<INPUT> "LLVM bitcode file").value_parser(value_parser!(String)))
         .arg(arg!(--"no-dot" "Skip DOT graph emission"))
         .arg(arg!(--"show-summaries" "Print inferred summaries"))
         .arg(arg!(--"debug-invariants" "Enable loop invariant debug logging"))
+        .arg(arg!(--"diff-debug" "Print each rule firing and new predicates added"))
         .arg(arg!(--"llm-invariants" "Ask an LLM backend for loop invariants"))
         .arg(arg!(--"llm-force" "Use LLM invariant search before algorithmic search"))
         .arg(
@@ -69,7 +75,10 @@ fn main() {
         )
         .get_matches();
 
-    init_logging(matches.get_flag("debug-invariants"));
+    init_logging(
+        matches.get_flag("debug-invariants"),
+        matches.get_flag("diff-debug"),
+    );
     initialize_target();
 
     let input = matches.get_one::<String>("INPUT").unwrap();
@@ -89,11 +98,11 @@ fn main() {
     );
 }
 
-fn init_logging(debug_invariants: bool) {
-    let default_filter = if debug_invariants {
-        "info,loop_invariant=debug"
-    } else {
-        "info"
+fn init_logging(debug_invariants: bool, diff_debug: bool) {
+    let default_filter = match (debug_invariants, diff_debug) {
+        (_, true) => "info,loop_invariant=debug,rules=debug",
+        (true, false) => "info,loop_invariant=debug",
+        _ => "info",
     };
     Builder::from_env(Env::default().default_filter_or(default_filter)).init();
 }
