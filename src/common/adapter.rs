@@ -64,12 +64,19 @@ const HEAP_ALLOCATORS: &[&str] = &[
 /// `instruction_nodes` maps each LLVM instruction to the [`CfgNodeId`] it was lowered into.
 /// This mapping is used after the fact by [`compute_return_summary`] and by the driver when
 /// it needs to associate analysis results with source locations.
+///
+/// `ptr_at` is the final pointer store-to-load forwarding map produced by
+/// [`resolve_memory_effects`].  It maps `(region, concrete_offset)` to the `(region, offset)`
+/// of the pointer value that was last stored at that memory cell.  Driver code uses this to
+/// extract [`PointerWriteEffect`]s for ext-region entries and populate the callee's
+/// [`ReturnSummary::ptr_writes`].
 #[derive(Clone, Debug)]
 pub struct AdaptedProcedure {
     pub name: String,
     pub cfg: AbstractCfg,
     pub assertions: Vec<AssertionSite>,
     pub instruction_nodes: HashMap<Instruction, CfgNodeId>,
+    pub ptr_at: HashMap<(String, i64), (String, Term)>,
 }
 
 /// A single `may_assert(cond)` call site within a function.
@@ -102,6 +109,29 @@ pub struct WriteEffectSummary {
     pub relation: Formula,
 }
 
+/// Records that a function stored a pointer value through one of its pointer parameters.
+///
+/// Semantics: the function wrote a pointer to `(target_region, target_offset)` into the
+/// memory cell at offset `param_offset` within the region corresponding to parameter
+/// `param_index`.
+///
+/// Example — constructor `_ZN7CounterC2Ev(this: *Counter)` stores the vtable pointer:
+/// ```text
+/// param_index = 0, param_offset = 0,
+/// target_region = "global$_ZTV7Counter", target_offset = Int(2)
+/// ```
+/// Applied in the caller: if the actual argument for param 0 resolves to
+/// `(heap$_Znwm@0, 0)`, the caller's `ptr_at` gains
+/// `(heap$_Znwm@0, 0) → (global$_ZTV7Counter, Int(2))`,
+/// enabling vtable fn-ptr resolution for subsequent virtual calls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PointerWriteEffect {
+    pub param_index: usize,
+    pub param_offset: i64,
+    pub target_region: String,
+    pub target_offset: Term,
+}
+
 /// An interprocedural summary of a function's return value and memory side effects.
 ///
 /// `relation` is a formula over the function's formal parameters (using their abstract names,
@@ -110,8 +140,12 @@ pub struct WriteEffectSummary {
 /// callee's behaviour needs to be spliced into the caller's CFG.
 ///
 /// `write_effects` records which pointer parameters the function may write through, together
-/// with the before/after memory relation for each modified region.  Currently the field is
-/// populated by the driver but the injection machinery reserves space for it here.
+/// with the before/after memory relation for each modified region.
+///
+/// `ptr_writes` records pointer store-to-load forwarding effects: for each pointer parameter
+/// through which the function stored a pointer, one [`PointerWriteEffect`] entry.  These are
+/// applied by [`resolve_memory_effects`] when processing the call site, updating the caller's
+/// `ptr_at` map so that subsequent `PointerLoad`s (e.g. vptr reads) resolve correctly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReturnSummary {
     pub function: String,
@@ -119,6 +153,7 @@ pub struct ReturnSummary {
     pub retval_name: String,
     pub relation: Formula,
     pub write_effects: Vec<WriteEffectSummary>,
+    pub ptr_writes: Vec<PointerWriteEffect>,
 }
 
 /// A keyed store of [`ReturnSummary`] values, one per callee function name.
@@ -135,12 +170,46 @@ pub struct ReturnSummary {
 pub struct CallSummaryRegistry {
     summaries: BTreeMap<String, ReturnSummary>,
     next_call_site: Cell<usize>,
+    /// Module-wide vtable map: global region name → function-pointer entries per slot.
+    /// Pre-built by scanning all function graphs before adaptation; merged into each
+    /// function's local vtable_fn_ptrs so cross-function vtable propagation works.
+    pub vtable_map: HashMap<String, Vec<Option<String>>>,
 }
 
 impl CallSummaryRegistry {
     /// Creates an empty registry with the call-site counter reset to zero.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Scans all operands of `graph` for global vtable references and populates the
+    /// module-wide vtable map.  Call this for every graph before starting adaptation so
+    /// that vtable entries discovered in one function (e.g. a constructor) are available
+    /// in all other functions that receive the vtable pointer via `ptr_writes`.
+    pub fn scan_graph_vtables(&mut self, graph: &FunctionGraph) {
+        for instruction in &graph.vertices {
+            for operand_idx in 0..instruction.get_operand_count() {
+                if let Some(op) = instruction.get_operand(operand_idx) {
+                    if let Some((global_name, _offset)) = op.as_const_gep_of_global() {
+                        let region = format!("global${global_name}");
+                        if !self.vtable_map.contains_key(&region) {
+                            if let Some(base_op) = op.get_operand(0) {
+                                if let Some(entries) = base_op.constant_fn_ptr_elements() {
+                                    self.vtable_map.insert(region, entries);
+                                }
+                            }
+                        }
+                    } else if op.is_global_variable_ref() {
+                        let region = format!("global${}", op.display_name());
+                        if !self.vtable_map.contains_key(&region) {
+                            if let Some(entries) = op.constant_fn_ptr_elements() {
+                                self.vtable_map.insert(region, entries);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Registers `summary`, keyed by `summary.function`.  Overwrites any existing entry for
@@ -370,11 +439,26 @@ pub fn adapt_with_purity_and_summaries(
     lower_assumes(function_name, graph, &mut cfg, &instruction_nodes)?;
     cfg.ensure_single_exit()
         .map_err(|error| AdapterError::Cfg(error.to_string()))?;
-    let final_env = resolve_memory_effects(&mut cfg, graph, function_name, alias, &mut flat);
+
+    // Build node→instruction reverse map so resolve_memory_effects can look up
+    // actual call arguments when applying callee ptr_writes.
+    let node_to_instruction: HashMap<CfgNodeId, Instruction> =
+        instruction_nodes.iter().map(|(&k, &v)| (v, k)).collect();
+
+    let (final_env, ptr_at) = resolve_memory_effects(
+        &mut cfg,
+        graph,
+        function_name,
+        alias,
+        &mut flat,
+        summaries,
+        &node_to_instruction,
+    );
     apply_pending_return_summaries(
         &mut cfg,
         graph,
         &instruction_nodes,
+        &node_to_instruction,
         function_name,
         summaries,
         &final_env,
@@ -392,6 +476,7 @@ pub fn adapt_with_purity_and_summaries(
         cfg,
         assertions,
         instruction_nodes,
+        ptr_at,
     })
 }
 
@@ -558,6 +643,57 @@ pub fn compute_return_summary(
         retval_name,
         relation,
         write_effects: Vec::new(),
+        ptr_writes: Vec::new(),
+    })
+}
+
+/// Extracts [`PointerWriteEffect`]s from the final `ptr_at` map of an adapted function.
+///
+/// Scans `ptr_at` for entries whose region matches one of the function's external parameter
+/// regions (`fn$__ext_N`).  Each such entry records that the function stored a pointer
+/// through that parameter, which is exported to callers via [`ReturnSummary::ptr_writes`].
+pub fn extract_ptr_writes(
+    graph: &FunctionGraph,
+    function_name: &str,
+    ptr_at: &HashMap<(String, i64), (String, Term)>,
+) -> Vec<PointerWriteEffect> {
+    let mut writes = Vec::new();
+    for &param_index in &graph.pointer_param_indices {
+        let ext_region = ext_region_name(function_name, param_index);
+        for ((region, param_offset), (target_region, target_offset)) in ptr_at {
+            if *region == ext_region {
+                writes.push(PointerWriteEffect {
+                    param_index,
+                    param_offset: *param_offset,
+                    target_region: target_region.clone(),
+                    target_offset: target_offset.clone(),
+                });
+            }
+        }
+    }
+    writes
+}
+
+/// Produces a [`ReturnSummary`] carrying only pointer write effects when
+/// [`compute_return_summary`] returns `None` (e.g. void-returning or pointer-returning
+/// functions whose retval doesn't appear in any integer formula).
+///
+/// Returns `None` if no pointer writes were recorded for any parameter region.
+pub fn ptr_write_summary_if_any(
+    graph: &FunctionGraph,
+    adapted: &AdaptedProcedure,
+) -> Option<ReturnSummary> {
+    let ptr_writes = extract_ptr_writes(graph, &adapted.name, &adapted.ptr_at);
+    if ptr_writes.is_empty() {
+        return None;
+    }
+    Some(ReturnSummary {
+        function: adapted.name.clone(),
+        formal_parameters: formal_parameter_names(graph, &adapted.name),
+        retval_name: synthetic_retval_name(&adapted.name),
+        relation: Formula::True,
+        write_effects: Vec::new(),
+        ptr_writes,
     })
 }
 
@@ -1698,7 +1834,9 @@ fn resolve_memory_effects(
     function_name: &str,
     alias: &AliasResult,
     flat: &mut FlatLayout,
-) -> PointerEnv {
+    summaries: &CallSummaryRegistry,
+    node_to_instruction: &HashMap<CfgNodeId, Instruction>,
+) -> (PointerEnv, HashMap<(String, i64), (String, Term)>) {
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
     let order = cfg
         .topological_order_excluding(&excluded)
@@ -1714,9 +1852,19 @@ fn resolve_memory_effects(
     let mut fn_ptr_vars: HashMap<String, String> = HashMap::new();
 
     // Vtable map: global region name → list of function names per vtable slot.
-    // Built eagerly from global variable initializers that look like arrays of
-    // function pointers (C++ vtables).  A None entry means null or non-function.
-    let mut vtable_fn_ptrs: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    // Seeded from the module-wide registry (populated by scan_graph_vtables before
+    // adaptation) so vtable entries discovered in one function (e.g. a constructor)
+    // are available here even if the current function never directly references the
+    // vtable global.  Extended further during the per-instruction operand scan below.
+    let mut vtable_fn_ptrs: HashMap<String, Vec<Option<String>>> =
+        summaries.vtable_map.clone();
+
+    // Pointer store-to-load forwarding map.
+    // ptr_at[(R, k)] = (VR, VO) means: the memory cell at (region R, offset k)
+    // currently holds a pointer to (VR, VO).  Populated by PointerStore; consulted
+    // by PointerLoad before falling back to the conservative region alias.
+    // Callee ptr_writes (from ReturnSummary) are merged here when a Call is processed.
+    let mut ptr_at: HashMap<(String, i64), (String, Term)> = HashMap::new();
 
     let mut env = PointerEnv::default();
     for &param_index in &graph.pointer_param_indices {
@@ -1862,17 +2010,30 @@ fn resolve_memory_effects(
                     target_slot,
                     value_ptr,
                 } => {
-                    if let Some(binding) = env.get(&value_ptr).cloned() {
-                        env.bind(target_slot.clone(), binding.region, binding.offset);
-                    } else {
-                        // AA fallback: if value_ptr points to exactly one abstract
-                        // location, propagate that binding to target_slot.
-                        let locs = alias.points_to(&value_ptr);
-                        if locs.len() == 1 {
-                            let region = locs.iter().next().unwrap().0.clone();
-                            env.bind(target_slot.clone(), region, Term::int(0));
+                    // Record what pointer is stored at the memory cell that target_slot
+                    // points to.  This is the ptr_at map: ptr_at[(R, k)] = (VR, VO).
+                    // We do NOT rebind env[target_slot] — the slot's own location in
+                    // memory is unchanged; only the content stored there changes.
+                    if let Some(slot_binding) = env.get(&target_slot).cloned() {
+                        if let Some(k) = slot_binding.offset.try_as_constant_int() {
+                            if let Some(val_binding) = env.get(&value_ptr).cloned() {
+                                ptr_at.insert(
+                                    (slot_binding.region, k),
+                                    (val_binding.region, val_binding.offset),
+                                );
+                            } else {
+                                // AA fallback: if value_ptr's target region is uniquely known,
+                                // use it as the stored pointer value.
+                                let locs = alias.points_to(&value_ptr);
+                                if locs.len() == 1 {
+                                    let region = locs.iter().next().unwrap().0.clone();
+                                    ptr_at.insert(
+                                        (slot_binding.region, k),
+                                        (region, Term::int(0)),
+                                    );
+                                }
+                            }
                         }
-                        // If ambiguous or unknown, leave target_slot unbound (conservative).
                     }
                     rewritten.push(TransferEffect::Nop);
                 }
@@ -1881,22 +2042,40 @@ fn resolve_memory_effects(
                     source_slot,
                 } => {
                     if let Some(binding) = env.get(&source_slot).cloned() {
-                        // Vtable fn-ptr lookup: if the source slot resolves to a known
-                        // global vtable region at a concrete offset, try to find the
-                        // function name at that index and record it in fn_ptr_vars.
-                        // This enables IndirectCall resolution below for virtual dispatch.
-                        let mut resolved_as_fn_ptr = false;
-                        if let Term::Int(idx) = &binding.offset {
-                            if let Some(entries) = vtable_fn_ptrs.get(&binding.region) {
-                                let i = *idx as usize;
-                                if let Some(Some(fn_name)) = entries.get(i) {
-                                    fn_ptr_vars.insert(target_ptr.clone(), fn_name.clone());
-                                    resolved_as_fn_ptr = true;
+                        // Step 1: consult ptr_at — if someone previously stored a pointer
+                        // into the memory cell that source_slot points to, use that stored
+                        // pointer as the binding for target_ptr.  This resolves the vptr
+                        // load pattern: *obj (object region) → stored vtable region.
+                        let resolved_via_ptr_at =
+                            if let Some(k) = binding.offset.try_as_constant_int() {
+                                ptr_at.get(&(binding.region.clone(), k)).cloned()
+                            } else {
+                                None
+                            };
+
+                        if let Some((stored_region, stored_offset)) = resolved_via_ptr_at {
+                            // The memory cell holds a pointer to (stored_region, stored_offset).
+                            // Set env[target_ptr] so that a subsequent PointerLoad can do the
+                            // vtable fn-ptr check at that region/offset.
+                            env.bind(target_ptr, stored_region, stored_offset);
+                        } else {
+                            // Step 2: no ptr_at entry — vtable fn-ptr lookup directly on the
+                            // source binding (existing behavior for direct vtable loads).
+                            let mut resolved_as_fn_ptr = false;
+                            if let Some(idx) = binding.offset.try_as_constant_int() {
+                                if let Some(entries) = vtable_fn_ptrs.get(&binding.region) {
+                                    let i = idx as usize;
+                                    if let Some(Some(fn_name)) = entries.get(i) {
+                                        fn_ptr_vars.insert(target_ptr.clone(), fn_name.clone());
+                                        resolved_as_fn_ptr = true;
+                                    }
                                 }
                             }
-                        }
-                        if !resolved_as_fn_ptr {
-                            env.bind(target_ptr, binding.region, binding.offset);
+                            if !resolved_as_fn_ptr {
+                                // Conservative fallback: treat source_slot's binding as the
+                                // loaded pointer's binding (SSA-level alias approximation).
+                                env.bind(target_ptr, binding.region, binding.offset);
+                            }
                         }
                     } else {
                         // AA fallback: collect all abstract locations stored into every
@@ -1995,6 +2174,42 @@ fn resolve_memory_effects(
                     }
                     rewritten.push(effect);
                 }
+                TransferEffect::Call {
+                    ref callee,
+                    memory_effect: _,
+                } => {
+                    // Apply callee ptr_writes to the caller's ptr_at map.
+                    // This propagates pointer stores done by the callee (e.g. a constructor
+                    // storing the vptr) through the call boundary so that subsequent
+                    // PointerLoads in this function can resolve them.
+                    if let Some(summary) = summaries.get(callee) {
+                        if !summary.ptr_writes.is_empty() {
+                            if let Some(&instr) = node_to_instruction.get(&node_id) {
+                                let actual_args = instr.get_call_args();
+                                for pw in &summary.ptr_writes {
+                                    if let Some(actual) = actual_args.get(pw.param_index) {
+                                        let arg_name = local_name(function_name, *actual);
+                                        if let Some(arg_binding) = env.get(&arg_name).cloned() {
+                                            if let Some(base) =
+                                                arg_binding.offset.try_as_constant_int()
+                                            {
+                                                let caller_offset = base + pw.param_offset;
+                                                ptr_at.insert(
+                                                    (arg_binding.region.clone(), caller_offset),
+                                                    (
+                                                        pw.target_region.clone(),
+                                                        pw.target_offset.clone(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    rewritten.push(effect);
+                }
                 other => rewritten.push(other),
             }
         }
@@ -2004,7 +2219,7 @@ fn resolve_memory_effects(
         }
     }
 
-    env
+    (env, ptr_at)
 }
 
 fn scalar_memory_slot_var(region: &str, offset: &Term, sort: Sort) -> Option<Var> {
@@ -2040,10 +2255,17 @@ fn apply_pending_return_summaries(
     cfg: &mut AbstractCfg,
     graph: &FunctionGraph,
     instruction_nodes: &HashMap<Instruction, CfgNodeId>,
+    node_to_instruction: &HashMap<CfgNodeId, Instruction>,
     function_name: &str,
     summaries: &CallSummaryRegistry,
     final_env: &PointerEnv,
 ) -> Result<(), AdapterError> {
+    // Collect (node_id, callee, instruction) for all call sites that have a known summary.
+    // This includes both direct calls (from the LLVM instruction) and indirect calls that
+    // were resolved to a concrete callee by resolve_memory_effects via vtable lookup.
+    let mut pending: Vec<(CfgNodeId, String, Instruction)> = Vec::new();
+
+    // Direct calls: derive callee from the LLVM instruction.
     for instruction in &graph.vertices {
         if instruction.get_opcode() != InstructionOpcode::Call {
             continue;
@@ -2051,10 +2273,54 @@ fn apply_pending_return_summaries(
         let Some(callee) = instruction.get_called_function() else {
             continue;
         };
-        let Some(summary) = summaries.get(&callee) else {
+        if summaries.get(&callee).is_none() {
+            continue;
+        }
+        let Some(&node_id) = instruction_nodes.get(instruction) else {
             continue;
         };
-        let Some(&node_id) = instruction_nodes.get(instruction) else {
+        pending.push((node_id, callee, *instruction));
+    }
+
+    // Resolved indirect calls: derive callee from the CFG node's Call effect (set during
+    // resolve_memory_effects when a vtable indirect call was resolved).
+    let node_ids: Vec<CfgNodeId> = cfg.node_ids().collect();
+    for node_id in node_ids {
+        // Only process nodes whose corresponding LLVM instruction was an indirect call
+        // (i.e., get_called_function() == None).  Direct calls are already handled above.
+        let Some(&instr) = node_to_instruction.get(&node_id) else {
+            continue;
+        };
+        if instr.get_opcode() != InstructionOpcode::Call {
+            continue;
+        }
+        if instr.get_called_function().is_some() {
+            continue; // Already handled as a direct call above.
+        }
+        // Find the resolved callee from the node's Call effects.
+        let Ok(node) = cfg.node(node_id) else {
+            continue;
+        };
+        let Some(callee) = node.transfer.effects.iter().find_map(|e| {
+            if let TransferEffect::Call { callee, .. } = e {
+                Some(callee.clone())
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+        if summaries.get(&callee).is_none() {
+            continue;
+        }
+        // Avoid duplicates (shouldn't happen but be safe).
+        if !pending.iter().any(|(nid, _, _)| *nid == node_id) {
+            pending.push((node_id, callee, instr));
+        }
+    }
+
+    for (node_id, callee, instruction) in pending {
+        let Some(summary) = summaries.get(&callee) else {
             continue;
         };
 
@@ -2069,7 +2335,7 @@ fn apply_pending_return_summaries(
         }
         mapping.insert(
             summary.retval_name.clone(),
-            local_name(function_name, *instruction),
+            local_name(function_name, instruction),
         );
 
         let renamed = rename_callee_vars(&summary.relation, &mapping, &callee, &local_prefix);
@@ -2501,6 +2767,20 @@ fn substitute_ext_regions_term(term: &Term, region_map: &BTreeMap<String, (Strin
                         Term::add(base.clone(), rewritten_index),
                     );
                 }
+                // Prefix-match for field sub-regions created by StructFieldGep,
+                // e.g. "call_prefix$__ext_0$f1" when "call_prefix$__ext_0" is in region_map.
+                // Field sub-regions have their own 0-based indexing, so the parent base
+                // offset is not added — only the actual region name gains the suffix.
+                for (ext_key, (actual_region, _base)) in region_map {
+                    if let Some(suffix) = name.strip_prefix(ext_key.as_str()) {
+                        if suffix.starts_with('$') {
+                            return Term::select(
+                                Memory::var(format!("{actual_region}{suffix}")),
+                                rewritten_index,
+                            );
+                        }
+                    }
+                }
             }
             Term::select(
                 substitute_ext_regions_memory(memory, region_map),
@@ -2540,6 +2820,14 @@ fn substitute_ext_regions_memory(
             if let Some((actual_region, _)) = region_map.get(name) {
                 Memory::var(actual_region.clone())
             } else {
+                // Prefix-match for field sub-regions (same logic as in substitute_ext_regions_term).
+                for (ext_key, (actual_region, _)) in region_map {
+                    if let Some(suffix) = name.strip_prefix(ext_key.as_str()) {
+                        if suffix.starts_with('$') {
+                            return Memory::var(format!("{actual_region}{suffix}"));
+                        }
+                    }
+                }
                 Memory::var(name)
             }
         }
@@ -2782,6 +3070,7 @@ mod tests {
                         ),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 });
                 let adapted = adapt_with_purity_and_summaries(
                     &graphs[0],
@@ -3075,6 +3364,7 @@ mod tests {
                         ),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 });
 
                 let adapted = adapt_with_purity_and_summaries(

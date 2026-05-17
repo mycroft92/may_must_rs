@@ -429,16 +429,102 @@ does not verify end-to-end because:
 This is a **precision** issue, not a soundness bug: the tool never claims
 `Verified` for an actually-unsafe program.
 
-**What is needed (future work):** Extend `ReturnSummary` to carry pointer write
-effects as a map `(ext_region, offset) → (target_region, target_offset)`.  The
-caller's `apply_pending_return_summaries` would then update its `PointerEnv`
-with these mappings, making the vptr binding visible and allowing the
-`IndirectCall` to resolve.
+**Fix — pointer store-to-load forwarding:** implemented.  See the next section.
+
+### Pointer store-to-load forwarding (`ptr_at` map)
+
+#### Within-function
+
+`resolve_memory_effects` in `src/common/adapter.rs` maintains a side table:
+
+```
+ptr_at: HashMap<(region: String, offset: i64), (region: String, offset: Term)>
+```
+
+`ptr_at[(R, k)] = (VR, VO)` means: the memory cell `(R, k)` currently holds a
+pointer to `(VR, VO)`.
+
+**`PointerStore { target_slot, value_ptr }`** — instead of rebinding `env[target_slot]`
+(the old SSA-alias approach), the new code writes to `ptr_at`:
+
+```
+if env[target_slot] = (R, Int(k)) and env[value_ptr] = (VR, VO):
+    ptr_at[(R, k)] = (VR, VO)
+```
+
+In the constructor body this records
+`ptr_at[("fn$__ext_0", 0)] = ("global$_ZTV7Counter", 2)`.
+
+**`PointerLoad { target_ptr, source_slot }`** — before the vtable fn-ptr check,
+`ptr_at` is consulted:
+
+```
+if env[source_slot] = (R, Int(k)):
+    if ptr_at[(R, k)] = (VR, VO):
+        env[target_ptr] = (VR, VO)      ← indirect through stored pointer
+    else:
+        env[target_ptr] = (R, k)         ← old conservative fallback
+```
+
+Now, a subsequent `PointerLoad` from `env[target_ptr] = (global$_ZTV7Counter, 2)` hits
+the vtable fn-ptr check and resolves to `_ZNK7Counter3getEv`.
+
+#### Cross-function — `PointerWriteEffect` in `ReturnSummary`
+
+`ptr_at` entries for external regions (ext params) are exported via
+`PointerWriteEffect` (in `src/common/adapter.rs`):
+
+```rust
+pub struct PointerWriteEffect {
+    pub param_index: usize,   // which pointer parameter was written through
+    pub param_offset: i64,    // offset within the param's region
+    pub target_region: String,
+    pub target_offset: Term,
+}
+```
+
+`ReturnSummary` now carries `ptr_writes: Vec<PointerWriteEffect>`.  The
+extraction step (`extract_ptr_writes`) scans the callee's final `ptr_at` for
+entries whose region matches `callee$__ext_N` and emits one
+`PointerWriteEffect` per entry.
+
+`AdaptedProcedure` stores the final `ptr_at` so driver.rs can extract
+`ptr_writes` when building the `ReturnSummary`.
+
+#### Cross-function application in `resolve_memory_effects`
+
+When `resolve_memory_effects` encounters a `Call { callee }` effect and the
+callee has `ptr_writes` in its registered summary, it:
+
+1. Looks up the original LLVM instruction via `node_to_instruction[node_id]` to
+   get the actual call arguments.
+2. For each `PointerWriteEffect { param_index, param_offset, target_region, target_offset }`:
+   - Finds `env[actual_arg[param_index]]` = `(caller_region, caller_base_offset)`.
+   - Adds `ptr_at[(caller_region, caller_base_offset + param_offset)] = (target_region, target_offset)`.
+3. Subsequent `PointerLoad`s in the same function see the updated `ptr_at` and
+   resolve the vtable correctly.
+
+#### Call chain propagation
+
+The constructor chain `main → C1 (_ZN7CounterC1Ev) → C2 (_ZN7CounterC2Ev)` is
+handled by the driver's bottom-up fixed-point iteration:
+
+| Iteration | What happens |
+|-----------|-------------|
+| 1 | C2 processed: ptr_at[(ext_0, 0)] = vtable → C2 ReturnSummary.ptr_writes populated |
+| 2 | C1 processed with C2's summary: Call C2 → ptr_at[(ext_0, 0)] = vtable propagated → C1 ReturnSummary.ptr_writes populated |
+| 3 | main processed with C1's summary: Call C1 → ptr_at[(heap$_Znwm@0, 0)] = vtable → PointerLoad %8 → env[%8] = (global$vtable, 2) → PointerLoad %10 → fn_ptr_vars[%10] = Counter::get → IndirectCall resolved ✓ |
+
+For functions with no integer return value (like constructors returning `void`
+or an opaque `this` pointer that never appears in an integer formula),
+`ptr_write_summary_if_any` in `src/common/adapter.rs` creates a
+`ReturnSummary` with `relation: Formula::True` purely to carry the ptr_writes.
+This ensures the constructor's side effects propagate even when
+`compute_return_summary` returns `None`.
 
 ### Test
 
 `tests/vtable_dispatch.cpp` exercises the pattern.  The test
-`vtable_dispatch_does_not_crash` in `src/may_must_analysis/driver.rs` verifies
-that the tool processes the fixture without panicking.  The verdict is currently
-`Unsafe` (false alarm) due to the limitation above; this is documented in the
-test with `// known false alarm` and the test asserts only `!= panic`.
+`vtable_dispatch_verifies` in `src/may_must_analysis/driver.rs` asserts that the
+assertion `v == 42` is `Verified` end-to-end, with the vtable resolved through
+the C1→C2 constructor chain and `Counter::get` returning `value_` = 42.

@@ -1227,7 +1227,19 @@ impl Instruction {
                 if init.is_null() {
                     return None;
                 }
-                init
+                // Clang often wraps the vtable array in a struct: `{ [N x ptr] } { [...] }`.
+                // If the initializer is a ConstantArray, use it directly; otherwise try the
+                // first struct field (index 0), which is the array in the common single-field
+                // struct vtable layout.
+                if !LLVMIsAConstantArray(init).is_null() {
+                    init
+                } else {
+                    let field0 = LLVMGetAggregateElement(init, 0);
+                    if field0.is_null() || LLVMIsAConstantArray(field0).is_null() {
+                        return None;
+                    }
+                    field0
+                }
             } else if !LLVMIsAConstantArray(self.0).is_null() {
                 self.0
             } else {

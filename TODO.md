@@ -155,12 +155,34 @@ cannot resolve.  The remaining work is wiring `heap$callC` region names into
 the adapter so that `malloc` call sites produce `Seed` constraints in the AA
 and the lowered CFG contains concrete `MemoryStore` effects for heap writes.
 
-### Step 5 — Virtual dispatch
+### Step 5 — Virtual dispatch (done, `0.6.0`)
 
-`call %vtable_fn_ptr(...)` is an indirect call — no static callee name to
-look up. This requires a points-to / class-hierarchy analysis pass that maps
-each virtual call site to the set of possible concrete callees, then either:
-- inlines each candidate and checks under the union, or
-- builds per-class summaries and joins them at the call site.
+Indirect calls through vtable pointers (`call %vtable_fn_ptr(...)`) are now
+resolved to concrete callees at the lowering boundary:
 
-This is the most complex piece and is independent of Steps 1–4.
+1. **Module-wide vtable map** — `CallSummaryRegistry::scan_graph_vtables`
+   reads all vtable globals (handling Clang's `{ [N x ptr] }` struct wrapper)
+   and populates a `vtable_map: HashMap<region, Vec<Option<fn_name>>>`.
+
+2. **`ptr_at` side table** — `resolve_memory_effects` tracks
+   `ptr_at: HashMap<(region, concrete_offset), (region, Term)>` recording what
+   pointer is stored at each memory cell (e.g. the vptr store in a constructor
+   propagated via `ReturnSummary::ptr_writes`).
+
+3. **Vtable PointerLoad** — when loading a pointer from a cell that holds a
+   vtable region, the vtable map is consulted to insert the resolved function
+   name into `fn_ptr_vars`.
+
+4. **IndirectCall rewrite** — `TransferEffect::IndirectCall` is rewritten to
+   `TransferEffect::Call { callee }` once the callee is known.
+
+5. **Return summary application** — `apply_pending_return_summaries` now also
+   processes resolved indirect calls (second loop over CFG nodes), applying
+   callee return summaries exactly as for direct calls.
+
+6. **Field sub-region substitution** — `substitute_ext_regions` now does
+   prefix-match on `$f`-suffixed regions so that callee field access through
+   `ext_N$fK` maps to the caller's `actual_region$fK`.
+
+Test: `vtable_dispatch_verifies` — `Counter::get()` via virtual dispatch,
+assertion `v == 42` verified `Safe`.

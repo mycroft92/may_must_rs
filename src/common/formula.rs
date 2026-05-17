@@ -358,6 +358,30 @@ impl Term {
         Term::Neg(Box::new(inner))
     }
 
+    /// Evaluate this term to a constant integer if every sub-term is a literal.
+    /// Returns `None` for any term that contains variables, memory selects, or
+    /// boolean coercions.  Useful for constant-folding GEP offsets.
+    pub fn try_as_constant_int(&self) -> Option<i64> {
+        match self {
+            Term::Int(n) => Some(*n),
+            Term::Add(l, r) => Some(l.try_as_constant_int()? + r.try_as_constant_int()?),
+            Term::Sub(l, r) => Some(l.try_as_constant_int()? - r.try_as_constant_int()?),
+            Term::Mul(l, r) => Some(l.try_as_constant_int()? * r.try_as_constant_int()?),
+            Term::Div(l, r) => {
+                let d = r.try_as_constant_int()?;
+                if d == 0 { return None; }
+                Some(l.try_as_constant_int()? / d)
+            }
+            Term::Rem(l, r) => {
+                let d = r.try_as_constant_int()?;
+                if d == 0 { return None; }
+                Some(l.try_as_constant_int()? % d)
+            }
+            Term::Neg(inner) => Some(-inner.try_as_constant_int()?),
+            _ => None,
+        }
+    }
+
     pub fn sort(&self) -> Result<Sort, FormulaError> {
         match self {
             Term::Var(var) => Ok(var.sort()),
