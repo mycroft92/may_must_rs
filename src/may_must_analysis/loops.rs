@@ -850,9 +850,7 @@ type StoreFacts = BTreeMap<(String, i64), Term>;
 
 /// Intersect two `StoreFacts` maps, keeping only entries that agree on value.
 fn intersect_store_facts(a: StoreFacts, b: StoreFacts) -> StoreFacts {
-    a.into_iter()
-        .filter(|(k, v)| b.get(k) == Some(v))
-        .collect()
+    a.into_iter().filter(|(k, v)| b.get(k) == Some(v)).collect()
 }
 
 /// Resolve any `Select(Var(region), Int(k))` sub-terms using concrete store facts.
@@ -900,15 +898,15 @@ fn resolve_select_in_term(term: &Term, facts: &StoreFacts) -> Term {
 /// subsequent `Assign { Select(...) }` effects resolve the load against the
 /// recorded facts, so the caller sees e.g. `cur = 0` rather than
 /// `cur = select(stack0, 0)` when the preheader contains `store 0, ptr %i`.
-fn apply_effects_sp(
-    effects: &[TransferEffect],
-    pre: &Formula,
-    facts: &mut StoreFacts,
-) -> Formula {
+fn apply_effects_sp(effects: &[TransferEffect], pre: &Formula, facts: &mut StoreFacts) -> Formula {
     let mut formula = pre.clone();
     for effect in effects {
         match effect {
-            TransferEffect::MemoryStore { region, offset, value } => {
+            TransferEffect::MemoryStore {
+                region,
+                offset,
+                value,
+            } => {
                 match offset.try_as_constant_int() {
                     Some(k) => {
                         let resolved = resolve_select_in_term(value, facts);
@@ -937,10 +935,7 @@ fn apply_effects_sp(
                 value: AssignValue::Term(term),
             } => {
                 let resolved = resolve_select_in_term(term, facts);
-                formula = Formula::and(
-                    formula,
-                    Formula::eq(Term::Var(target.clone()), resolved),
-                );
+                formula = Formula::and(formula, Formula::eq(Term::Var(target.clone()), resolved));
             }
             TransferEffect::Assign {
                 target,
@@ -1024,8 +1019,11 @@ fn forward_reach_at_header(
 
             // Apply source-node effects: updates both formula and path_facts.
             let mut path_facts = source_in;
-            let source_out =
-                apply_effects_sp(&source_node.transfer.effects, &source_reach, &mut path_facts);
+            let source_out = apply_effects_sp(
+                &source_node.transfer.effects,
+                &source_reach,
+                &mut path_facts,
+            );
 
             // Apply edge guard, then edge effects (phi assignments etc.).
             let guarded = Formula::and(source_out, edge.guard.clone());

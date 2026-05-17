@@ -61,7 +61,7 @@ use crate::may_must_analysis::providers::LoopContext;
 use crate::may_must_analysis::rules::{Judgement, RuleEngine, RuleError};
 use crate::may_must_analysis::summaries::SummaryTables;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Final outcome of one assertion check together with supporting witness data.
 ///
@@ -87,6 +87,8 @@ pub struct AssertionResult {
     pub judgement: Judgement,
     pub entry_summary: NodeSummary,
     pub assertion_summary: NodeSummary,
+    /// Debug name map from the adapted procedure (region/IR-var → source var name).
+    pub debug_names: HashMap<String, String>,
 }
 
 /// Errors that can occur during the backward (or combined) analysis pass.
@@ -174,7 +176,16 @@ pub fn analyze(
     site: &AssertionSite,
     oracle: &Oracle,
 ) -> Result<AssertionResult, BackwardError> {
-    analyze_with_tables(cfg, "", site, oracle, &SummaryTables::new(), None, None)
+    analyze_with_tables(
+        cfg,
+        "",
+        site,
+        oracle,
+        &SummaryTables::new(),
+        None,
+        None,
+        &HashMap::new(),
+    )
 }
 
 /// Top-level entry point for checking one assertion inside a (possibly cyclic) CFG.
@@ -209,9 +220,18 @@ pub fn analyze_with_tables(
     tables: &SummaryTables,
     config: Option<&InvariantConfig>,
     precomputed: Option<&[(CfgNodeId, Formula)]>,
+    debug_names: &HashMap<String, String>,
 ) -> Result<AssertionResult, BackwardError> {
     if cfg.topological_order().is_some() {
-        return run_backward(cfg, site, oracle, &BTreeSet::new(), &[], tables);
+        return run_backward(
+            cfg,
+            site,
+            oracle,
+            &BTreeSet::new(),
+            &[],
+            tables,
+            debug_names,
+        );
     }
 
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
@@ -237,7 +257,15 @@ pub fn analyze_with_tables(
                     oracle,
                 )?;
             if exit_closure_ok {
-                return run_backward(cfg, site, oracle, &excluded, precomputed, tables);
+                return run_backward(
+                    cfg,
+                    site,
+                    oracle,
+                    &excluded,
+                    precomputed,
+                    tables,
+                    debug_names,
+                );
             }
             // Exit closure failed: the precomputed invariant does not discharge this
             // assertion.  Fall through to synthesis to find a stronger invariant.
@@ -259,11 +287,20 @@ pub fn analyze_with_tables(
         &site.location,
         oracle,
         config,
+        debug_names,
     )?;
     if invariants.is_empty() {
         return Err(BackwardError::CyclicCfgUnsupported);
     }
-    run_backward(cfg, site, oracle, &excluded, &invariants, tables)
+    run_backward(
+        cfg,
+        site,
+        oracle,
+        &excluded,
+        &invariants,
+        tables,
+        debug_names,
+    )
 }
 
 /// Core bidirectional analysis pass.
@@ -317,6 +354,7 @@ fn run_backward(
     excluded_edges: &BTreeSet<crate::common::abstract_cfg::CfgEdgeId>,
     loop_invariants: &[(CfgNodeId, Formula)],
     tables: &SummaryTables,
+    debug_names: &HashMap<String, String>,
 ) -> Result<AssertionResult, BackwardError> {
     let order = cfg
         .topological_order_excluding(excluded_edges)
@@ -363,6 +401,7 @@ fn run_backward(
         judgement,
         entry_summary: engine.summary(cfg.entry())?.clone(),
         assertion_summary: engine.summary(site.node)?.clone(),
+        debug_names: debug_names.clone(),
     })
 }
 
@@ -383,8 +422,18 @@ pub fn discover_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
     oracle: &Oracle,
+    debug_names: &HashMap<String, String>,
 ) -> Option<Vec<(CfgNodeId, Formula)>> {
-    synthesize_loop_invariants(cfg, function, &BTreeMap::new(), "", oracle, None).ok()
+    synthesize_loop_invariants(
+        cfg,
+        function,
+        &BTreeMap::new(),
+        "",
+        oracle,
+        None,
+        debug_names,
+    )
+    .ok()
 }
 
 /// Invariant synthesis pipeline for a cyclic CFG.
@@ -409,6 +458,7 @@ fn synthesize_loop_invariants(
     assertion_location: &str,
     oracle: &Oracle,
     config: Option<&InvariantConfig>,
+    debug_names: &HashMap<String, String>,
 ) -> Result<Vec<(CfgNodeId, Formula)>, BackwardError> {
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
@@ -435,7 +485,7 @@ fn synthesize_loop_invariants(
                 target: "loop_invariant",
                 "function {function} loop {} algorithmic candidates: {}",
                 index + 1,
-                format_candidates(&candidates)
+                format_candidates(&candidates, debug_names)
             );
             accepted_candidate = first_accepted_candidate(
                 function,
@@ -447,6 +497,7 @@ fn synthesize_loop_invariants(
                 oracle,
                 &assertion_postconditions,
                 &accepted,
+                debug_names,
             );
         }
 
@@ -458,7 +509,7 @@ fn synthesize_loop_invariants(
                 target: "loop_invariant",
                 "function {function} loop {} CHC candidates: {}",
                 index + 1,
-                format_candidates(&candidates)
+                format_candidates(&candidates, debug_names)
             );
             accepted_candidate = first_accepted_candidate(
                 function,
@@ -470,6 +521,7 @@ fn synthesize_loop_invariants(
                 oracle,
                 &assertion_postconditions,
                 &accepted,
+                debug_names,
             );
         }
 
@@ -484,7 +536,7 @@ fn synthesize_loop_invariants(
                 target: "loop_invariant",
                 "function {function} loop {} houdini candidates: {}",
                 index + 1,
-                format_candidates(&candidates)
+                format_candidates(&candidates, debug_names)
             );
             accepted_candidate = first_accepted_candidate(
                 function,
@@ -496,6 +548,7 @@ fn synthesize_loop_invariants(
                 oracle,
                 &assertion_postconditions,
                 &accepted,
+                debug_names,
             );
         }
 
@@ -555,7 +608,7 @@ fn synthesize_loop_invariants(
                         target: "loop_invariant",
                         "function {function} loop {} llm candidate {} => {}",
                         index + 1,
-                        pretty_formula(&candidate),
+                        pretty_formula_with_names(&candidate, debug_names),
                         render_invariant_result(&result)
                     );
                     if result == InvariantCheckResult::Accepted {
@@ -584,7 +637,7 @@ fn synthesize_loop_invariants(
             target: "loop_invariant",
             "function {function} loop {} accepted invariant: {}",
             index + 1,
-            pretty_formula(&candidate)
+            pretty_formula_with_names(&candidate, debug_names)
         );
         accepted.push((loop_info.header, candidate));
     }
@@ -725,6 +778,7 @@ fn first_accepted_candidate(
     oracle: &Oracle,
     assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
     accepted_inner: &[(CfgNodeId, Formula)],
+    debug_names: &HashMap<String, String>,
 ) -> Option<Formula> {
     candidates.par_iter().find_map_any(|candidate| {
         let result = check_loop_invariant_verbose(
@@ -741,7 +795,7 @@ fn first_accepted_candidate(
             "function {function} loop {} {} candidate {} => {}",
             loop_index,
             phase,
-            pretty_formula(&normalized),
+            pretty_formula_with_names(&normalized, debug_names),
             render_invariant_result(&result)
         );
         (result == InvariantCheckResult::Accepted).then_some(normalized)
@@ -784,7 +838,7 @@ fn render_invariant_result(result: &InvariantCheckResult) -> String {
     }
 }
 
-fn format_candidates(candidates: &[Formula]) -> String {
+fn format_candidates(candidates: &[Formula], debug_names: &HashMap<String, String>) -> String {
     if candidates.is_empty() {
         "[]".to_string()
     } else {
@@ -792,7 +846,7 @@ fn format_candidates(candidates: &[Formula]) -> String {
             "[{}]",
             candidates
                 .iter()
-                .map(pretty_formula)
+                .map(|f| pretty_formula_with_names(f, debug_names))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -812,6 +866,7 @@ fn format_candidates(candidates: &[Formula]) -> String {
 ///   [counterexample or reach/state summary if Unknown]
 /// ```
 pub fn render_result(result: &AssertionResult) -> String {
+    let names = &result.debug_names;
     let location = if !result.source_location.file.is_empty() {
         result.source_location.to_string()
     } else if result.source_location.line > 0 {
@@ -824,15 +879,21 @@ pub fn render_result(result: &AssertionResult) -> String {
         Judgement::Verified => lines.push("    judgement: Verified".to_string()),
         Judgement::Unknown => {
             lines.push("    judgement: Unknown".to_string());
-            lines.push(format!("    reach: {}", result.entry_summary.reach));
-            lines.push(format!("    state: {}", result.entry_summary.state));
+            lines.push(format!(
+                "    reach: {}",
+                result.entry_summary.reach.pretty(names)
+            ));
+            lines.push(format!(
+                "    state: {}",
+                result.entry_summary.state.pretty(names)
+            ));
         }
         Judgement::BugFound { model } => {
             lines.push("    judgement: UNSAFE".to_string());
             if let Some(model) = model.as_ref() {
                 if !model.is_empty() {
                     lines.push("    counterexample:".to_string());
-                    lines.push(render_counterexample(model));
+                    lines.push(render_counterexample(model, names));
                 }
             }
         }
@@ -855,23 +916,40 @@ pub fn render_result(result: &AssertionResult) -> String {
 /// [function2]
 ///   var3 = value3
 /// ```
-fn render_counterexample(model: &SmtModel) -> String {
-    use std::collections::BTreeMap;
+fn render_counterexample(model: &SmtModel, debug_names: &HashMap<String, String>) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
     let mut by_function: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Track (func, display_name) pairs already covered by a scalar entry so we
+    // can suppress the redundant ArrayDefault memory entry for the same variable.
+    let mut scalar_names_seen: BTreeSet<(String, String)> = BTreeSet::new();
 
     for (var, value) in &model.scalar {
         if let Some((func, local)) = parse_model_var_name(var.name()) {
+            let display = debug_names
+                .get(var.name())
+                .cloned()
+                .unwrap_or(local.clone());
+            scalar_names_seen.insert((func.clone(), display.clone()));
             by_function
                 .entry(func)
                 .or_default()
-                .push(format!("      {} = {}", local, value));
+                .push(format!("      {} = {}", display, value));
         }
     }
     for (name, value) in &model.memory {
         if let Some((func, local)) = parse_model_var_name(name) {
+            let display = debug_names.get(name).cloned().unwrap_or(local.clone());
+            // Skip ArrayDefault memory entries whose source name is already shown
+            // by a scalar — Z3 picks an arbitrary default for unconstrained memory
+            // regions, which would contradict the (more accurate) scalar value.
+            if matches!(value, ModelValue::ArrayDefault(_))
+                && scalar_names_seen.contains(&(func.clone(), display.clone()))
+            {
+                continue;
+            }
             by_function.entry(func).or_default().push(format!(
                 "      {}: {}",
-                local,
+                display,
                 format_array_value(value)
             ));
         }
@@ -956,8 +1034,18 @@ fn format_array_value(value: &ModelValue) -> String {
 /// Used in invariant debugging logs to keep output concise and readable.  The
 /// wrapping threshold is 100 characters.
 pub fn pretty_formula(formula: &Formula) -> String {
+    pretty_formula_with_names(formula, &std::collections::HashMap::new())
+}
+
+/// Like [`pretty_formula`] but substitutes region names with source variable
+/// names from LLVM debug info (e.g. `select(main$stack0, 0)` → `array[0]`).
+/// Pass `&adapted.debug_names` when the `AdaptedProcedure` is in scope.
+pub fn pretty_formula_with_names(
+    formula: &Formula,
+    names: &std::collections::HashMap<String, String>,
+) -> String {
     const WRAP_WIDTH: usize = 100;
-    let rendered = formula.to_string();
+    let rendered = formula.pretty(names);
     if rendered.len() <= WRAP_WIDTH {
         rendered
     } else {

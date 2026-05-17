@@ -277,7 +277,9 @@ pub fn analyze_module_with_llm(
         if adapted.cfg.topological_order().is_some() {
             continue;
         }
-        if let Some(invariants) = discover_loop_invariants(&adapted.cfg, &adapted.name, oracle) {
+        if let Some(invariants) =
+            discover_loop_invariants(&adapted.cfg, &adapted.name, oracle, &adapted.debug_names)
+        {
             summary_tables.set_loop_invariants(adapted.name.clone(), invariants);
         }
     }
@@ -375,7 +377,9 @@ pub fn analyze_with_summaries(
             let invariants = tables.get_loop_invariants(&adapted.name);
             (!invariants.is_empty()).then(|| invariants.to_vec())
         })
-        .or_else(|| discover_loop_invariants(&adapted.cfg, &adapted.name, oracle));
+        .or_else(|| {
+            discover_loop_invariants(&adapted.cfg, &adapted.name, oracle, &adapted.debug_names)
+        });
     let precomputed = precomputed_owned.as_deref();
 
     let site_results: Vec<_> = adapted
@@ -391,6 +395,7 @@ pub fn analyze_with_summaries(
                     tables,
                     config,
                     precomputed,
+                    &adapted.debug_names,
                 )
             } else {
                 analyze(&adapted.cfg, site, oracle)
@@ -508,6 +513,7 @@ fn infer_cyclic_observer_summary(
                 &SummaryTables::new(),
                 None,
                 Some(&invariants),
+                &adapted.debug_names,
             )
             .ok()?;
             if matches!(result.judgement, Judgement::Verified) {

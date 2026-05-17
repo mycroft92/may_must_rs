@@ -29,8 +29,15 @@ use llvm_sys::prelude::*;
 use llvm_sys::target::LLVMTargetDataRef;
 use llvm_sys::target::*;
 use llvm_sys::{LLVMIntPredicate, LLVMOpcode, LLVMRealPredicate, LLVMTypeKind};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr;
+
+// DbgRecord content APIs present in LLVM 20 but not yet wrapped in llvm-sys.
+extern "C" {
+    fn LLVMDbgVariableRecordGetValue(Record: LLVMDbgRecordRef) -> LLVMValueRef;
+    fn LLVMDbgVariableRecordGetVariable(Record: LLVMDbgRecordRef) -> LLVMMetadataRef;
+}
 
 /// A Rust-friendly mirror of `LLVMOpcode`, covering the subset of LLVM IR
 /// opcodes that the analyzer cares about.
@@ -697,6 +704,60 @@ impl Function {
 
             res
         }
+    }
+
+    /// Build a map from alloca `Instruction` → source variable name by scanning
+    /// all instructions in the function for `#dbg_declare` records.
+    ///
+    /// The result is used by the adapter to annotate abstract memory regions
+    /// (`main$stack0`, `main$stack1`, …) with human-readable source names for
+    /// debug display.  Returns an empty map when no LLVM debug info is present.
+    pub fn collect_alloca_debug_names(&self) -> HashMap<Instruction, String> {
+        let mut map = HashMap::new();
+        unsafe {
+            let module = LLVMGetGlobalParent(self.0);
+            let context = LLVMGetModuleContext(module);
+            let mut bb = LLVMGetFirstBasicBlock(self.0);
+            while !bb.is_null() {
+                let mut inst = LLVMGetFirstInstruction(bb);
+                while !inst.is_null() {
+                    let mut record = LLVMGetFirstDbgRecord(inst);
+                    while !record.is_null() {
+                        let val = LLVMDbgVariableRecordGetValue(record);
+                        // Only care about alloca-backed declarations.
+                        if !val.is_null() && !LLVMIsAAllocaInst(val).is_null() {
+                            let meta = LLVMDbgVariableRecordGetVariable(record);
+                            if !meta.is_null() {
+                                let meta_val = LLVMMetadataAsValue(context, meta);
+                                if !meta_val.is_null() && LLVMGetMDNodeNumOperands(meta_val) >= 2 {
+                                    let mut ops = vec![
+                                        ptr::null_mut();
+                                        LLVMGetMDNodeNumOperands(meta_val) as usize
+                                    ];
+                                    LLVMGetMDNodeOperands(meta_val, ops.as_mut_ptr());
+                                    // Operand 1 of DILocalVariable is the name MDString.
+                                    let name_op = ops[1];
+                                    if !name_op.is_null() {
+                                        let mut str_len = 0u32;
+                                        let str_ptr = LLVMGetMDString(name_op, &mut str_len);
+                                        if !str_ptr.is_null() && str_len > 0 {
+                                            let name = CStr::from_ptr(str_ptr)
+                                                .to_string_lossy()
+                                                .into_owned();
+                                            map.insert(Instruction(val), name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        record = LLVMGetNextDbgRecord(record);
+                    }
+                    inst = LLVMGetNextInstruction(inst);
+                }
+                bb = LLVMGetNextBasicBlock(bb);
+            }
+        }
+        map
     }
 }
 
