@@ -218,20 +218,51 @@ pub fn analyze_with_tables(
     let force_llm = config
         .and_then(|config| config.llm.as_ref())
         .is_some_and(|llm| llm.force);
-    let invariants = if let Some(precomputed) = precomputed {
-        if !precomputed.is_empty() && !force_llm {
-            precomputed.to_vec()
-        } else {
-            synthesize_loop_invariants(cfg, function, site, oracle, config, &excluded)?
-        }
-    } else {
-        synthesize_loop_invariants(cfg, function, site, oracle, config, &excluded)?
-    };
 
+    // Compute assertion-specific backward states once; shared by exit-closure
+    // checking and synthesis so neither call repeats the backward pass.
+    let assertion_postconditions = compute_preliminary_backward_states(cfg, site, &excluded)?;
+
+    if let Some(precomputed) = precomputed {
+        if !precomputed.is_empty() && !force_llm {
+            // config=None signals the observer pattern: invariants skip exit closure and
+            // are verified by run_backward directly.  In the regular (config=Some) path,
+            // check exit closure first to see whether the precomputed invariant is strong
+            // enough to discharge this specific assertion.
+            let exit_closure_ok = config.is_none()
+                || precomputed_satisfy_exit_closure(
+                    cfg,
+                    &assertion_postconditions,
+                    precomputed,
+                    oracle,
+                )?;
+            if exit_closure_ok {
+                return run_backward(cfg, site, oracle, &excluded, precomputed, tables);
+            }
+            // Exit closure failed: the precomputed invariant does not discharge this
+            // assertion.  Fall through to synthesis to find a stronger invariant.
+            // Using run_backward here with an invariant that failed exit closure is
+            // unsound — the backward state from the exit condition can collapse to
+            // False at the entry via loop-initialization substitution, giving a
+            // spurious Verified even when the assertion is violable.
+            log::debug!(
+                target: "loop_invariant",
+                "function {function}: precomputed invariant failed exit closure — falling through to synthesis"
+            );
+        }
+    }
+
+    let invariants = synthesize_loop_invariants(
+        cfg,
+        function,
+        &assertion_postconditions,
+        &site.location,
+        oracle,
+        config,
+    )?;
     if invariants.is_empty() {
         return Err(BackwardError::CyclicCfgUnsupported);
     }
-
     run_backward(cfg, site, oracle, &excluded, &invariants, tables)
 }
 
@@ -335,16 +366,14 @@ fn run_backward(
     })
 }
 
-/// Lightweight invariant-only pass used by the interprocedural driver.
+/// Pre-pass that caches loop invariants before full per-assertion analysis.
 ///
-/// Unlike [`synthesize_loop_invariants`] this function does not take an
-/// assertion site — it only uses the *algorithmic* candidate strategy and
-/// returns `None` if any loop cannot be handled.  The resulting invariants are
-/// cached in [`SummaryTables`] and reused across multiple assertion checks in
-/// the same function, avoiding redundant synthesis work.
+/// Calls [`synthesize_loop_invariants`] with empty `assertion_postconditions`
+/// (scope = `True`), so exit closure is skipped — no assertion site is
+/// available yet.  The resulting invariants are cached in [`SummaryTables`]
+/// and reused across multiple assertion checks in the same function.
 ///
-/// Returns `None` if the CFG is acyclic (no invariants needed) or if any loop
-/// yields no accepted algorithmic candidate.
+/// Returns `None` if any loop cannot be handled (i.e. synthesis fails for it).
 ///
 /// # Purpose
 ///
@@ -355,83 +384,32 @@ pub fn discover_loop_invariants(
     function: &str,
     oracle: &Oracle,
 ) -> Option<Vec<(CfgNodeId, Formula)>> {
-    if cfg.topological_order().is_some() {
-        return None;
-    }
-    let mut loops = detect_loops(cfg);
-    sort_innermost_first(&mut loops);
-    let mut accepted = Vec::new();
-
-    for (index, loop_info) in loops.into_iter().enumerate() {
-        let candidates = algorithmic_candidates(&loop_info, cfg);
-        log::debug!(
-            target: "loop_invariant",
-            "function {function} loop {} algorithmic candidates: {}",
-            index + 1,
-            format_candidates(&candidates)
-        );
-        let Some(candidate) = first_accepted_candidate(
-            function,
-            index + 1,
-            "algorithmic-precompute",
-            &loop_info,
-            cfg,
-            &candidates,
-            oracle,
-            &BTreeMap::new(),
-            &accepted,
-        ) else {
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} produced no accepted algorithmic invariant",
-                index + 1
-            );
-            return None;
-        };
-        log::debug!(
-            target: "loop_invariant",
-            "function {function} loop {} precomputed algorithmic invariant: {}",
-            index + 1,
-            pretty_formula(&candidate)
-        );
-        accepted.push((loop_info.header, candidate));
-    }
-
-    Some(accepted)
+    synthesize_loop_invariants(cfg, function, &BTreeMap::new(), "", oracle, None).ok()
 }
 
-/// Full invariant synthesis pipeline for a cyclic CFG with a concrete assertion.
+/// Invariant synthesis pipeline for a cyclic CFG.
 ///
-/// For each detected loop (processed innermost-first) the function tries the
-/// enabled candidate strategies in order.  Preliminary backward states (WP of
-/// `NOT obligation` propagated backward with back edges blocked) are computed
-/// once upfront and passed to [`check_loop_invariant_verbose`] as the
-/// `assertion_postconditions` argument, enabling the exit-closure check to
-/// verify that the invariant is strong enough to discharge the obligation at
-/// loop exits.
+/// Accepts `assertion_postconditions` (WP of `NOT obligation` propagated
+/// backward with back edges blocked) and an optional `assertion_location` string
+/// for LLM context.  Pass `&BTreeMap::new()` and `""` from
+/// [`discover_loop_invariants`] (the pre-pass with no assertion site); pass
+/// the computed postconditions and the site label from [`analyze_with_tables`].
 ///
-/// When all strategies fail for any loop the function returns
-/// [`BackwardError::CyclicCfgUnsupported`].  On success, the returned vector
-/// contains one `(header, invariant)` pair per loop, innermost first.
+/// For each detected loop (innermost-first) the function tries the enabled
+/// candidate strategies in order.  When `assertion_postconditions` is empty,
+/// exit closure is effectively skipped (no assertion site to check against),
+/// making this safe to call from the pre-pass.
 ///
-/// # Strategy sequence
-///
-/// The function tries strategies in this order (if enabled in `config`):
-/// 1. Algorithmic (unless `skip_algorithmic` is set).
-/// 2. CHC solving.
-/// 3. Houdini template weakening.
-/// 4. Template (currently unsupported).
-/// 5. LLM-guided CEGIS (if `llm` is configured).
+/// Returns [`Err(BackwardError::CyclicCfgUnsupported)`] if no invariant is
+/// found for any loop, or `Ok(vec![])` if the CFG has no loops.
 fn synthesize_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
-    site: &AssertionSite,
+    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
+    assertion_location: &str,
     oracle: &Oracle,
     config: Option<&InvariantConfig>,
-    excluded_back_edges: &BTreeSet<CfgEdgeId>,
 ) -> Result<Vec<(CfgNodeId, Formula)>, BackwardError> {
-    let assertion_postconditions =
-        compute_preliminary_backward_states(cfg, site, excluded_back_edges)?;
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
     let methods = selected_methods(config);
@@ -543,7 +521,7 @@ fn synthesize_loop_invariants(
                         },
                         &loop_info,
                         cfg,
-                        site.location.clone(),
+                        assertion_location.to_string(),
                         exit_postcondition.clone(),
                         attempts.clone(),
                     );
@@ -647,6 +625,62 @@ fn compute_preliminary_backward_states(
         .iter()
         .map(|(id, summary)| (*id, summary.state.clone()))
         .collect())
+}
+
+/// Check that every precomputed loop invariant satisfies exit closure for this assertion.
+///
+/// `discover_loop_invariants` skips exit closure (it has no assertion site). Before
+/// reusing those invariants in [`run_backward`], we must verify that each invariant
+/// satisfies all three checks — initiation, inductiveness, and exit closure — for
+/// the specific assertion site being checked.
+///
+/// Exit closure is always checked for every loop that has a precomputed invariant.
+/// The earlier optimisation that skipped the check when the loop appeared not to
+/// write any variable mentioned in the obligation was removed because it produced
+/// false-Verified results: when the obligation is on a loaded scalar, its source
+/// region name does not appear in the obligation formula, so the syntactic check
+/// incorrectly declared the loop irrelevant (see `debug/array-2-false-safe.md`).
+///
+/// Returns `Ok(true)` if every invariant passes all three checks (including exit
+/// closure), `Ok(false)` if any fails. Callers should fall through to
+/// [`synthesize_loop_invariants`] when this returns `false`.
+fn precomputed_satisfy_exit_closure(
+    cfg: &AbstractCfg,
+    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
+    precomputed: &[(CfgNodeId, Formula)],
+    oracle: &Oracle,
+) -> Result<bool, BackwardError> {
+    let mut loops = detect_loops(cfg);
+    sort_innermost_first(&mut loops);
+    let mut accepted_inner: Vec<(CfgNodeId, Formula)> = Vec::new();
+    for loop_info in &loops {
+        if let Some((_, invariant)) = precomputed.iter().find(|(h, _)| *h == loop_info.header) {
+            let result = check_loop_invariant_verbose(
+                loop_info,
+                cfg,
+                invariant,
+                oracle,
+                &assertion_postconditions,
+                &accepted_inner,
+            );
+            log::debug!(
+                target: "loop_invariant",
+                "precomputed exit-closure check for invariant {} => {}",
+                pretty_formula(invariant),
+                match &result {
+                    InvariantCheckResult::Accepted => "accepted".to_string(),
+                    InvariantCheckResult::InitiationFailed => "rejected: initiation failed".to_string(),
+                    InvariantCheckResult::InductivenessFailed => "rejected: inductiveness failed".to_string(),
+                    InvariantCheckResult::ExitClosureFailed { exit_edge } => format!("rejected: exit closure failed at {:?}", exit_edge),
+                }
+            );
+            if result != InvariantCheckResult::Accepted {
+                return Ok(false);
+            }
+            accepted_inner.push((loop_info.header, invariant.clone()));
+        }
+    }
+    Ok(true)
 }
 
 fn selected_methods(config: Option<&InvariantConfig>) -> Vec<InvariantMethod> {

@@ -378,7 +378,9 @@ pub fn analyze_with_summaries(
         .or_else(|| discover_loop_invariants(&adapted.cfg, &adapted.name, oracle));
     let precomputed = precomputed_owned.as_deref();
 
-    let site_results: Vec<_> = adapted.assertions.par_iter()
+    let site_results: Vec<_> = adapted
+        .assertions
+        .par_iter()
         .map(|site| {
             let result = if let Some(tables) = tables {
                 analyze_with_tables(
@@ -1588,6 +1590,26 @@ mod tests {
                 SafetyVerdict::Safe,
                 "vtable dispatch should be Verified but got {:?}",
                 main_report.verdict()
+            );
+        });
+    }
+
+    #[test]
+    fn array_2_is_not_falsely_verified() {
+        // array-2: loop fills array[0] with nondet, then asserts array[0] > menor.
+        // The loop invariant (j >= 0) fails exit closure because the counter does
+        // not constrain the array contents.  The analysis must not return Verified
+        // (false safe); it should return Unknown (synthesis cannot find an invariant
+        // strong enough to discharge the array-content assertion).
+        with_bc_graphs("array-2", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let proc = procedure(&report, "main");
+            assert_ne!(
+                proc.verdict(),
+                SafetyVerdict::Safe,
+                "array-2 must not be falsely verified"
             );
         });
     }

@@ -522,9 +522,23 @@ pub fn check_loop_invariant_verbose(
             .get(&info.header)
             .cloned()
             .unwrap_or(Formula::False);
-        match oracle.implies(&candidate, &exit_header) {
-            Ok(Validity::Valid) => {}
-            Ok(Validity::Invalid) | Ok(Validity::Unknown) | Err(_) => {
+        log::trace!(
+            target: "loop_invariant",
+            "exit closure: candidate={} postcondition={} exit_header={}",
+            crate::may_must_analysis::backward::pretty_formula(&candidate),
+            crate::may_must_analysis::backward::pretty_formula(postcondition),
+            crate::may_must_analysis::backward::pretty_formula(&exit_header),
+        );
+        // Exit closure: the invariant must be INCONSISTENT with the violation condition
+        // at the exit. "I AND exit_header infeasible" means "if I holds, no violation
+        // can reach the assertion through this exit" — the correct safety criterion.
+        // (The old oracle.implies check tested I ⊢ violation, which is backwards.)
+        let combined = Formula::and(candidate.clone(), exit_header.clone());
+        match oracle.feasibility(&combined) {
+            Ok(crate::common::oracle::Feasibility::Infeasible) => {}
+            Ok(crate::common::oracle::Feasibility::Feasible)
+            | Ok(crate::common::oracle::Feasibility::Unknown)
+            | Err(_) => {
                 return InvariantCheckResult::ExitClosureFailed {
                     exit_edge: *exit_edge,
                 };

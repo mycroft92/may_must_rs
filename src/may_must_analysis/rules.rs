@@ -184,6 +184,13 @@ impl<'a> RuleEngine<'a> {
             .clone();
         let source_reach = self.summary(edge.source)?.reach.clone();
         let propagated = Formula::and(source_reach, edge.guard);
+        log::debug!(
+            target: "rules",
+            "[must_post] {:?}→{:?}: reach += {}",
+            edge.source,
+            edge.target,
+            fmt_formula(&propagated),
+        );
         self.summary_mut(edge.target)?.join_reach(&propagated);
         Ok(())
     }
@@ -212,6 +219,13 @@ impl<'a> RuleEngine<'a> {
             .map_err(|_| RuleError::UnknownNode { node: edge.source })?
             .transfer
             .wp(&post_at_source);
+        log::debug!(
+            target: "rules",
+            "[notmay_pre] {:?}→{:?}: state += {}",
+            edge.source,
+            edge.target,
+            fmt_formula(&pre_at_source),
+        );
         self.summary_mut(edge.source)?.join_state(&pre_at_source);
         Ok(())
     }
@@ -236,6 +250,12 @@ impl<'a> RuleEngine<'a> {
             .map_err(|_| RuleError::UnknownEdge { edge: edge_id })?;
         let combined = self.summary(edge.source)?.combined();
         if oracle.feasibility(&combined)? == Feasibility::Infeasible {
+            log::debug!(
+                target: "rules",
+                "[notmay_pre_pruned] {:?}→{:?}: reach∧state infeasible — edge blocked, state := False",
+                edge.source,
+                edge.target,
+            );
             self.block_edge(edge_id);
             self.summary_mut(edge.source)?.state = Formula::False;
         }
@@ -277,6 +297,13 @@ impl<'a> RuleEngine<'a> {
             let target_state = self.summary(edge.target)?.state.clone();
             let valid = oracle.implies(&target_state, &summary.postcondition)?;
             if feasible != Feasibility::Infeasible && valid == Validity::Valid {
+                log::debug!(
+                    target: "rules",
+                    "[notmay_pre_usesummary] {:?}→{:?}: callee '{}' summary discharges state — edge blocked, state := False",
+                    edge.source,
+                    edge.target,
+                    callee,
+                );
                 self.block_edge(edge_id);
                 self.summary_mut(edge.source)?.state = Formula::False;
                 break;
@@ -312,6 +339,14 @@ impl<'a> RuleEngine<'a> {
             return Ok(());
         };
         for summary in tables.must(&callee) {
+            log::debug!(
+                target: "rules",
+                "[must_post_usesummary] {:?}→{:?}: callee '{}' must-summary: reach += {}",
+                edge.source,
+                edge.target,
+                callee,
+                fmt_formula(&summary.postcondition),
+            );
             self.summary_mut(edge.target)?
                 .join_reach(&summary.postcondition);
         }
@@ -416,6 +451,17 @@ pub fn callee_of(node: &crate::common::abstract_cfg::AbstractNode) -> Option<Str
 /// or `None` otherwise.
 pub fn edge_view(cfg: &AbstractCfg, id: CfgEdgeId) -> Option<&AbstractEdge> {
     cfg.edge(id).ok()
+}
+
+/// Format a formula for diff-debug logging, truncating long conjunctions.
+fn fmt_formula(formula: &Formula) -> String {
+    const WRAP: usize = 120;
+    let s = formula.to_string();
+    if s.len() <= WRAP {
+        s
+    } else {
+        format!("{} …(+{})", &s[..WRAP], s.len() - WRAP)
+    }
 }
 
 #[cfg(test)]
