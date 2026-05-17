@@ -1127,12 +1127,17 @@ mod tests {
     fn compile_fixture(stem: &str) -> PathBuf {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = {
-            let direct = repo_root.join("tests").join(format!("{stem}.c"));
-            if direct.exists() {
-                direct
-            } else {
-                repo_root.join("tests/flow").join(format!("{stem}.c"))
-            }
+            // Try C source first, then C++ (both in tests/ and tests/flow/).
+            let candidates = [
+                repo_root.join("tests").join(format!("{stem}.c")),
+                repo_root.join("tests/flow").join(format!("{stem}.c")),
+                repo_root.join("tests").join(format!("{stem}.cpp")),
+                repo_root.join("tests/flow").join(format!("{stem}.cpp")),
+            ];
+            candidates
+                .into_iter()
+                .find(|p| p.exists())
+                .unwrap_or_else(|| repo_root.join("tests").join(format!("{stem}.c")))
         };
         let status = Command::new("sh")
             .arg("tests/build_ir.sh")
@@ -1522,6 +1527,42 @@ mod tests {
             let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
             let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
             assert_all_verified(procedure(&report, "test_distinct_stack_addrs"), 1);
+        });
+    }
+
+    #[test]
+    fn vtable_dispatch_does_not_crash() {
+        // The vtable dispatch fixture exercises: HeapAlloc for the object (_Znwm),
+        // ConstantExpr GEP binding for the vptr store in the constructor, IndirectCall
+        // emission for the virtual call.
+        //
+        // Current limitation: the vptr written in the constructor does not flow back
+        // to the caller because pointer write effects are not yet encoded in
+        // ReturnSummary.  The IndirectCall therefore remains unresolved, and its
+        // return value is unconstrained — Z3 can assign it 0, producing a false
+        // Unsafe verdict.  This is a known false alarm, not unsoundness in the
+        // verification direction (we never report Verified for programs that are
+        // actually unsafe).  The test just verifies the analysis runs without crashing.
+        with_bc_graphs("vtable_dispatch", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            // Must not panic.
+            let _ = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+        });
+    }
+
+    #[test]
+    fn heap_distinct_malloc_sites_do_not_alias() {
+        // Two calls to malloc in the same function must produce distinct abstract
+        // regions so that a write through one pointer does not invalidate the
+        // constraint on the other.  Without per-call-site heap regions, both
+        // pointers would share one region and the store to *b would make the
+        // assertion *a == 1 unprovable.
+        with_bc_graphs("heap_distinct", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            assert_all_verified(procedure(&report, "heap_distinct"), 1);
         });
     }
 }

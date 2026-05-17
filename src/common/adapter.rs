@@ -44,6 +44,21 @@ use crate::common::llvm_utils::program_graph::FunctionGraph;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Heap allocator functions whose return value is treated as a fresh abstract region
+/// rather than an unresolved pointer.  Each call site gets a unique region name of the
+/// form `heap$<callee>@<N>` so distinct allocation sites remain distinguishable.
+///
+/// Only pure allocators that do not write to existing memory are listed here.
+/// `realloc` is intentionally excluded because it may free the old pointer and return
+/// either the same address or a new one, which requires a more complex model.
+const HEAP_ALLOCATORS: &[&str] = &[
+    "malloc",
+    "calloc",
+    "_Znwm",
+    "_Znam",
+    "__cxa_allocate_exception",
+];
+
 /// The result of lowering a single LLVM function to the abstract CFG representation.
 ///
 /// `instruction_nodes` maps each LLVM instruction to the [`CfgNodeId`] it was lowered into.
@@ -249,14 +264,35 @@ pub fn adapt_with_purity_and_summaries(
         }
     }
 
-    // Build flat address layout: stack allocas first, then ext pointer params,
-    // then globals (discovered by scanning all operands).  Globals not seen here
-    // are added lazily in resolve_memory_effects when they appear as operands.
+    // Pre-pass: assign unique heap regions to known allocator call sites whose
+    // result is a pointer.  Each call site gets heap$<callee>@<N> so that, e.g.,
+    // two calls to malloc in the same function produce distinct abstract regions.
+    let mut heap_alloc_regions = HashMap::<Instruction, String>::new();
+    let mut heap_index = 0usize;
+    for instruction in &graph.vertices {
+        if instruction.get_opcode() == InstructionOpcode::Call && is_pointer_value(*instruction) {
+            if let Some(callee) = instruction.get_called_function() {
+                if HEAP_ALLOCATORS.contains(&callee.as_str()) {
+                    let region = format!("{function_name}$heap${callee}@{heap_index}");
+                    heap_alloc_regions.insert(*instruction, region);
+                    heap_index += 1;
+                }
+            }
+        }
+    }
+
+    // Build flat address layout: stack allocas first, then heap allocations,
+    // then ext pointer params, then globals (discovered by scanning all operands).
+    // Globals not seen here are added lazily in resolve_memory_effects when they
+    // appear as operands.
     let mut flat = FlatLayout::new();
     for instruction in &graph.vertices {
         if let Some(region) = allocation_regions.get(instruction) {
             flat.add_region(region.clone());
         }
+    }
+    for region in heap_alloc_regions.values() {
+        flat.add_region(region.clone());
     }
     for &param_index in &graph.pointer_param_indices {
         flat.add_region(ext_region_name(function_name, param_index));
@@ -277,6 +313,7 @@ pub fn adapt_with_purity_and_summaries(
         start,
         memory_pure,
         &allocation_regions,
+        &heap_alloc_regions,
         &layout,
     )?);
     let mut instruction_nodes = HashMap::new();
@@ -291,6 +328,7 @@ pub fn adapt_with_purity_and_summaries(
             *instruction,
             memory_pure,
             &allocation_regions,
+            &heap_alloc_regions,
             &layout,
         )?;
         let node_id = cfg.add_node(instruction.print(), transfer);
@@ -784,6 +822,9 @@ fn lower_gep(
 ///   synthetic return-value variable.
 /// - **`call`**: if the callee is not `may_assert`, produce a `Call` effect with
 ///   `PreservesMemory` when the callee is in `memory_pure`, otherwise `HavocMemory`.
+///   Exception: calls to known heap allocators (`malloc`, `calloc`, etc.) that have a
+///   pointer-typed result produce `HeapAlloc` instead and no `Call` effect, since
+///   allocators do not write to existing memory regions.
 /// - **`fneg`**: produces a negation `Assign`.
 /// - **`bitcast` / `addrspacecast`** on pointer values: produce `PointerAlias`.
 /// - **`switch`**, **`indirectbr`**: produce no effects (guards are approximated as `True`).
@@ -796,6 +837,7 @@ fn lower_node_transfer(
     instruction: Instruction,
     memory_pure: &BTreeSet<String>,
     allocation_regions: &HashMap<Instruction, String>,
+    heap_alloc_regions: &HashMap<Instruction, String>,
     layout: &TargetData,
 ) -> Result<TransferFn, AdapterError> {
     let mut effects = Vec::<TransferEffect>::new();
@@ -1192,19 +1234,46 @@ fn lower_node_transfer(
             }
         }
         InstructionOpcode::Call => {
-            let callee = instruction
-                .get_called_function()
-                .ok_or_else(|| AdapterError::UnsupportedInstruction(instruction.print()))?;
-            if callee != "may_assert" {
-                let memory_effect = if memory_pure.contains(&callee) {
-                    CallMemoryEffect::PreservesMemory
-                } else {
-                    CallMemoryEffect::HavocMemory
-                };
-                effects.push(TransferEffect::Call {
-                    callee: callee.clone(),
-                    memory_effect,
-                });
+            match instruction.get_called_function() {
+                None => {
+                    // Indirect call through a function pointer (e.g. virtual dispatch).
+                    // The callee value is the last LLVM operand of the call instruction.
+                    // `resolve_memory_effects` will attempt to resolve this to a concrete
+                    // callee via a vtable lookup; if that fails it is treated conservatively.
+                    if let Some(callee_op) =
+                        instruction.get_operand(instruction.get_operand_count().saturating_sub(1))
+                    {
+                        let callee_ptr = local_name(function_name, callee_op);
+                        effects.push(TransferEffect::IndirectCall {
+                            callee_ptr,
+                            memory_effect: CallMemoryEffect::HavocMemory,
+                        });
+                    }
+                }
+                Some(callee) if callee == "may_assert" => {
+                    // Stripped by program_graph.rs; no node-local effect.
+                }
+                Some(callee) => {
+                    if let Some(region) = heap_alloc_regions.get(&instruction) {
+                        // Known allocator returning a fresh pointer: bind the result to a
+                        // unique heap region instead of emitting a Call with HavocMemory.
+                        // Allocators do not write to any existing memory region.
+                        effects.push(TransferEffect::HeapAlloc {
+                            result_ptr: pointer_name(function_name, instruction),
+                            region: region.clone(),
+                        });
+                    } else {
+                        let memory_effect = if memory_pure.contains(&callee) {
+                            CallMemoryEffect::PreservesMemory
+                        } else {
+                            CallMemoryEffect::HavocMemory
+                        };
+                        effects.push(TransferEffect::Call {
+                            callee: callee.clone(),
+                            memory_effect,
+                        });
+                    }
+                }
             }
         }
         InstructionOpcode::FNeg => {
@@ -1489,33 +1558,136 @@ fn assertion_location(site: &crate::common::llvm_utils::program_graph::AssertSit
 /// Builds the [`PointerEnv`] for the function and rewrites abstract memory effects in the
 /// CFG to concrete array-theory terms.
 ///
-/// This is the heart of the memory model.  The pass works in two phases:
+/// This is the heart of the memory model.  It translates the symbolic pointer
+/// environment — which maps LLVM SSA pointer names to `(region, offset)` pairs — into
+/// concrete `MemoryStore` and `select(region, offset)` expressions that the WP engine can
+/// reason about directly.
 ///
-/// **Phase 1 – seed the environment.**
-/// Pointer parameters are mapped to fresh "external" regions (`fn$__ext_N`) with offset 0.
-/// Global variable references encountered in the instruction operands are mapped to
-/// per-global regions (`global$<name>`).
+/// The pass works in two phases:
 ///
-/// **Phase 2 – forward dataflow rewrite.**
-/// The CFG nodes are visited in topological order (back-edges are excluded to break cycles;
-/// if a full topological order is unavailable the original node order is used as a
-/// best-effort approximation).  For each node's effects:
+/// ---
 ///
-/// - `Alloca` → recorded in the env mapping the local pointer name to the new stack region.
-/// - `GetElementPtr` → the child pointer inherits the parent's region with an adjusted offset.
-/// - `Load` on a pointer whose binding is known → rewritten to `Assign(select(region, offset))`.
-///   Real-typed loads use a scalar slot variable instead of an array select.
-/// - `Store` on a known pointer → rewritten to `MemoryStore(region, offset, value)`.
-///   Real-typed stores become a scalar slot `Assign`.
-/// - `PointerStore { target_slot, value_ptr }` → if `value_ptr` is in the env, binds
-///   `target_slot` to the same region.  If not in the env, falls back to `alias`:
-///   when `pts(value_ptr)` is a singleton the unique region is bound; otherwise
-///   `target_slot` is left unresolved (conservative).
-/// - `PointerLoad { target_ptr, source_slot }` → if `source_slot` is in the env, binds
-///   `target_ptr` to the same region.  If not in the env, falls back to `alias`:
-///   the union of `pts_mem(r)` for each `r ∈ pts(source_slot)` is taken; when the
-///   union is a singleton that region is bound; otherwise `target_ptr` is left unresolved.
-/// - `PointerAlias` → copies the binding from source to target, then becomes `Nop`.
+/// ## Phase 1 — Seed the environment
+///
+/// Before visiting any instruction, the env is pre-populated with all pointer bindings
+/// that are known from the function signature and module-level information:
+///
+/// - **Pointer parameters** (`fn$%param`): each parameter at a `pointer_param_index` is
+///   bound to a fresh *external region* `fn$__ext_N` at offset 0.  External regions model
+///   memory that lives in the *caller's* frame; the callee can read and write through them
+///   but cannot know their absolute address.  The region name is stable so callee summaries
+///   can later be instantiated at the call site via region substitution.
+///
+/// - **Global variable references**: any operand in the function body that refers to a
+///   global variable with pointer type is bound to a per-global region `global$<name>` at
+///   offset 0.  Globals are scanned eagerly here (before the node traversal) so that a
+///   reference in an early instruction does not depend on traversal order.
+///
+/// ---
+///
+/// ## Phase 2 — Forward dataflow rewrite
+///
+/// CFG nodes are visited in *topological order*, excluding detected back-edges (to avoid
+/// a chicken-and-egg dependency on the result of the traversal itself).  If no valid
+/// topological order exists (e.g. irreducible CFG), the original node order is used as a
+/// best-effort approximation.  For each node, the existing abstract effects are consumed
+/// and replaced with a rewritten list according to the following rules:
+///
+/// ### Allocation effects — establish new region bindings
+///
+/// - **`Alloca { target, region }`** — the stack alloca names a fresh region.  `target`
+///   (the LLVM SSA pointer name) is bound to `(region, 0)` in the env.  The effect is
+///   kept as-is; WP treats it as a no-op but it serves as a readable record of the
+///   allocation in the CFG.
+///
+/// - **`HeapAlloc { result_ptr, region }`** — a call to a known allocator (`malloc`,
+///   `calloc`, etc.) that was assigned a unique heap region during the pre-pass.
+///   `result_ptr` is bound to `(region, 0)` in the env and `region` is registered in the
+///   `FlatLayout` so that a subsequent `ptrtoint` of the result gets a concrete integer
+///   address distinct from all stack and global regions.  The effect is kept as-is; WP
+///   treats it as a no-op.
+///
+/// ### Pointer arithmetic — propagate bindings through GEP
+///
+/// - **`GetElementPtr { target, base, offset }`** — if `base` is already in the env, the
+///   child pointer `target` inherits the same region with the offset incremented:
+///   `target → (base.region, base.offset + offset)`.  If `base` is not in the env the GEP
+///   is kept unchanged and the target remains unresolved.  Effect is kept as-is (no-op for
+///   WP).
+///
+/// - **`StructFieldGep { target, base, field_index }`** — instead of adjusting the offset
+///   inside the base region, a dedicated per-field *sub-region* is created:
+///   `target → ("<base.region>$f<field_index>", 0)`.  This gives each struct field its own
+///   independent array so the backward analysis can distinguish `node->x` from `node->y`
+///   without needing array-theory element-level reasoning.  Effect becomes `Nop`.
+///
+/// ### Scalar loads and stores — materialise select/store expressions
+///
+/// - **`Load { target, source }`** (non-pointer result) — if `source` is in the env,
+///   rewritten to `Assign { target, select(region, offset) }`.  The `select` term is the
+///   SMT array-read operation; the backward WP will later reduce it when a preceding
+///   `MemoryStore` at the same region and offset is in scope.  Real-typed (floating-point)
+///   loads use a named scalar slot variable `<region>$slot_real` instead of an array
+///   select, since the solver's real theory does not have array support.  If `source` is
+///   not in the env, the original `Load` effect is kept unchanged (target remains free).
+///
+/// - **`Store { target, value }`** (non-pointer value) — if `target` is in the env,
+///   rewritten to `MemoryStore { region, offset, value }`.  WP will later substitute the
+///   array `region := store(region, offset, value)` in the postcondition.  Real-typed
+///   stores become a scalar slot `Assign`.  If `target` is not in the env the original
+///   `Store` effect is kept unchanged (the write is invisible to WP).
+///
+/// ### Pointer-valued loads and stores — propagate env bindings
+///
+/// - **`PointerStore { target_slot, value_ptr }`** — stores a pointer into a pointer-typed
+///   memory cell (e.g. `node->next = other_node`).  If `value_ptr` is in the env, its
+///   `(region, offset)` binding is copied to `target_slot` so that a subsequent
+///   `PointerLoad` from the same slot can recover the pointed-to region.  If `value_ptr`
+///   is *not* in the env, the alias analysis fallback is tried: if `pts(value_ptr)` is a
+///   singleton the unique region is bound; if ambiguous or unknown `target_slot` is left
+///   unresolved.  Effect becomes `Nop` (no WP effect — pointer identity is not a first-
+///   class formula term).
+///
+/// - **`PointerLoad { target_ptr, source_slot }`** — loads a pointer from a pointer-typed
+///   memory cell.  If `source_slot` is in the env, its binding is copied to `target_ptr`.
+///   If `source_slot` is not in the env, the alias analysis fallback collects all abstract
+///   locations stored into every region that `source_slot` may point to
+///   (`⋃ pts_mem(r) for r ∈ pts(source_slot)`); when the union is a singleton that region
+///   is bound; otherwise `target_ptr` is left unresolved.  Effect becomes `Nop`.
+///
+/// - **`PointerAlias { target, source }`** — copies the binding from `source` to `target`
+///   without any arithmetic, then becomes `Nop`.  Produced by `bitcast` and
+///   `addrspacecast` on pointer values.
+///
+/// ### Flat-address arithmetic — ptrtoint / inttoptr round-trips
+///
+/// - **`PtrToInt { target, source_ptr }`** — if `source_ptr` is in the env *and* its
+///   offset is a concrete integer, the flat address `base(region) + offset` is looked up
+///   in the [`FlatLayout`] and the result is emitted as `Assign { target, Int(addr) }`.
+///   The resolved address is also recorded in a side table `flat_int_vars` so that
+///   subsequent arithmetic on `target` can propagate the concrete value.  If the pointer
+///   is unresolved, the effect becomes `Nop` (target remains unconstrained).
+///
+/// - **`IntToPtr { target_ptr, source_name }`** — the inverse: if `source_name` is in
+///   `flat_int_vars` (i.e., was produced by a `ptrtoint` of a known pointer), the flat
+///   address is decoded via [`FlatLayout::region_at`] and `target_ptr` is bound to the
+///   resulting `(region, offset)` pair in the env.  This resolves container-of style
+///   patterns where a pointer is converted to an integer, offset by a struct field
+///   displacement, then converted back.  Effect always becomes `Nop`.
+///
+/// - **`Assign { target, Term }`** — arithmetic on integer-sorted variables is passed
+///   through unmodified, but if the right-hand side can be evaluated to a concrete flat
+///   address (via `eval_flat_addr`), the result is also recorded in `flat_int_vars` so
+///   that ptrtoint + arithmetic + inttoptr chains resolve correctly.
+///
+/// ### Unresolvable effects — kept as-is
+///
+/// Any effect that does not match the above patterns (e.g. a `Load` whose source pointer
+/// is not in the env, a `Call` with `HavocMemory`, an `Assume`, etc.) is pushed into the
+/// rewritten list unchanged.  Downstream passes either handle them conservatively or leave
+/// the corresponding variable unconstrained.
+///
+/// ---
 ///
 /// Returns the final [`PointerEnv`] so that the callee-summary and memcpy injection passes
 /// can resolve actual regions for pointer arguments (see [`apply_pending_return_summaries`]
@@ -1536,6 +1708,16 @@ fn resolve_memory_effects(
     // Populated when PtrToInt is resolved; propagated through arithmetic Assigns.
     let mut flat_int_vars: HashMap<String, i64> = HashMap::new();
 
+    // Side table: SSA name → concrete function name, for virtual dispatch.
+    // Populated when a PointerLoad from a vtable region at a concrete index resolves
+    // to a known function pointer; consumed when an IndirectCall uses that name.
+    let mut fn_ptr_vars: HashMap<String, String> = HashMap::new();
+
+    // Vtable map: global region name → list of function names per vtable slot.
+    // Built eagerly from global variable initializers that look like arrays of
+    // function pointers (C++ vtables).  A None entry means null or non-function.
+    let mut vtable_fn_ptrs: HashMap<String, Vec<Option<String>>> = HashMap::new();
+
     let mut env = PointerEnv::default();
     for &param_index in &graph.pointer_param_indices {
         if let Some(param_name) = graph.params.get(param_index) {
@@ -1552,9 +1734,35 @@ fn resolve_memory_effects(
             if let Some(op) = instruction.get_operand(operand_idx) {
                 if op.is_global_variable_ref() && is_pointer_value(op) {
                     let ptr_name = local_name(function_name, op);
+                    let region = format!("global${}", op.display_name());
                     if env.get(&ptr_name).is_none() {
-                        let region = format!("global${}", op.display_name());
-                        env.bind(ptr_name, region, Term::int(0));
+                        env.bind(ptr_name, region.clone(), Term::int(0));
+                    }
+                    // Build vtable map for this global if not already done.
+                    if !vtable_fn_ptrs.contains_key(&region) {
+                        if let Some(entries) = op.constant_fn_ptr_elements() {
+                            vtable_fn_ptrs.insert(region, entries);
+                        }
+                    }
+                } else if let Some((global_name, offset)) = op.as_const_gep_of_global() {
+                    // ConstantExpr GEP of a global: e.g. the vptr value stored in a
+                    // constructor (`getelementptr @_ZTV3Foo, 0, 2`).  Bind the expression's
+                    // name so that PointerStore can propagate the vtable region through
+                    // the PointerEnv.
+                    let ptr_name = local_name(function_name, op);
+                    if env.get(&ptr_name).is_none() {
+                        let region = format!("global${global_name}");
+                        flat.add_region(region.clone());
+                        // Build vtable map for the base global too.
+                        if !vtable_fn_ptrs.contains_key(&region) {
+                            // Re-fetch the global's fn-ptr entries via the operand's base.
+                            if let Some(base_op) = op.get_operand(0) {
+                                if let Some(entries) = base_op.constant_fn_ptr_elements() {
+                                    vtable_fn_ptrs.insert(region.clone(), entries);
+                                }
+                            }
+                        }
+                        env.bind(ptr_name, region, Term::int(offset));
                     }
                 }
             }
@@ -1573,6 +1781,14 @@ fn resolve_memory_effects(
                 TransferEffect::Alloca { target, region } => {
                     env.bind(target.clone(), region.clone(), Term::int(0));
                     rewritten.push(TransferEffect::Alloca { target, region });
+                }
+                TransferEffect::HeapAlloc { result_ptr, region } => {
+                    // Bind the call result pointer to the fresh heap region and register
+                    // it in the flat layout so ptrtoint of a heap pointer gets a concrete
+                    // integer address distinct from all stack/global regions.
+                    flat.add_region(region.clone());
+                    env.bind(result_ptr.clone(), region.clone(), Term::int(0));
+                    rewritten.push(TransferEffect::HeapAlloc { result_ptr, region });
                 }
                 TransferEffect::GetElementPtr {
                     target,
@@ -1665,7 +1881,23 @@ fn resolve_memory_effects(
                     source_slot,
                 } => {
                     if let Some(binding) = env.get(&source_slot).cloned() {
-                        env.bind(target_ptr, binding.region, binding.offset);
+                        // Vtable fn-ptr lookup: if the source slot resolves to a known
+                        // global vtable region at a concrete offset, try to find the
+                        // function name at that index and record it in fn_ptr_vars.
+                        // This enables IndirectCall resolution below for virtual dispatch.
+                        let mut resolved_as_fn_ptr = false;
+                        if let Term::Int(idx) = &binding.offset {
+                            if let Some(entries) = vtable_fn_ptrs.get(&binding.region) {
+                                let i = *idx as usize;
+                                if let Some(Some(fn_name)) = entries.get(i) {
+                                    fn_ptr_vars.insert(target_ptr.clone(), fn_name.clone());
+                                    resolved_as_fn_ptr = true;
+                                }
+                            }
+                        }
+                        if !resolved_as_fn_ptr {
+                            env.bind(target_ptr, binding.region, binding.offset);
+                        }
                     } else {
                         // AA fallback: collect all abstract locations stored into every
                         // region that source_slot may point to.  If the union is a single
@@ -1686,6 +1918,25 @@ fn resolve_memory_effects(
                         // If ambiguous or unknown, leave target_ptr unbound (conservative).
                     }
                     rewritten.push(TransferEffect::Nop);
+                }
+                TransferEffect::IndirectCall {
+                    callee_ptr,
+                    memory_effect,
+                } => {
+                    // Try to resolve the indirect call to a concrete callee via the
+                    // fn_ptr_vars side table (populated by vtable PointerLoad above).
+                    if let Some(callee) = fn_ptr_vars.get(&callee_ptr) {
+                        rewritten.push(TransferEffect::Call {
+                            callee: callee.clone(),
+                            memory_effect,
+                        });
+                    } else {
+                        // Unresolved indirect call: keep as-is for conservative handling.
+                        rewritten.push(TransferEffect::IndirectCall {
+                            callee_ptr,
+                            memory_effect,
+                        });
+                    }
                 }
                 TransferEffect::PointerAlias { target, source } => {
                     if let Some(binding) = env.get(&source).cloned() {

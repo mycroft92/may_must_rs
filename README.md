@@ -200,6 +200,8 @@ src/common/alias_analysis.rs           field-sensitive flow-insensitive Andersen
                                         analysis; run once per module before lowering
 src/common/adapter.rs                  FunctionGraph → AdaptedProcedure lowering
                                         (GEP offsets, per-field struct regions,
+                                         heap call-site abstraction (HeapAlloc),
+                                         vtable fn-ptr resolution (IndirectCall),
                                          pointer environment resolution,
                                          AA-assisted PointerStore/PointerLoad binding,
                                          return summary injection, memcpy unrolling)
@@ -247,10 +249,10 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | Source locations in assertion reports (requires `-g`) | ✅ |
 | Readable counterexamples grouped by function | ✅ |
 | Floating-point lowering | ❌ |
-| Heap-allocated struct reasoning (`malloc` / `new`) | ❌ (Step 4 — AA complete; adapter wiring pending) |
+| Heap-allocated struct reasoning (`malloc` / `new` / `calloc`) | ✅ (call-site abstraction; per-field regions) |
 | General cyclic callee summaries (non-observer patterns) | ❌ |
 | Alias analysis (flow-insensitive, field-sensitive Andersen) | ✅ |
-| Virtual dispatch | ❌ (Step 5) |
+| Virtual dispatch (same-function vtable resolution) | ✅ (infrastructure done; cross-function limited) |
 | Broader cast / instruction coverage | partial |
 
 Unsupported procedures return `UNKNOWN` rather than terminating the run.
