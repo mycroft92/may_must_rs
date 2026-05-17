@@ -934,6 +934,78 @@ fn collect_select_indices_memory(memory: &Memory, indices: &mut Vec<i64>) {
     }
 }
 
+/// Collect all memory region names (`Memory::Var`) referenced anywhere in `formula`.
+///
+/// Used by the loop-relevance pre-filter in `precomputed_satisfy_exit_closure` to
+/// decide whether a loop's writes can affect the exit postcondition without running
+/// the full exit-closure SMT query.
+pub fn collect_memory_region_names(formula: &Formula) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    collect_region_names_formula(formula, &mut names);
+    names
+}
+
+fn collect_region_names_formula(formula: &Formula, out: &mut std::collections::BTreeSet<String>) {
+    match formula {
+        Formula::True | Formula::False | Formula::Var(_) => {}
+        Formula::Not(inner) => collect_region_names_formula(inner, out),
+        Formula::And(items) | Formula::Or(items) => {
+            for item in items {
+                collect_region_names_formula(item, out);
+            }
+        }
+        Formula::Implies(lhs, rhs) => {
+            collect_region_names_formula(lhs, out);
+            collect_region_names_formula(rhs, out);
+        }
+        Formula::Eq(lhs, rhs)
+        | Formula::Lt(lhs, rhs)
+        | Formula::Le(lhs, rhs)
+        | Formula::Gt(lhs, rhs)
+        | Formula::Ge(lhs, rhs) => {
+            collect_region_names_term(lhs, out);
+            collect_region_names_term(rhs, out);
+        }
+        Formula::MemoryEq(lhs, rhs) => {
+            collect_region_names_memory(lhs, out);
+            collect_region_names_memory(rhs, out);
+        }
+    }
+}
+
+fn collect_region_names_term(term: &Term, out: &mut std::collections::BTreeSet<String>) {
+    match term {
+        Term::Var(_) | Term::Int(_) | Term::Real(_) => {}
+        Term::BoolToInt(inner) => collect_region_names_formula(inner, out),
+        Term::Select(memory, index) => {
+            collect_region_names_memory(memory, out);
+            collect_region_names_term(index, out);
+        }
+        Term::Add(lhs, rhs)
+        | Term::Sub(lhs, rhs)
+        | Term::Mul(lhs, rhs)
+        | Term::Div(lhs, rhs)
+        | Term::Rem(lhs, rhs) => {
+            collect_region_names_term(lhs, out);
+            collect_region_names_term(rhs, out);
+        }
+        Term::Neg(inner) => collect_region_names_term(inner, out),
+    }
+}
+
+fn collect_region_names_memory(memory: &Memory, out: &mut std::collections::BTreeSet<String>) {
+    match memory {
+        Memory::Var(name) => {
+            out.insert(name.clone());
+        }
+        Memory::Store(inner, index, value) => {
+            collect_region_names_memory(inner, out);
+            collect_region_names_term(index, out);
+            collect_region_names_term(value, out);
+        }
+    }
+}
+
 /// Errors produced by formula sort-checking ([`Formula::validate`], [`Term::sort`]).
 ///
 /// These errors indicate a programming mistake in formula construction — they
