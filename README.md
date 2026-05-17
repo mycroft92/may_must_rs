@@ -145,14 +145,14 @@ procedure subject  [1 assertion(s), 26 instruction(s)]
     judgement: UNSAFE
     counterexample:
       [subject]
-        %12 = false
-        %8 = true
-        stack2: all elements = 0
+        cond = false
+        flag = true
   verdict: UNSAFE
 ```
 
-Source locations (`file:line:col`) are reported when the bitcode was compiled
-with `-g`.
+Source locations (`file:line:col`) and source variable names in
+counterexamples and loop-invariant logs are reported when the bitcode was
+compiled with `-g`.
 
 ---
 
@@ -248,6 +248,7 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | `llvm.memcpy` / `llvm.memset` unrolling | ✅ |
 | Source locations in assertion reports (requires `-g`) | ✅ |
 | Readable counterexamples grouped by function | ✅ |
+| Source variable names in debug/counterexample output (requires `-g`) | ✅ |
 | Floating-point lowering | ❌ |
 | Heap-allocated struct reasoning (`malloc` / `new` / `calloc`) | ✅ (call-site abstraction; per-field regions) |
 | General cyclic callee summaries (non-observer patterns) | ❌ |
