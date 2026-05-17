@@ -752,6 +752,13 @@ impl Term {
         match self {
             Term::Select(memory, index) => match memory.as_ref() {
                 Memory::Var(region) => {
+                    // Scalar regions (only accessed at offset 0) show without subscript.
+                    if matches!(index.as_ref(), Term::Int(0)) {
+                        let scalar_key = format!("{region}|scalar");
+                        if let Some(src) = names.get(&scalar_key) {
+                            return src.clone();
+                        }
+                    }
                     let src = names.get(region).map(|s| s.as_str()).unwrap_or(region);
                     format!("{src}[{}]", index.pretty(names))
                 }

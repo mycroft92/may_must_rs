@@ -53,8 +53,8 @@ use crate::may_must_analysis::llm_provider::{
 };
 use crate::may_must_analysis::loops::{
     algorithmic_candidates, chc_loop_invariant, check_loop_invariant_verbose,
-    collect_loop_body_int_constants, detect_loops, houdini_candidates, normalize_candidate,
-    sort_innermost_first, InvariantCheckResult,
+    collect_loop_body_int_constants, detect_loops, entry_safety_candidates, houdini_candidates,
+    normalize_candidate, sort_innermost_first, InvariantCheckResult,
 };
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::providers::LoopContext;
@@ -496,6 +496,34 @@ fn synthesize_loop_invariants(
                 &candidates,
                 oracle,
                 &assertion_postconditions,
+                &accepted,
+                debug_names,
+            );
+        }
+
+        if accepted_candidate.is_none() && !assertion_postconditions.is_empty() {
+            let candidates =
+                entry_safety_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
+            log::debug!(
+                target: "loop_invariant",
+                "function {function} loop {} entry-safety candidates: {}",
+                index + 1,
+                format_candidates(&candidates, debug_names)
+            );
+            // Exit closure is intentionally skipped here (empty postconditions map).
+            // Entry-safety candidates are inductive by construction; the authoritative
+            // discharge of the assertion obligation is performed by the subsequent
+            // run_backward bidirectional check — the same observer-invariant pattern
+            // used in driver.rs for cyclic callee summaries.
+            accepted_candidate = first_accepted_candidate(
+                function,
+                index + 1,
+                "entry-safety",
+                &loop_info,
+                cfg,
+                &candidates,
+                oracle,
+                &BTreeMap::new(),
                 &accepted,
                 debug_names,
             );

@@ -145,14 +145,14 @@ procedure subject  [1 assertion(s), 26 instruction(s)]
     judgement: UNSAFE
     counterexample:
       [subject]
-        %12 = false
-        %8 = true
-        stack2: all elements = 0
+        cond = false
+        flag = true
   verdict: UNSAFE
 ```
 
-Source locations (`file:line:col`) are reported when the bitcode was compiled
-with `-g`.
+Source locations (`file:line:col`) and source variable names in
+counterexamples and loop-invariant logs are reported when the bitcode was
+compiled with `-g`.
 
 ---
 
@@ -174,9 +174,12 @@ indeterminate → `UNKNOWN`.
 
 **Loop invariant synthesis** is attempted in order:
 1. Algorithmic pattern matching (counter bounds from back-edge guards).
-2. Constrained Horn Clause (CHC) solving via Z3's SPACER engine.
-3. Houdini weakening — a large template set is pruned to an inductive subset.
-4. LLM-guided CEGIS (optional, when an LLM provider is configured).
+2. Entry-safety candidates — mines `counter==init || safety` forms from
+   preheader store facts and the assertion postcondition; accepted inductively
+   with the bidirectional check discharging the assertion (Phase-B pattern).
+3. Constrained Horn Clause (CHC) solving via Z3's SPACER engine.
+4. Houdini weakening — a large template set is pruned to an inductive subset.
+5. LLM-guided CEGIS (optional, when an LLM provider is configured).
 
 **Interprocedural reasoning** uses summaries in both directions:
 - `ReturnSummary`: relates return values to inputs, inferred by backward WP.
@@ -240,6 +243,7 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | Acyclic procedure verification | ✅ |
 | Cyclic procedures with loop invariant synthesis | ✅ |
 | Loop invariants via algorithmic pattern matching | ✅ |
+| Loop invariants via entry-safety candidates (Phase-B discharge) | ✅ |
 | Loop invariants via CHC / Z3 SPACER | ✅ |
 | Loop invariants via Houdini weakening | ✅ |
 | Loop invariants via LLM-guided CEGIS | ✅ (requires LLM provider) |
@@ -248,6 +252,7 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | `llvm.memcpy` / `llvm.memset` unrolling | ✅ |
 | Source locations in assertion reports (requires `-g`) | ✅ |
 | Readable counterexamples grouped by function | ✅ |
+| Source variable names in debug/counterexample output (requires `-g`) | ✅ |
 | Floating-point lowering | ❌ |
 | Heap-allocated struct reasoning (`malloc` / `new` / `calloc`) | ✅ (call-site abstraction; per-field regions) |
 | General cyclic callee summaries (non-observer patterns) | ❌ |

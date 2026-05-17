@@ -249,6 +249,8 @@ pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula
                         push_candidate(&mut candidates, &defs, predicate.clone());
                         push_candidate(&mut candidates, &defs, Formula::not(predicate.clone()));
                         emit_counter_bounds(&mut candidates, &defs, predicate);
+                        // Generate all comparison variants (<, <=, >, >=, ==) for comparison predicates.
+                        push_comparison_variants(&mut candidates, &defs, predicate);
                         if target.sort() == Sort::Bool {
                             push_candidate(
                                 &mut candidates,
@@ -570,8 +572,44 @@ fn emit_counter_bounds(
     push_candidate(candidates, defs, Formula::and(lower, upper));
 }
 
+/// For a comparison predicate, generate all 5 operator variants with the same LHS and RHS.
+///
+/// When the loop body computes a comparison like `array[j] <= menor`, the invariant
+/// might require a different operator (`>=`) on the same operands.  Emitting all
+/// variants ensures the invariant search is not limited by which operator happened
+/// to appear in the source.
+fn push_comparison_variants(
+    candidates: &mut Vec<Formula>,
+    defs: &BTreeMap<String, AssignValue>,
+    predicate: &Formula,
+) {
+    let (lhs, rhs) = match predicate {
+        Formula::Lt(l, r)
+        | Formula::Le(l, r)
+        | Formula::Gt(l, r)
+        | Formula::Ge(l, r)
+        | Formula::Eq(l, r) => (l.clone(), r.clone()),
+        _ => return,
+    };
+    push_candidate(candidates, defs, Formula::lt(lhs.clone(), rhs.clone()));
+    push_candidate(candidates, defs, Formula::le(lhs.clone(), rhs.clone()));
+    push_candidate(candidates, defs, Formula::gt(lhs.clone(), rhs.clone()));
+    push_candidate(candidates, defs, Formula::ge(lhs.clone(), rhs.clone()));
+    push_candidate(candidates, defs, Formula::eq(lhs, rhs));
+}
+
 fn push_nontrivial(candidates: &mut Vec<Formula>, formula: Formula) {
-    if formula != Formula::True && formula != Formula::False && !candidates.contains(&formula) {
+    if formula == Formula::True || formula == Formula::False {
+        return;
+    }
+    // Skip tautological implications a => a (generated when a bool variable is substituted
+    // with its defining predicate by normalize_formula_with_defs).
+    if let Formula::Implies(lhs, rhs) = &formula {
+        if lhs == rhs {
+            return;
+        }
+    }
+    if !candidates.contains(&formula) {
         candidates.push(formula);
     }
 }
@@ -1245,6 +1283,259 @@ pub fn loop_write_regions_and_vars(
         }
     }
     (regions, vars)
+}
+
+/// Generate invariant candidates of the form `counter == init || safety`.
+///
+/// When the preheader stores a constant to a scalar region (e.g. `j = 0`) and the
+/// assertion violation at loop exit implies a safety condition (e.g. `array[0] >= menor`),
+/// the combined candidate `select(j_region, 0) == 0 || array[0] >= menor` captures
+/// invariants that neither the algorithmic nor Houdini phases generate.
+///
+/// Two candidate sets are generated:
+/// 1. **Direct**: `counter == init || NOT(violation_at_exit_target)` — uses the assertion
+///    violation formula directly without backward-propagating through the loop body.  This
+///    avoids loop-path conditions that inflate the formula and defeat inductiveness.
+/// 2. **Propagated**: `counter == init || NOT(exit_header)` — uses the violation condition
+///    backward-propagated to the header.  Included as a fallback when the direct form
+///    is too weak.
+pub fn entry_safety_candidates(
+    info: &LoopInfo,
+    cfg: &AbstractCfg,
+    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
+    inner: InnerInvariants<'_>,
+) -> Vec<Formula> {
+    let store_facts = preheader_store_facts_at_header(cfg, info.header, inner);
+    if store_facts.is_empty() {
+        return vec![];
+    }
+
+    // Collect direct violations from exit targets without backward propagation.
+    let mut direct_violations = Vec::new();
+    for exit_edge in &info.exit_edges {
+        let Ok(edge) = cfg.edge(*exit_edge) else {
+            continue;
+        };
+        let Some(postcondition) = assertion_postconditions.get(&edge.target) else {
+            continue;
+        };
+        if *postcondition == Formula::False {
+            continue;
+        }
+        direct_violations.push(postcondition.clone());
+    }
+
+    let mut candidates = Vec::new();
+
+    // Conjunction of all initial scalar store facts (e.g. `j == 0 AND SIZE == 1`).
+    // This guards the first disjunct so the exit closure can rule out SIZE == 0 etc.
+    let all_scalar_eqs: Vec<Formula> = store_facts
+        .iter()
+        .filter(|((_, offset), _)| *offset == 0)
+        .map(|((region, offset), value)| {
+            Formula::eq(
+                Term::select(Memory::var(region.clone()), Term::int(*offset)),
+                value.clone(),
+            )
+        })
+        .collect();
+
+    if !direct_violations.is_empty() {
+        let direct_safety = Formula::not(Formula::or_all(direct_violations));
+        // Combined guard: (ALL initial scalar facts) || safety
+        if !all_scalar_eqs.is_empty() {
+            push_nontrivial(
+                &mut candidates,
+                Formula::or(
+                    Formula::and_all(all_scalar_eqs.clone()),
+                    direct_safety.clone(),
+                ),
+            );
+        }
+        // Also individual: counter == init || safety (fallback for multi-counter loops)
+        for ((region, offset), value) in &store_facts {
+            if *offset != 0 {
+                continue;
+            }
+            let counter_eq = Formula::eq(
+                Term::select(Memory::var(region.clone()), Term::int(*offset)),
+                value.clone(),
+            );
+            push_nontrivial(
+                &mut candidates,
+                Formula::or(counter_eq, direct_safety.clone()),
+            );
+        }
+    }
+
+    // Also try the backward-propagated version as a fallback.
+    if let Some(exit_violation) =
+        exit_violation_at_header(info, cfg, assertion_postconditions, inner)
+    {
+        let safety = Formula::not(exit_violation);
+        if !all_scalar_eqs.is_empty() {
+            push_nontrivial(
+                &mut candidates,
+                Formula::or(Formula::and_all(all_scalar_eqs), safety.clone()),
+            );
+        }
+        for ((region, offset), value) in &store_facts {
+            if *offset != 0 {
+                continue;
+            }
+            let counter_eq = Formula::eq(
+                Term::select(Memory::var(region.clone()), Term::int(*offset)),
+                value.clone(),
+            );
+            push_nontrivial(&mut candidates, Formula::or(counter_eq, safety.clone()));
+        }
+    }
+
+    candidates
+}
+
+/// Compute the violation condition at the loop header by backward propagation from exit edges.
+///
+/// Returns `None` if there are no exit postconditions or if propagation fails.
+fn exit_violation_at_header(
+    info: &LoopInfo,
+    cfg: &AbstractCfg,
+    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
+    inner: InnerInvariants<'_>,
+) -> Option<Formula> {
+    let excluded: BTreeSet<CfgEdgeId> = cfg.detect_back_edges().into_iter().collect();
+    let mut header_violations = Vec::new();
+    for exit_edge in &info.exit_edges {
+        let Ok(edge) = cfg.edge(*exit_edge) else {
+            continue;
+        };
+        let Some(postcondition) = assertion_postconditions.get(&edge.target) else {
+            continue;
+        };
+        if *postcondition == Formula::False {
+            continue;
+        }
+        let Some(exit_requirement) = edge_source_requirement(cfg, *exit_edge, postcondition) else {
+            continue;
+        };
+        let Some(exit_states) = backward_states(
+            cfg,
+            &[(edge.source, exit_requirement)],
+            &excluded,
+            Some(&info.body),
+            true,
+            inner,
+            false,
+        ) else {
+            continue;
+        };
+        let exit_header = exit_states
+            .get(&info.header)
+            .cloned()
+            .unwrap_or(Formula::False);
+        if exit_header != Formula::False {
+            header_violations.push(exit_header);
+        }
+    }
+    if header_violations.is_empty() {
+        return None;
+    }
+    Some(Formula::or_all(header_violations))
+}
+
+/// Return store facts that hold at the loop header on first entry.
+///
+/// Runs the same forward SP pass as [`forward_reach_at_header`] but returns
+/// the accumulated concrete store facts at the header rather than the formula.
+fn preheader_store_facts_at_header(
+    cfg: &AbstractCfg,
+    header: CfgNodeId,
+    inner: InnerInvariants<'_>,
+) -> StoreFacts {
+    let all_back_edges: BTreeSet<CfgEdgeId> = cfg.detect_back_edges().into_iter().collect();
+    let Some(order) = cfg.topological_order_excluding(&all_back_edges) else {
+        return StoreFacts::new();
+    };
+    let inner_map: BTreeMap<CfgNodeId, &Formula> = inner.iter().map(|(h, inv)| (*h, inv)).collect();
+    let mut reach: BTreeMap<CfgNodeId, Formula> =
+        cfg.node_ids().map(|id| (id, Formula::False)).collect();
+    reach.insert(cfg.entry(), Formula::True);
+    let mut node_in_facts: BTreeMap<CfgNodeId, StoreFacts> = BTreeMap::new();
+    node_in_facts.insert(cfg.entry(), StoreFacts::new());
+    for (&h, &inv) in &inner_map {
+        let e = reach.entry(h).or_insert(Formula::False);
+        *e = Formula::or(e.clone(), inv.clone());
+    }
+    for &node in &order {
+        if node == header {
+            // We want the IN-facts at the header; stop processing before the header's own effects.
+            break;
+        }
+        let mut incoming_facts: Option<StoreFacts> = None;
+        for edge_id in cfg.incoming_edges(node) {
+            if all_back_edges.contains(&edge_id) {
+                continue;
+            }
+            let Ok(edge) = cfg.edge(edge_id) else {
+                continue;
+            };
+            let source_reach = reach.get(&edge.source).cloned().unwrap_or(Formula::False);
+            if source_reach == Formula::False {
+                continue;
+            }
+            let Ok(source_node) = cfg.node(edge.source) else {
+                continue;
+            };
+            let source_in = node_in_facts.get(&edge.source).cloned().unwrap_or_default();
+            let mut path_facts = source_in;
+            let source_out = apply_effects_sp(
+                &source_node.transfer.effects,
+                &source_reach,
+                &mut path_facts,
+            );
+            let guarded = Formula::and(source_out, edge.guard.clone());
+            let through_edge = apply_effects_sp(&edge.effects, &guarded, &mut path_facts);
+            let existing = reach.get(&node).cloned().unwrap_or(Formula::False);
+            reach.insert(node, Formula::or(existing, through_edge));
+            incoming_facts = Some(match incoming_facts {
+                None => path_facts,
+                Some(prev) => intersect_store_facts(prev, path_facts),
+            });
+        }
+        if let Some(facts) = incoming_facts {
+            node_in_facts.insert(node, facts);
+        }
+    }
+    // Now collect facts that arrive at the header from its non-back predecessors.
+    let mut header_incoming: Option<StoreFacts> = None;
+    for edge_id in cfg.incoming_edges(header) {
+        if all_back_edges.contains(&edge_id) {
+            continue;
+        }
+        let Ok(edge) = cfg.edge(edge_id) else {
+            continue;
+        };
+        let source_reach = reach.get(&edge.source).cloned().unwrap_or(Formula::False);
+        if source_reach == Formula::False {
+            continue;
+        }
+        let Ok(source_node) = cfg.node(edge.source) else {
+            continue;
+        };
+        let source_in = node_in_facts.get(&edge.source).cloned().unwrap_or_default();
+        let mut path_facts = source_in;
+        apply_effects_sp(
+            &source_node.transfer.effects,
+            &source_reach,
+            &mut path_facts,
+        );
+        apply_effects_sp(&edge.effects, &Formula::True, &mut path_facts);
+        header_incoming = Some(match header_incoming {
+            None => path_facts,
+            Some(prev) => intersect_store_facts(prev, path_facts),
+        });
+    }
+    header_incoming.unwrap_or_default()
 }
 
 /// are used by [`houdini_candidates`] to construct bound templates.
