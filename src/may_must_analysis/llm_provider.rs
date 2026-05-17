@@ -114,6 +114,7 @@ impl LlmCandidateProvider {
             retval_name: format!("{}$__retval", ctx.function),
             relation,
             write_effects: Vec::new(),
+            ptr_writes: Vec::new(),
         })
     }
 }

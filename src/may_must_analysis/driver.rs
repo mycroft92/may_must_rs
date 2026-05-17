@@ -35,11 +35,13 @@
 
 #![allow(dead_code)]
 
+use rayon::prelude::*;
+
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, SourceLocation};
 use crate::common::adapter::{
     adapt, adapt_with_purity_and_summaries, collect_callee_names, compute_return_summary,
-    ext_region_name, synthetic_retval_name, AdaptedProcedure, AdapterError, AssertionSite,
-    CallSummaryRegistry, ReturnSummary,
+    ext_region_name, extract_ptr_writes, ptr_write_summary_if_any, synthetic_retval_name,
+    AdaptedProcedure, AdapterError, AssertionSite, CallSummaryRegistry, ReturnSummary,
 };
 use crate::common::alias_analysis::run_alias_analysis;
 use crate::common::formula::{Formula, Memory, Term, Var};
@@ -210,6 +212,14 @@ pub fn analyze_module_with_llm(
     let alias = run_alias_analysis(graphs);
     let mut summaries = CallSummaryRegistry::new();
 
+    // Pre-scan all graphs to build the module-wide vtable map.  This ensures that vtable
+    // entries discovered in one function (e.g. a C++ constructor that stores the vptr) are
+    // available in all other functions during adaptation, even if those functions never
+    // directly reference the vtable global.
+    for graph in graphs {
+        summaries.scan_graph_vtables(graph);
+    }
+
     let in_graph = graphs
         .iter()
         .map(|graph| graph.name.clone())
@@ -368,22 +378,27 @@ pub fn analyze_with_summaries(
         .or_else(|| discover_loop_invariants(&adapted.cfg, &adapted.name, oracle));
     let precomputed = precomputed_owned.as_deref();
 
+    let site_results: Vec<_> = adapted.assertions.par_iter()
+        .map(|site| {
+            let result = if let Some(tables) = tables {
+                analyze_with_tables(
+                    &adapted.cfg,
+                    &adapted.name,
+                    site,
+                    oracle,
+                    tables,
+                    config,
+                    precomputed,
+                )
+            } else {
+                analyze(&adapted.cfg, site, oracle)
+            };
+            (site, result)
+        })
+        .collect();
     let mut assertions = Vec::new();
     let mut failures = Vec::new();
-    for site in &adapted.assertions {
-        let result = if let Some(tables) = tables {
-            analyze_with_tables(
-                &adapted.cfg,
-                &adapted.name,
-                site,
-                oracle,
-                tables,
-                config,
-                precomputed,
-            )
-        } else {
-            analyze(&adapted.cfg, site, oracle)
-        };
+    for (site, result) in site_results {
         match result {
             Ok(result) => assertions.push(result),
             Err(BackwardError::CyclicCfgUnsupported) => failures.push(format!(
@@ -412,8 +427,25 @@ fn infer_return_summary(
     adapted: &AdaptedProcedure,
     oracle: &Oracle,
 ) -> Option<ReturnSummary> {
-    compute_return_summary(graph, adapted)
+    let ptr_writes = extract_ptr_writes(graph, &adapted.name, &adapted.ptr_at);
+
+    let base = compute_return_summary(graph, adapted)
         .or_else(|| infer_cyclic_observer_summary(graph, adapted, oracle))
+        .or_else(|| {
+            // For functions whose return value has no integer formula (e.g. constructors
+            // returning void or an opaque pointer), still produce a summary if there are
+            // pointer write effects to propagate (e.g. vptr stores).
+            if ptr_writes.is_empty() {
+                None
+            } else {
+                ptr_write_summary_if_any(graph, adapted)
+            }
+        });
+
+    base.map(|mut s| {
+        s.ptr_writes = ptr_writes;
+        s
+    })
 }
 
 /// Infer a return summary for a looping function that observes an array argument.
@@ -496,6 +528,7 @@ fn infer_cyclic_observer_summary(
         retval_name,
         relation: Formula::and_all(relations),
         write_effects: Vec::new(),
+        ptr_writes: Vec::new(),
     })
 }
 
@@ -1317,6 +1350,7 @@ mod tests {
                         Term::add(Term::Var(Var::int("inc$%x")), Term::int(1)),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 });
                 let report = super::analyze_with_summaries(
                     &graphs[0],
@@ -1384,6 +1418,7 @@ mod tests {
                         Term::add(Term::Var(Var::int("inc$%x")), Term::int(1)),
                     ),
                     write_effects: Vec::new(),
+                    ptr_writes: Vec::new(),
                 };
                 let provider = ManualProvider::new().with_function_summary(summary);
                 let reports =
@@ -1531,23 +1566,29 @@ mod tests {
     }
 
     #[test]
-    fn vtable_dispatch_does_not_crash() {
-        // The vtable dispatch fixture exercises: HeapAlloc for the object (_Znwm),
-        // ConstantExpr GEP binding for the vptr store in the constructor, IndirectCall
-        // emission for the virtual call.
+    fn vtable_dispatch_verifies() {
+        // Full end-to-end virtual dispatch: new Counter(), store vptr in constructor,
+        // load vptr in caller, resolve IndirectCall via ptr_at + vtable_fn_ptrs,
+        // apply Counter::get's return summary, discharge may_assert(v == 42).
         //
-        // Current limitation: the vptr written in the constructor does not flow back
-        // to the caller because pointer write effects are not yet encoded in
-        // ReturnSummary.  The IndirectCall therefore remains unresolved, and its
-        // return value is unconstrained — Z3 can assign it 0, producing a false
-        // Unsafe verdict.  This is a known false alarm, not unsoundness in the
-        // verification direction (we never report Verified for programs that are
-        // actually unsafe).  The test just verifies the analysis runs without crashing.
+        // The ptr_at map (pointer store-to-load forwarding) propagates the vptr write
+        // from the C2 constructor through C1 to the caller, enabling the IndirectCall
+        // to resolve to _ZNK7Counter3getEv and the assertion to be Verified.
         with_bc_graphs("vtable_dispatch", |graphs| {
             let oracle = Oracle::new();
             let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
-            // Must not panic.
-            let _ = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let reports = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let main_report = reports
+                .reports
+                .iter()
+                .find(|r| r.procedure == "_Z20test_vtable_dispatchv")
+                .expect("test_vtable_dispatch function not found in reports");
+            assert_eq!(
+                main_report.verdict(),
+                SafetyVerdict::Safe,
+                "vtable dispatch should be Verified but got {:?}",
+                main_report.verdict()
+            );
         });
     }
 
