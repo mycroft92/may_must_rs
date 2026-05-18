@@ -1141,7 +1141,7 @@ pub fn observer_disjunction_candidates(
 
 /// Extract the counter variable from a back-edge guard of the form `counter < bound`
 /// or `counter <= bound`.  Returns `None` for all other guard shapes.
-fn extract_back_edge_counter(info: &LoopInfo) -> Option<Var> {
+pub(crate) fn extract_back_edge_counter(info: &LoopInfo) -> Option<Var> {
     match &info.back_edge_guard {
         Formula::Lt(Term::Var(counter), _) | Formula::Le(Term::Var(counter), _) => {
             (counter.sort() == Sort::Int).then(|| counter.clone())
@@ -1154,7 +1154,7 @@ fn extract_back_edge_counter(info: &LoopInfo) -> Option<Var> {
 ///
 /// If `formula` is `And(items)`, returns references to each item.
 /// Otherwise returns a one-element slice containing the formula itself.
-fn formula_conjuncts(formula: &Formula) -> Vec<&Formula> {
+pub(crate) fn formula_conjuncts(formula: &Formula) -> Vec<&Formula> {
     match formula {
         Formula::And(items) => items.iter().collect(),
         other => vec![other],
@@ -1204,7 +1204,7 @@ fn collect_select_indices_term(term: &Term, out: &mut Vec<Term>) {
 ///
 /// Returns `None` for compound formulas (And, Or, Implies) where precise negation
 /// would require De Morgan expansion — callers should wrap with `Formula::not` instead.
-fn negate_comparison(formula: &Formula) -> Option<Formula> {
+pub(crate) fn negate_comparison(formula: &Formula) -> Option<Formula> {
     Some(match formula {
         Formula::Lt(l, r) => Formula::ge(l.clone(), r.clone()),
         Formula::Le(l, r) => Formula::gt(l.clone(), r.clone()),

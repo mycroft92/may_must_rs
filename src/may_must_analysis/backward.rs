@@ -557,13 +557,12 @@ fn synthesize_loop_invariants(
             );
         }
 
-        // Observer phase: `counter <= k || NOT(violation_at_k)` candidates.
-        // Runs in Default (phase 2) and ObserverOnly modes.
-        // Phase A: full exit closure (preferred).
-        // Phase B: skip exit closure if Phase A fails.
+        // Observer phase: only runs in ObserverOnly mode (for diagnostic comparison).
+        // In Default mode, ACHAR subsumes observer by generating the same disjunction
+        // candidates as part of its output.
         let run_observer = accepted_candidate.is_none()
             && !assertion_postconditions.is_empty()
-            && matches!(mode, SynthesisMode::Default | SynthesisMode::ObserverOnly);
+            && *mode == SynthesisMode::ObserverOnly;
         if run_observer {
             log::debug!(
                 target: "loop_invariant",
@@ -617,8 +616,9 @@ fn synthesize_loop_invariants(
             }
         }
 
-        // ACHAR phase: grammar-guided enumeration over the loop vocabulary.
-        // Runs in Default (phase 3) and GrammarOnly modes.
+        // ACHAR phase: grammar-guided enumeration over the loop vocabulary,
+        // including observer-style disjunction candidates.
+        // Runs in Default (phase 2) and GrammarOnly modes.
         let run_achar = accepted_candidate.is_none()
             && matches!(mode, SynthesisMode::Default | SynthesisMode::GrammarOnly);
         if run_achar {
@@ -712,6 +712,11 @@ fn synthesize_loop_invariants(
                         render_invariant_result(&result)
                     );
                     if result == InvariantCheckResult::Accepted {
+                        log::info!(
+                            target: "loop_invariant",
+                            "function {function} loop {}: llm accepted invariant: {}",
+                            index + 1, pretty_formula_with_names(&candidate, debug_names)
+                        );
                         accepted_candidate = Some(candidate);
                         break;
                     }
@@ -733,11 +738,6 @@ fn synthesize_loop_invariants(
         }
 
         let candidate = accepted_candidate.expect("checked above");
-        log::info!(
-            target: "loop_invariant",
-            "function {function} loop {}: accepted invariant: {}",
-            index + 1, pretty_formula_with_names(&candidate, debug_names)
-        );
         accepted.push((loop_info.header, candidate));
     }
 
@@ -861,6 +861,13 @@ fn first_accepted_candidate(
     debug_names: &HashMap<String, String>,
 ) -> Option<Formula> {
     candidates.par_iter().find_map_any(|candidate| {
+        let normalized = normalize_candidate(cfg, loop_info.header, candidate);
+        // Skip tautologies: after WP normalization through the header, a candidate
+        // such as `%cur <= select(stack, 0)` can collapse to `select(stack, 0) <= select(stack, 0)`.
+        // Such formulas pass all checks trivially but contribute nothing to the proof.
+        if is_tautology(&normalized) {
+            return None;
+        }
         let result = check_loop_invariant_verbose(
             loop_info,
             cfg,
@@ -869,7 +876,6 @@ fn first_accepted_candidate(
             assertion_postconditions,
             accepted_inner,
         );
-        let normalized = normalize_candidate(cfg, loop_info.header, candidate);
         log::debug!(
             target: "loop_invariant",
             "function {function} loop {} {} candidate {} => {}",
@@ -878,8 +884,31 @@ fn first_accepted_candidate(
             pretty_formula_with_names(&normalized, debug_names),
             render_invariant_result(&result)
         );
-        (result == InvariantCheckResult::Accepted).then_some(normalized)
+        if result == InvariantCheckResult::Accepted {
+            log::info!(
+                target: "loop_invariant",
+                "function {function} loop {}: {} accepted invariant: {}",
+                loop_index, phase, pretty_formula_with_names(&normalized, debug_names)
+            );
+            Some(normalized)
+        } else {
+            None
+        }
     })
+}
+
+/// Return true if `formula` is a structural tautology that contributes nothing
+/// to a proof.  Checks comparison atoms where both sides are identical after
+/// normalization (e.g. `select(m, 0) <= select(m, 0)`).
+fn is_tautology(formula: &Formula) -> bool {
+    match formula {
+        Formula::Le(a, b) | Formula::Ge(a, b) | Formula::Eq(a, b) => {
+            format!("{a:?}") == format!("{b:?}")
+        }
+        Formula::And(items) => items.iter().all(is_tautology),
+        Formula::Or(items) => items.iter().any(is_tautology),
+        _ => false,
+    }
 }
 
 fn exit_postcondition_for_loop(
