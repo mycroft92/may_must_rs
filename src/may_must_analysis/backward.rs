@@ -135,6 +135,17 @@ pub enum SynthesisMode {
     GrammarOnly,
 }
 
+impl SynthesisMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SynthesisMode::Default => "default",
+            SynthesisMode::AlgorithmicOnly => "algorithmic-only",
+            SynthesisMode::ObserverOnly => "observer-only",
+            SynthesisMode::GrammarOnly => "achar-only",
+        }
+    }
+}
+
 /// Runtime configuration for the loop-invariant synthesis pass.
 pub struct InvariantConfig {
     pub llm: Option<LlmInvariantConfig>,
@@ -459,6 +470,12 @@ fn synthesize_loop_invariants(
     let mut accepted = Vec::<(CfgNodeId, Formula)>::new();
 
     for (index, loop_info) in loops.into_iter().enumerate() {
+        let loop_loc = crate::may_must_analysis::loops::fmt_loop_loc(&loop_info);
+        log::info!(
+            target: "loop_invariant",
+            "function {function} loop {} [{}]: synthesizing invariant [mode={}]",
+            index + 1, loop_loc, mode.name()
+        );
         log::debug!(
             target: "loop_invariant",
             "function {function} loop {} header {:?} body {:?}",
@@ -472,7 +489,17 @@ fn synthesize_loop_invariants(
             && !force_llm
             && *mode == SynthesisMode::AlgorithmicOnly
         {
+            log::info!(
+                target: "loop_invariant",
+                "function {function} loop {}: trying algorithmic generator",
+                index + 1
+            );
             let candidates = algorithmic_candidates(&loop_info, cfg);
+            log::debug!(
+                target: "loop_invariant",
+                "function {function} loop {} algorithmic: {} candidates",
+                index + 1, candidates.len()
+            );
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} algorithmic candidates: {}",
@@ -499,8 +526,18 @@ fn synthesize_loop_invariants(
             && !assertion_postconditions.is_empty()
             && *mode == SynthesisMode::Default
         {
+            log::info!(
+                target: "loop_invariant",
+                "function {function} loop {}: trying entry-safety generator",
+                index + 1
+            );
             let candidates =
                 entry_safety_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
+            log::debug!(
+                target: "loop_invariant",
+                "function {function} loop {} entry-safety: {} candidates",
+                index + 1, candidates.len()
+            );
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} entry-safety candidates: {}",
@@ -528,8 +565,18 @@ fn synthesize_loop_invariants(
             && !assertion_postconditions.is_empty()
             && matches!(mode, SynthesisMode::Default | SynthesisMode::ObserverOnly);
         if run_observer {
+            log::info!(
+                target: "loop_invariant",
+                "function {function} loop {}: trying observer generator",
+                index + 1
+            );
             let candidates =
                 observer_disjunction_candidates(&loop_info, cfg, assertion_postconditions);
+            log::debug!(
+                target: "loop_invariant",
+                "function {function} loop {} observer: {} candidates",
+                index + 1, candidates.len()
+            );
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} observer candidates: {}",
@@ -549,6 +596,11 @@ fn synthesize_loop_invariants(
                     debug_names,
                 );
                 if accepted_candidate.is_none() {
+                    log::debug!(
+                        target: "loop_invariant",
+                        "function {function} loop {} observer phase-A failed, trying phase-B",
+                        index + 1
+                    );
                     accepted_candidate = first_accepted_candidate(
                         function,
                         index + 1,
@@ -565,23 +617,33 @@ fn synthesize_loop_invariants(
             }
         }
 
-        // Grammar (ACHAR) phase: grammar-guided enumeration over the loop vocabulary.
+        // ACHAR phase: grammar-guided enumeration over the loop vocabulary.
         // Runs in Default (phase 3) and GrammarOnly modes.
-        let run_grammar = accepted_candidate.is_none()
+        let run_achar = accepted_candidate.is_none()
             && matches!(mode, SynthesisMode::Default | SynthesisMode::GrammarOnly);
-        if run_grammar {
+        if run_achar {
+            log::info!(
+                target: "loop_invariant",
+                "function {function} loop {}: trying achar generator",
+                index + 1
+            );
             let candidates =
                 achar::grammar_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
             log::debug!(
                 target: "loop_invariant",
-                "function {function} loop {} grammar candidates: {}",
+                "function {function} loop {} achar: {} candidates",
+                index + 1, candidates.len()
+            );
+            log::debug!(
+                target: "loop_invariant",
+                "function {function} loop {} achar candidates: {}",
                 index + 1, format_candidates(&candidates, debug_names)
             );
             if !candidates.is_empty() {
                 accepted_candidate = first_accepted_candidate(
                     function,
                     index + 1,
-                    "grammar",
+                    "achar",
                     &loop_info,
                     cfg,
                     &candidates,
@@ -597,6 +659,11 @@ fn synthesize_loop_invariants(
         // Runs in all modes (when no algorithmic phase succeeded).
         if accepted_candidate.is_none() {
             if let Some(llm) = llm_config {
+                log::info!(
+                    target: "loop_invariant",
+                    "function {function} loop {}: trying llm generator",
+                    index + 1
+                );
                 let variable_sorts = collect_variable_sorts(&loop_info, cfg);
                 let exit_postcondition =
                     exit_postcondition_for_loop(&loop_info, assertion_postconditions, cfg);
@@ -657,17 +724,18 @@ fn synthesize_loop_invariants(
         }
 
         if accepted_candidate.is_none() {
-            log::debug!(
+            log::info!(
                 target: "loop_invariant",
-                "function {function} loop {} accepted no invariant", index + 1
+                "function {function} loop {}: no invariant accepted — synthesis failed",
+                index + 1
             );
             return Err(BackwardError::CyclicCfgUnsupported);
         }
 
         let candidate = accepted_candidate.expect("checked above");
-        log::debug!(
+        log::info!(
             target: "loop_invariant",
-            "function {function} loop {} accepted invariant: {}",
+            "function {function} loop {}: accepted invariant: {}",
             index + 1, pretty_formula_with_names(&candidate, debug_names)
         );
         accepted.push((loop_info.header, candidate));
