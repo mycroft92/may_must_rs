@@ -181,6 +181,10 @@ indeterminate → `UNKNOWN`.
 4. Houdini weakening — a large template set is pruned to an inductive subset.
 5. LLM-guided CEGIS (optional, when an LLM provider is configured).
 
+Each candidate is checked for initiation, inductiveness, and (except for
+entry-safety Phase-B candidates) exit closure. See [LOOPS.md](LOOPS.md) for
+the full soundness analysis of each check.
+
 **Interprocedural reasoning** uses summaries in both directions:
 - `ReturnSummary`: relates return values to inputs, inferred by backward WP.
 - `SummaryTables`: loop invariants cached per procedure and reused by callers.
@@ -262,7 +266,9 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 
 Unsupported procedures return `UNKNOWN` rather than terminating the run.
 
-See [MEMORY_MODEL.md](MEMORY_MODEL.md) for the full roadmap and [REFERENCES.md](REFERENCES.md) for citations.
+See [LOOPS.md](LOOPS.md) for the loop invariant checking and soundness analysis,
+[MEMORY_MODEL.md](MEMORY_MODEL.md) for the full roadmap, and
+[REFERENCES.md](REFERENCES.md) for citations.
 
 ---
 
