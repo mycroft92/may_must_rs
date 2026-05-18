@@ -1,14 +1,14 @@
-//! Loop detection and loop-invariant synthesis/verification.
+//! Loop detection and loop-invariant verification.
 //!
 //! # Responsibilities
 //!
 //! 1. **Detection** — [`detect_loops`] identifies natural loops in the CFG by
 //!    finding back edges and computing the corresponding loop bodies.
 //!
-//! 2. **Candidate generation** — [`algorithmic_candidates`],
-//!    [`observer_disjunction_candidates`], and [`entry_safety_candidates`] produce
-//!    formula candidates using different strategies; the caller (in `backward.rs`)
-//!    tries them in order.
+//! 2. **Candidate generation** — [`observer_disjunction_candidates`] and
+//!    [`entry_safety_candidates`] produce formula candidates; the caller (in
+//!    `backward.rs`) tries them in order before falling through to the ACHAR
+//!    grammar enumerator in `achar.rs`.
 //!
 //! 3. **Invariant checking** — [`check_loop_invariant_verbose`] performs the
 //!    three-part soundness check for a candidate formula:
@@ -75,13 +75,6 @@ pub struct LoopInfo {
     pub back_edge_guard: Formula,
     /// Source location of the loop header, if available.
     pub source_location: Option<SourceLocation>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CounterInit {
-    Literal(i64),
-    Variable(String),
-    Unknown,
 }
 
 pub type InnerInvariants<'a> = &'a [(CfgNodeId, Formula)];
@@ -193,116 +186,6 @@ pub fn sort_innermost_first(loops: &mut [LoopInfo]) {
     loops.sort_by_key(|info| info.body.len());
 }
 
-/// Generate invariant candidates by structural pattern matching on the loop.
-///
-/// This is the fastest strategy and should be tried first.  It mines candidates
-/// from:
-/// - The back-edge guard (loop-continuation condition) and its negation.
-/// - Entry guards from the header to body nodes.
-/// - Exit edge guard negations (loop-termination conditions).
-/// - Predicate assignments in the body (and their implication forms).
-/// - Counter increment patterns (`i = i + c`) that suggest `i >= 0`.
-/// - Integer literal assignments that suggest lower-bound invariants.
-///
-/// Candidates derived from variables that have constant definitions in the loop
-/// body are simplified via substitution using [`normalize_formula_with_defs`].
-///
-/// # Strategy characteristics
-///
-/// - **Speed**: O(CFG size) — no solver queries.
-/// - **Specificity**: targets counter loops and guards.
-/// - **Limitations**: misses non-syntactic invariants.
-pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula> {
-    let defs = collect_loop_definitions(info, cfg);
-    let mut candidates = Vec::new();
-    push_candidate(&mut candidates, &defs, info.back_edge_guard.clone());
-    emit_counter_bounds(&mut candidates, &defs, &info.back_edge_guard);
-    for edge_id in cfg.outgoing_edges(info.header) {
-        if let Ok(edge) = cfg.edge(edge_id) {
-            if info.body.contains(&edge.target) {
-                push_candidate(&mut candidates, &defs, edge.guard.clone());
-                emit_counter_bounds(&mut candidates, &defs, &edge.guard);
-            }
-        }
-    }
-    for edge_id in &info.exit_edges {
-        if let Ok(edge) = cfg.edge(*edge_id) {
-            push_candidate(&mut candidates, &defs, Formula::not(edge.guard.clone()));
-            emit_counter_bounds(&mut candidates, &defs, &edge.guard);
-        }
-    }
-    for node in &info.body {
-        if let Ok(node) = cfg.node(*node) {
-            for effect in &node.transfer.effects {
-                match effect {
-                    TransferEffect::Assign {
-                        target,
-                        value: AssignValue::Predicate(predicate),
-                    } => {
-                        push_candidate(&mut candidates, &defs, predicate.clone());
-                        push_candidate(&mut candidates, &defs, Formula::not(predicate.clone()));
-                        emit_counter_bounds(&mut candidates, &defs, predicate);
-                        // Generate all comparison variants (<, <=, >, >=, ==) for comparison predicates.
-                        push_comparison_variants(&mut candidates, &defs, predicate);
-                        if target.sort() == Sort::Bool {
-                            push_candidate(
-                                &mut candidates,
-                                &defs,
-                                Formula::implies(Formula::Var(target.clone()), predicate.clone()),
-                            );
-                        }
-                    }
-                    TransferEffect::Assign {
-                        target,
-                        value: AssignValue::Term(Term::Int(value)),
-                    } if target.sort() == Sort::Int => {
-                        push_candidate(
-                            &mut candidates,
-                            &defs,
-                            Formula::ge(Term::Var(target.clone()), Term::int(*value)),
-                        );
-                    }
-                    TransferEffect::Assign {
-                        target,
-                        value: AssignValue::Term(term),
-                    } if target.sort() == Sort::Int => {
-                        if is_self_increment(target, term) {
-                            push_candidate(
-                                &mut candidates,
-                                &defs,
-                                Formula::ge(Term::Var(target.clone()), Term::int(0)),
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    candidates
-}
-
-pub fn check_loop_invariant(
-    info: &LoopInfo,
-    cfg: &AbstractCfg,
-    candidate: &Formula,
-    oracle: &Oracle,
-    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    inner: InnerInvariants<'_>,
-) -> bool {
-    matches!(
-        check_loop_invariant_verbose(
-            info,
-            cfg,
-            candidate,
-            oracle,
-            assertion_postconditions,
-            inner
-        ),
-        InvariantCheckResult::Accepted
-    )
-}
-
 /// Check a loop invariant candidate and return a detailed result.
 ///
 /// The three checks performed in order are:
@@ -350,13 +233,6 @@ pub fn check_loop_invariant_verbose(
     // preheader).  The store facts are added as `select(region, k) = value`
     // equations so the solver can determine initiation without needing to track
     // functional memory expressions across the SMT boundary.
-    //
-    // This replaces the previous approach of propagating `NOT candidate`
-    // backward from the header with all back edges excluded globally.  That
-    // backward approach under-approximated reachability for later loops in
-    // multi-loop functions (earlier loops were forced to their 0-iteration exit
-    // path), which allowed absurd candidates like `!(i < length)` to pass
-    // initiation for loop 3 when loop 1 and 2 had already exited.
     let reach_h = forward_reach_at_header(cfg, info.header, inner);
     let initiation_violation = Formula::and(reach_h, Formula::not(candidate.clone()));
     match oracle.feasibility(&initiation_violation) {
@@ -440,7 +316,6 @@ pub fn check_loop_invariant_verbose(
         // Exit closure: the invariant must be INCONSISTENT with the violation condition
         // at the exit. "I AND exit_header infeasible" means "if I holds, no violation
         // can reach the assertion through this exit" — the correct safety criterion.
-        // (The old oracle.implies check tested I ⊢ violation, which is backwards.)
         let combined = Formula::and(candidate.clone(), exit_header.clone());
         match oracle.feasibility(&combined) {
             Ok(crate::common::oracle::Feasibility::Infeasible) => {}
@@ -455,47 +330,6 @@ pub fn check_loop_invariant_verbose(
     }
 
     InvariantCheckResult::Accepted
-}
-
-fn emit_counter_bounds(
-    candidates: &mut Vec<Formula>,
-    defs: &BTreeMap<String, AssignValue>,
-    formula: &Formula,
-) {
-    let Some((counter, bound)) = extract_counter_bound(formula) else {
-        return;
-    };
-    let lower = Formula::ge(counter.clone(), Term::int(0));
-    let upper = Formula::le(counter.clone(), bound);
-    push_candidate(candidates, defs, lower.clone());
-    push_candidate(candidates, defs, upper.clone());
-    push_candidate(candidates, defs, Formula::and(lower, upper));
-}
-
-/// For a comparison predicate, generate all 5 operator variants with the same LHS and RHS.
-///
-/// When the loop body computes a comparison like `array[j] <= menor`, the invariant
-/// might require a different operator (`>=`) on the same operands.  Emitting all
-/// variants ensures the invariant search is not limited by which operator happened
-/// to appear in the source.
-fn push_comparison_variants(
-    candidates: &mut Vec<Formula>,
-    defs: &BTreeMap<String, AssignValue>,
-    predicate: &Formula,
-) {
-    let (lhs, rhs) = match predicate {
-        Formula::Lt(l, r)
-        | Formula::Le(l, r)
-        | Formula::Gt(l, r)
-        | Formula::Ge(l, r)
-        | Formula::Eq(l, r) => (l.clone(), r.clone()),
-        _ => return,
-    };
-    push_candidate(candidates, defs, Formula::lt(lhs.clone(), rhs.clone()));
-    push_candidate(candidates, defs, Formula::le(lhs.clone(), rhs.clone()));
-    push_candidate(candidates, defs, Formula::gt(lhs.clone(), rhs.clone()));
-    push_candidate(candidates, defs, Formula::ge(lhs.clone(), rhs.clone()));
-    push_candidate(candidates, defs, Formula::eq(lhs, rhs));
 }
 
 fn push_nontrivial(candidates: &mut Vec<Formula>, formula: Formula) {
@@ -514,225 +348,8 @@ fn push_nontrivial(candidates: &mut Vec<Formula>, formula: Formula) {
     }
 }
 
-fn push_candidate(
-    candidates: &mut Vec<Formula>,
-    defs: &BTreeMap<String, AssignValue>,
-    formula: Formula,
-) {
-    push_nontrivial(candidates, normalize_formula_with_defs(&formula, defs));
-}
+// ── Forward reach (initiation support) ───────────────────────────────────────
 
-fn extract_counter_bound(formula: &Formula) -> Option<(Term, Term)> {
-    match formula {
-        Formula::Lt(counter, bound) | Formula::Le(counter, bound) => {
-            matches_int_counter(counter, bound)
-        }
-        Formula::Not(inner) => match inner.as_ref() {
-            Formula::Ge(counter, bound) => matches_int_counter(counter, bound),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn matches_int_counter(counter: &Term, bound: &Term) -> Option<(Term, Term)> {
-    if !matches!(counter, Term::Var(var) if var.sort() == Sort::Int) {
-        return None;
-    }
-    if bound.sort().ok()? != Sort::Int {
-        return None;
-    }
-    Some((counter.clone(), bound.clone()))
-}
-
-fn is_self_increment(target: &Var, term: &Term) -> bool {
-    match term {
-        Term::Add(lhs, rhs) => {
-            matches_same_var(lhs, target) && matches!(rhs.as_ref(), Term::Int(_))
-                || matches_same_var(rhs, target) && matches!(lhs.as_ref(), Term::Int(_))
-        }
-        Term::Sub(lhs, rhs) => {
-            matches_same_var(lhs, target) && matches!(rhs.as_ref(), Term::Int(_))
-        }
-        _ => false,
-    }
-}
-
-fn matches_same_var(term: &Term, target: &Var) -> bool {
-    matches!(term, Term::Var(var) if var == target)
-}
-
-fn collect_loop_definitions(info: &LoopInfo, cfg: &AbstractCfg) -> BTreeMap<String, AssignValue> {
-    let mut defs = BTreeMap::new();
-    for node_id in &info.body {
-        let Ok(node) = cfg.node(*node_id) else {
-            continue;
-        };
-        for effect in &node.transfer.effects {
-            if let TransferEffect::Assign { target, value } = effect {
-                let recursive = match value {
-                    AssignValue::Term(term) => term_mentions_var(term, target.name()),
-                    AssignValue::Predicate(formula) => formula_mentions_var(formula, target.name()),
-                };
-                if !recursive {
-                    defs.insert(target.name().to_string(), value.clone());
-                }
-            }
-        }
-    }
-    defs
-}
-
-fn normalize_formula_with_defs(formula: &Formula, defs: &BTreeMap<String, AssignValue>) -> Formula {
-    match formula {
-        Formula::True => Formula::True,
-        Formula::False => Formula::False,
-        Formula::Var(var) => {
-            if let Some(AssignValue::Predicate(predicate)) = defs.get(var.name()) {
-                normalize_formula_with_defs(predicate, defs)
-            } else {
-                Formula::Var(var.clone())
-            }
-        }
-        Formula::Not(inner) => Formula::not(normalize_formula_with_defs(inner, defs)),
-        Formula::And(items) => Formula::and_all(
-            items
-                .iter()
-                .map(|item| normalize_formula_with_defs(item, defs))
-                .collect::<Vec<_>>(),
-        ),
-        Formula::Or(items) => Formula::or_all(
-            items
-                .iter()
-                .map(|item| normalize_formula_with_defs(item, defs))
-                .collect::<Vec<_>>(),
-        ),
-        Formula::Implies(lhs, rhs) => Formula::implies(
-            normalize_formula_with_defs(lhs, defs),
-            normalize_formula_with_defs(rhs, defs),
-        ),
-        Formula::Eq(lhs, rhs) => Formula::eq(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(lhs.clone(), rhs.clone()),
-        Formula::Lt(lhs, rhs) => Formula::lt(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Formula::Le(lhs, rhs) => Formula::le(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Formula::Gt(lhs, rhs) => Formula::gt(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Formula::Ge(lhs, rhs) => Formula::ge(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-    }
-}
-
-fn normalize_term_with_defs(term: &Term, defs: &BTreeMap<String, AssignValue>) -> Term {
-    match term {
-        Term::Var(var) => {
-            if let Some(AssignValue::Term(value)) = defs.get(var.name()) {
-                normalize_term_with_defs(value, defs)
-            } else {
-                Term::Var(var.clone())
-            }
-        }
-        Term::Int(value) => Term::int(*value),
-        Term::Real(value) => Term::real(*value),
-        Term::BoolToInt(inner) => Term::bool_to_int(normalize_formula_with_defs(inner, defs)),
-        Term::Select(memory, index) => Term::select(
-            memory.as_ref().clone(),
-            normalize_term_with_defs(index, defs),
-        ),
-        Term::Add(lhs, rhs) => Term::add(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Term::Sub(lhs, rhs) => Term::sub(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Term::Mul(lhs, rhs) => Term::mul(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Term::Div(lhs, rhs) => Term::div(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Term::Rem(lhs, rhs) => Term::rem(
-            normalize_term_with_defs(lhs, defs),
-            normalize_term_with_defs(rhs, defs),
-        ),
-        Term::Neg(inner) => Term::neg(normalize_term_with_defs(inner, defs)),
-    }
-}
-
-fn formula_mentions_var(formula: &Formula, name: &str) -> bool {
-    match formula {
-        Formula::True | Formula::False => false,
-        Formula::Var(var) => var.name() == name,
-        Formula::Not(inner) => formula_mentions_var(inner, name),
-        Formula::And(items) | Formula::Or(items) => {
-            items.iter().any(|item| formula_mentions_var(item, name))
-        }
-        Formula::Implies(lhs, rhs) => {
-            formula_mentions_var(lhs, name) || formula_mentions_var(rhs, name)
-        }
-        Formula::Eq(lhs, rhs)
-        | Formula::Lt(lhs, rhs)
-        | Formula::Le(lhs, rhs)
-        | Formula::Gt(lhs, rhs)
-        | Formula::Ge(lhs, rhs) => term_mentions_var(lhs, name) || term_mentions_var(rhs, name),
-        Formula::MemoryEq(_, _) => false,
-    }
-}
-
-fn term_mentions_var(term: &Term, name: &str) -> bool {
-    match term {
-        Term::Var(var) => var.name() == name,
-        Term::Int(_) | Term::Real(_) => false,
-        Term::BoolToInt(inner) => formula_mentions_var(inner, name),
-        Term::Select(_, index) => term_mentions_var(index, name),
-        Term::Add(lhs, rhs)
-        | Term::Sub(lhs, rhs)
-        | Term::Mul(lhs, rhs)
-        | Term::Div(lhs, rhs)
-        | Term::Rem(lhs, rhs) => term_mentions_var(lhs, name) || term_mentions_var(rhs, name),
-        Term::Neg(inner) => term_mentions_var(inner, name),
-    }
-}
-
-/// Compute a forward over-approximation of states at `header` on first entry.
-///
-/// Propagates SP (strongest postcondition) from the function entry through the
-/// acyclic CFG skeleton (all back edges excluded).  At inner/sibling loop
-/// headers that already have accepted invariants (from `inner`), the invariant
-/// is OR-seeded into the initial reach so that the code following those loops
-/// is not widened to `True`.
-///
-/// The result `R` satisfies: every state actually reachable at `header` on
-/// first entry (i.e. via a path that does not use `info.back_edge`) is a model
-/// of `R`.  This makes it suitable for the initiation check
-/// `R ∧ ¬candidate` infeasible ⟹ candidate holds at first entry.
-///
-/// # Approximation note
-///
-/// Sibling loops whose back edges are excluded contribute only their
-/// 0-iteration path to the reach, which is an under-approximation for variables
-/// the sibling loop modifies.  Seeding sibling headers with their invariants
-/// partially compensates: it adds the invariant as an additional OR-branch at
-/// the header, so subsequent code can propagate from a state where the invariant
-/// holds.  Variables that are unconditionally overwritten by the preheader code
-/// between the sibling loop and the current loop are unaffected by this
-/// approximation in practice.
 /// Concrete store facts accumulated during the forward SP pass.
 /// Maps `(region_name, constant_offset)` to the value last stored there.
 type StoreFacts = BTreeMap<(String, i64), Term>;
@@ -817,7 +434,6 @@ fn apply_effects_sp(effects: &[TransferEffect], pre: &Formula, facts: &mut Store
                 if matches!(memory_effect, CallMemoryEffect::HavocMemory) {
                     facts.clear();
                 }
-                // Call itself is transparent in SP (no formula change beyond memory havocing).
             }
             TransferEffect::Assign {
                 target,
@@ -843,14 +459,37 @@ fn apply_effects_sp(effects: &[TransferEffect], pre: &Formula, facts: &mut Store
             | TransferEffect::Obligation(c) => {
                 formula = Formula::and(formula, c.clone());
             }
-            // All other effects (Nop, Alloca, GEP, PointerLoad/Store/Alias, etc.)
-            // are transparent in the forward SP.
             _ => {}
         }
     }
     formula
 }
 
+/// Compute a forward over-approximation of states at `header` on first entry.
+///
+/// Propagates SP (strongest postcondition) from the function entry through the
+/// acyclic CFG skeleton (all back edges excluded).  At inner/sibling loop
+/// headers that already have accepted invariants (from `inner`), the invariant
+/// is OR-seeded into the initial reach so that the code following those loops
+/// is not widened to `True`.
+///
+/// The result `R` satisfies: every state actually reachable at `header` on
+/// first entry (i.e. via a path that does not use `info.back_edge`) is a model
+/// of `R`.  This makes it suitable for the initiation check
+/// `R ∧ ¬candidate` infeasible ⟹ candidate holds at first entry.
+///
+/// Returns the reach formula at the header's INPUT augmented with concrete
+/// `select(region, k) = value` equations from the preheader stores, putting
+/// the reach and normalised candidates in the same variable space.
+///
+/// # Approximation note
+///
+/// Sibling loops whose back edges are excluded contribute only their
+/// 0-iteration path to the reach, which is an under-approximation for variables
+/// the sibling loop modifies.  Seeding sibling headers with their invariants
+/// partially compensates: it adds the invariant as an additional OR-branch at
+/// the header, so subsequent code can propagate from a state where the invariant
+/// holds.
 fn forward_reach_at_header(
     cfg: &AbstractCfg,
     header: CfgNodeId,
@@ -858,34 +497,24 @@ fn forward_reach_at_header(
 ) -> Formula {
     let all_back_edges: BTreeSet<CfgEdgeId> = cfg.detect_back_edges().into_iter().collect();
     let Some(order) = cfg.topological_order_excluding(&all_back_edges) else {
-        // CFG has an unexpected cycle; return True (vacuously accepting) so
-        // the caller falls back to InductivenessFailed rather than accepting
-        // an uninspected candidate.
         return Formula::True;
     };
 
     let inner_map: BTreeMap<CfgNodeId, &Formula> = inner.iter().map(|(h, inv)| (*h, inv)).collect();
 
-    // reach[node] = SP formula at node's input (before the node's own effects).
     let mut reach: BTreeMap<CfgNodeId, Formula> =
         cfg.node_ids().map(|id| (id, Formula::False)).collect();
     reach.insert(cfg.entry(), Formula::True);
 
-    // node_in_facts[node] = concrete store facts at node's INPUT (before its effects),
-    // computed as the intersection of facts along all incoming non-back-edge paths.
     let mut node_in_facts: BTreeMap<CfgNodeId, StoreFacts> = BTreeMap::new();
     node_in_facts.insert(cfg.entry(), StoreFacts::new());
 
-    // Seed inner/sibling loop headers: OR their invariant into the initial
-    // state so that downstream code can reason from a state where the
-    // invariant holds, not only from the 0-iteration path.
     for (&h, &inv) in &inner_map {
         let e = reach.entry(h).or_insert(Formula::False);
         *e = Formula::or(e.clone(), inv.clone());
     }
 
     for &node in &order {
-        // Accumulated intersection of store facts from all active incoming paths.
         let mut incoming_facts: Option<StoreFacts> = None;
 
         for edge_id in cfg.incoming_edges(node) {
@@ -903,10 +532,7 @@ fn forward_reach_at_header(
                 continue;
             };
 
-            // Start from the store facts at the source node's INPUT.
             let source_in = node_in_facts.get(&edge.source).cloned().unwrap_or_default();
-
-            // Apply source-node effects: updates both formula and path_facts.
             let mut path_facts = source_in;
             let source_out = apply_effects_sp(
                 &source_node.transfer.effects,
@@ -914,36 +540,23 @@ fn forward_reach_at_header(
                 &mut path_facts,
             );
 
-            // Apply edge guard, then edge effects (phi assignments etc.).
             let guarded = Formula::and(source_out, edge.guard.clone());
             let through_edge = apply_effects_sp(&edge.effects, &guarded, &mut path_facts);
 
-            // OR the formula contribution into this node's reach.
             let existing = reach.get(&node).cloned().unwrap_or(Formula::False);
             reach.insert(node, Formula::or(existing, through_edge));
 
-            // Intersect the path facts into the incoming_facts accumulator:
-            // at a join point we can only assert facts that hold on ALL incoming paths.
             incoming_facts = Some(match incoming_facts {
                 None => path_facts,
                 Some(prev) => intersect_store_facts(prev, path_facts),
             });
         }
 
-        // Record the merged incoming facts for this node so successors can use them.
         if let Some(facts) = incoming_facts {
             node_in_facts.insert(node, facts);
         }
     }
 
-    // Return the reach at the HEADER OUTPUT (after the header's own effects).
-    // The initiation check in check_loop_invariant_verbose uses the unnormalized
-    // Candidates are normalized into header-input variable space by
-    // normalize_formula_with_defs (which substitutes header loads with
-    // select(region, k) terms).  So we return the header-INPUT formula augmented
-    // with store facts expressed as select(region, k) = value equations.  This
-    // puts the reach and the candidate in the same variable space so the solver
-    // can check initiation correctly.
     let header_in = reach.get(&header).cloned().unwrap_or(Formula::True);
     let header_in_facts = node_in_facts.get(&header).cloned().unwrap_or_default();
     header_in_facts
@@ -953,6 +566,8 @@ fn forward_reach_at_header(
             Formula::and(f, Formula::eq(select_term, value.clone()))
         })
 }
+
+// ── Backward state propagation ────────────────────────────────────────────────
 
 /// Propagate a set of seed formulas backward through the CFG and return the
 /// resulting per-node state map.
@@ -967,14 +582,6 @@ fn forward_reach_at_header(
 /// Inner loop headers supplied in `inner` are seeded with their invariants and
 /// the corresponding inner body nodes are skipped so that their transfer
 /// effects are not double-counted.
-///
-/// # Parameters
-///
-/// * `seeds` — initial state at given nodes (e.g., violation conditions).
-/// * `excluded_edges` — back edges to skip (enables topological propagation).
-/// * `restrict_to` — limit to edges within a subgraph (intra-loop analysis).
-/// * `ignore_body_guards` — suppress guards (unconditional WP for inductiveness).
-/// * `inner` — inner loop invariants (summarise their bodies).
 fn backward_states(
     cfg: &AbstractCfg,
     seeds: &[(CfgNodeId, Formula)],
@@ -1083,6 +690,8 @@ fn summarize_inner_loops(
     (headers, blocked_nodes)
 }
 
+// ── Candidate generators ──────────────────────────────────────────────────────
+
 /// Generate observer-disjunction invariant candidates: `counter <= k || NOT(violation_at_k)`.
 ///
 /// For each `select(region, k)` index term appearing in exit-edge violation formulas, and
@@ -1161,7 +770,6 @@ pub(crate) fn formula_conjuncts(formula: &Formula) -> Vec<&Formula> {
     }
 }
 
-/// Collect all `select(memory, index)` index terms that appear directly in a formula.
 fn collect_select_indices_in_formula(formula: &Formula) -> Vec<Term> {
     let mut out = Vec::new();
     collect_select_indices_formula(formula, &mut out);
@@ -1240,7 +848,6 @@ pub fn entry_safety_candidates(
         return vec![];
     }
 
-    // Collect direct violations from exit targets without backward propagation.
     let mut direct_violations = Vec::new();
     for exit_edge in &info.exit_edges {
         let Ok(edge) = cfg.edge(*exit_edge) else {
@@ -1257,8 +864,6 @@ pub fn entry_safety_candidates(
 
     let mut candidates = Vec::new();
 
-    // Conjunction of all initial scalar store facts (e.g. `j == 0 AND SIZE == 1`).
-    // This guards the first disjunct so the exit closure can rule out SIZE == 0 etc.
     let all_scalar_eqs: Vec<Formula> = store_facts
         .iter()
         .filter(|((_, offset), _)| *offset == 0)
@@ -1272,7 +877,6 @@ pub fn entry_safety_candidates(
 
     if !direct_violations.is_empty() {
         let direct_safety = Formula::not(Formula::or_all(direct_violations));
-        // Combined guard: (ALL initial scalar facts) || safety
         if !all_scalar_eqs.is_empty() {
             push_nontrivial(
                 &mut candidates,
@@ -1282,7 +886,6 @@ pub fn entry_safety_candidates(
                 ),
             );
         }
-        // Also individual: counter == init || safety (fallback for multi-counter loops)
         for ((region, offset), value) in &store_facts {
             if *offset != 0 {
                 continue;
@@ -1298,7 +901,6 @@ pub fn entry_safety_candidates(
         }
     }
 
-    // Also try the backward-propagated version as a fallback.
     if let Some(exit_violation) =
         exit_violation_at_header(info, cfg, assertion_postconditions, inner)
     {
@@ -1325,8 +927,6 @@ pub fn entry_safety_candidates(
 }
 
 /// Compute the violation condition at the loop header by backward propagation from exit edges.
-///
-/// Returns `None` if there are no exit postconditions or if propagation fails.
 fn exit_violation_at_header(
     info: &LoopInfo,
     cfg: &AbstractCfg,
@@ -1377,6 +977,7 @@ fn exit_violation_at_header(
 ///
 /// Runs the same forward SP pass as [`forward_reach_at_header`] but returns
 /// the accumulated concrete store facts at the header rather than the formula.
+/// Used by [`entry_safety_candidates`] to construct `counter == init` guards.
 fn preheader_store_facts_at_header(
     cfg: &AbstractCfg,
     header: CfgNodeId,
@@ -1398,7 +999,6 @@ fn preheader_store_facts_at_header(
     }
     for &node in &order {
         if node == header {
-            // We want the IN-facts at the header; stop processing before the header's own effects.
             break;
         }
         let mut incoming_facts: Option<StoreFacts> = None;
@@ -1436,7 +1036,6 @@ fn preheader_store_facts_at_header(
             node_in_facts.insert(node, facts);
         }
     }
-    // Now collect facts that arrive at the header from its non-back predecessors.
     let mut header_incoming: Option<StoreFacts> = None;
     for edge_id in cfg.incoming_edges(header) {
         if all_back_edges.contains(&edge_id) {
@@ -1466,73 +1065,4 @@ fn preheader_store_facts_at_header(
         });
     }
     header_incoming.unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::abstract_cfg::{AssignValue, TransferFn};
-
-    #[test]
-    fn algorithmic_candidates_include_counter_bounds() {
-        let mut cfg = AbstractCfg::new("entry");
-        let header = cfg.add_node("header", TransferFn::identity());
-        let latch = cfg.add_node(
-            "latch",
-            TransferFn::new(vec![TransferEffect::Assign {
-                target: Var::int("i"),
-                value: AssignValue::Term(Term::add(Term::var("i", Sort::Int), Term::int(1))),
-            }]),
-        );
-        let exit = cfg.add_node("exit", TransferFn::identity());
-        cfg.add_edge(cfg.entry(), header, Formula::True, vec![])
-            .unwrap();
-        cfg.add_edge(
-            header,
-            latch,
-            Formula::lt(Term::var("i", Sort::Int), Term::var("n", Sort::Int)),
-            vec![],
-        )
-        .unwrap();
-        let back_edge = cfg
-            .add_edge(
-                latch,
-                header,
-                Formula::lt(Term::var("i", Sort::Int), Term::var("n", Sort::Int)),
-                vec![],
-            )
-            .unwrap();
-        let exit_edge = cfg
-            .add_edge(
-                latch,
-                exit,
-                Formula::not(Formula::lt(
-                    Term::var("i", Sort::Int),
-                    Term::var("n", Sort::Int),
-                )),
-                vec![],
-            )
-            .unwrap();
-        let info = LoopInfo {
-            header,
-            latch,
-            back_edge,
-            body: BTreeSet::from([header, latch]),
-            exit_edges: vec![exit_edge],
-            back_edge_guard: Formula::lt(Term::var("i", Sort::Int), Term::var("n", Sort::Int)),
-            source_location: None,
-        };
-
-        let candidates = algorithmic_candidates(&info, &cfg);
-
-        assert!(candidates.contains(&Formula::ge(Term::var("i", Sort::Int), Term::int(0))));
-        assert!(candidates.contains(&Formula::le(
-            Term::var("i", Sort::Int),
-            Term::var("n", Sort::Int)
-        )));
-        assert!(candidates.contains(&Formula::and(
-            Formula::ge(Term::var("i", Sort::Int), Term::int(0)),
-            Formula::le(Term::var("i", Sort::Int), Term::var("n", Sort::Int)),
-        )));
-    }
 }

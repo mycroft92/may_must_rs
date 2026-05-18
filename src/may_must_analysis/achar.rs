@@ -27,8 +27,9 @@ use crate::may_must_analysis::loops::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Cap on pairwise conjunctions and observer-style disjunctions.
+/// Cap on pairwise conjunctions, general pairwise disjunctions, and observer disjunctions.
 const MAX_CONJUNCTIONS: usize = 60;
+const MAX_PAIRWISE_DISJ: usize = 60;
 const MAX_DISJUNCTIONS: usize = 60;
 
 /// Generate loop invariant candidates using a grammar over the loop vocabulary.
@@ -36,7 +37,8 @@ const MAX_DISJUNCTIONS: usize = 60;
 /// Candidates are returned in priority order:
 /// 1. Atoms: `lhs op rhs` over loop variables, select terms, and constants.
 /// 2. Pairwise conjunctions of atoms (capped at [`MAX_CONJUNCTIONS`]).
-/// 3. Observer-style disjunctions: `atom || NOT(violation_conjunct)` for each
+/// 3. Pairwise disjunctions of atoms (capped at [`MAX_PAIRWISE_DISJ`]).
+/// 4. Observer-style disjunctions: `atom || NOT(violation_conjunct)` for each
 ///    exit-edge violation conjunct (capped at [`MAX_DISJUNCTIONS`]).
 pub fn grammar_candidates(
     info: &LoopInfo,
@@ -51,6 +53,7 @@ pub fn grammar_candidates(
     let atoms = generate_atoms(&vocab);
     let mut candidates = atoms.clone();
     append_pairwise_conjunctions(&mut candidates, &atoms);
+    append_pairwise_disjunctions(&mut candidates, &atoms);
     append_observer_disjunctions(&mut candidates, &atoms, info, cfg, assertion_postconditions);
     candidates
 }
@@ -140,8 +143,7 @@ fn collect_term_vocab(
             selects.push(Term::Select(arr.clone(), idx.clone()));
             collect_term_vocab(idx, vars, consts, selects);
         }
-        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b)
-        | Term::Rem(a, b) => {
+        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b) | Term::Rem(a, b) => {
             collect_term_vocab(a, vars, consts, selects);
             collect_term_vocab(b, vars, consts, selects);
         }
@@ -208,8 +210,7 @@ fn collect_select_in_term(term: &Term, out: &mut Vec<Term>) {
             out.push(Term::Select(arr.clone(), idx.clone()));
             collect_select_in_term(idx, out);
         }
-        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b)
-        | Term::Rem(a, b) => {
+        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b) | Term::Rem(a, b) => {
             collect_select_in_term(a, out);
             collect_select_in_term(b, out);
         }
@@ -278,6 +279,21 @@ fn append_pairwise_conjunctions(out: &mut Vec<Formula>, atoms: &[Formula]) {
     }
 }
 
+// ── General pairwise disjunction layer ───────────────────────────────────────
+
+fn append_pairwise_disjunctions(out: &mut Vec<Formula>, atoms: &[Formula]) {
+    let mut count = 0;
+    'outer: for i in 0..atoms.len() {
+        for j in (i + 1)..atoms.len() {
+            if count >= MAX_PAIRWISE_DISJ {
+                break 'outer;
+            }
+            out.push(Formula::or(atoms[i].clone(), atoms[j].clone()));
+            count += 1;
+        }
+    }
+}
+
 // ── Observer-style disjunction layer ─────────────────────────────────────────
 
 /// Generate `atom || NOT(conjunct)` candidates for each exit-edge violation conjunct.
@@ -317,8 +333,7 @@ fn append_observer_disjunctions(
     let counter = extract_back_edge_counter(info);
     let mut count = 0;
     'outer: for conjunct in &conjuncts {
-        let negated = negate_comparison(conjunct)
-            .unwrap_or_else(|| Formula::not(conjunct.clone()));
+        let negated = negate_comparison(conjunct).unwrap_or_else(|| Formula::not(conjunct.clone()));
         out.push(negated.clone());
         // Observer's exact pattern first: counter <= k || NOT(C) for each select index k.
         if let Some(ref ctr) = counter {
@@ -373,8 +388,7 @@ fn collect_select_indices_in_formula(formula: &Formula, out: &mut Vec<Term>) {
 fn collect_select_idx_in_term(term: &Term, out: &mut Vec<Term>) {
     match term {
         Term::Select(_, index) => out.push(*index.clone()),
-        Term::Add(l, r) | Term::Sub(l, r) | Term::Mul(l, r) | Term::Div(l, r)
-        | Term::Rem(l, r) => {
+        Term::Add(l, r) | Term::Sub(l, r) | Term::Mul(l, r) | Term::Div(l, r) | Term::Rem(l, r) => {
             collect_select_idx_in_term(l, out);
             collect_select_idx_in_term(r, out);
         }

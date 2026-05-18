@@ -22,10 +22,6 @@
 //!   candidate loop invariant actually holds at all exit edges, i.e. whether
 //!   `invariant ∧ exit_condition → postcondition`.
 //!
-//! - **CHC property checking** ([`Oracle::check_chc_property`]):
-//!   delegates to the constrained Horn clause layer to verify relational properties
-//!   that span multiple procedure summaries.
-//!
 //! # Return value conventions
 //!
 //! [`Feasibility::Unknown`] and [`Validity::Unknown`] are returned when Z3 reports
@@ -37,7 +33,6 @@
 
 use crate::common::formula::{collect_select_indices, Formula, FormulaError, SmtModel};
 use crate::common::smt::solver::SmtScope;
-use crate::may_must_analysis::chc::{ChcSession, HornModel};
 use crate::may_must_analysis::node_summary::NodeSummary;
 use z3::SatResult;
 
@@ -174,26 +169,6 @@ impl Oracle {
             Feasibility::Unknown => Validity::Unknown,
         };
         Ok(result)
-    }
-
-    /// Verifies a relational `property` about `model` using the constrained Horn clause solver.
-    ///
-    /// `callee_models` provides the Horn summaries of any functions called by `model`; they
-    /// are included in the CHC session so the solver can reason about interprocedural
-    /// behaviour.  The property is checked against the named function in `model`.
-    ///
-    /// This is used when the assertion obligation spans multiple procedure calls and a simple
-    /// feasibility check on the flat abstract CFG is not sufficient.
-    pub fn check_chc_property(
-        &self,
-        model: &HornModel,
-        callee_models: &[HornModel],
-        property: &Formula,
-    ) -> Result<Validity, OracleError> {
-        let mut models = callee_models.to_vec();
-        models.push(model.clone());
-        let session = ChcSession::new(&models);
-        Ok(session.check_property(&model.function, model, property))
     }
 }
 

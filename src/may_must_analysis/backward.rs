@@ -23,18 +23,15 @@
 //! point [`analyze_with_tables`] accepts *precomputed* invariants (from a
 //! previous interprocedural pass) and falls back to [`synthesize_loop_invariants`]
 //! when none are available.  [`discover_loop_invariants`] is a lighter
-//! invariant-only path used by the interprocedural driver before full analysis.
+//! invariant-only path used by the interprocedural driver.
 //!
 //! # Invariant synthesis pipeline
 //!
 //! The active generators and their order are controlled by [`SynthesisMode`]:
 //!
-//! * **Default** (no flag): entry-safety → observer → ACHAR → LLM.
-//! * **`--algorithmic`**: only the pattern-matching phase (then LLM).
-//! * **`--inv-observer`**: only the observer-disjunction phase (then LLM).
-//! * **`--inv-grammar`**: only the ACHAR grammar phase (then LLM).
-//!
-//! Each candidate is checked with [`check_loop_invariant_verbose`] from [`loops`].
+//! * **Default** (no flag): entry-safety → ACHAR.
+//! * **`--inv-observer`**: only the observer-disjunction phase.
+//! * **`--inv-grammar`**: only the ACHAR grammar phase.
 //!
 //! Each candidate is checked with [`check_loop_invariant_verbose`] from [`loops`].
 
@@ -46,17 +43,11 @@ use crate::common::formula::{Formula, ModelValue, SmtModel};
 use crate::common::oracle::{Oracle, OracleError};
 use crate::common::source::SourceLocation;
 use crate::may_must_analysis::achar;
-use crate::may_must_analysis::llm_provider::{
-    build_full_loop_context, build_loop_invariant_prompt, collect_variable_sorts, parse_candidate,
-    CegisAttempt, LlmBackend,
-};
 use crate::may_must_analysis::loops::{
-    algorithmic_candidates, check_loop_invariant_verbose, detect_loops, entry_safety_candidates,
-    normalize_candidate, observer_disjunction_candidates, sort_innermost_first,
-    InvariantCheckResult,
+    check_loop_invariant_verbose, detect_loops, entry_safety_candidates, normalize_candidate,
+    observer_disjunction_candidates, sort_innermost_first, InvariantCheckResult,
 };
 use crate::may_must_analysis::node_summary::NodeSummary;
-use crate::may_must_analysis::providers::LoopContext;
 use crate::may_must_analysis::rules::{Judgement, RuleEngine, RuleError};
 use crate::may_must_analysis::summaries::SummaryTables;
 use rayon::prelude::*;
@@ -114,21 +105,18 @@ pub enum BackwardError {
 
 /// Selects which invariant synthesis generators are active.
 ///
-/// - `Default`: full pipeline — entry-safety → observer → ACHAR → LLM.
-/// - `AlgorithmicOnly`: only the pattern-matching phase (then LLM if configured).
-/// - `ObserverOnly`: only the observer-disjunction phase (then LLM if configured).
-/// - `GrammarOnly`: only the ACHAR grammar phase (then LLM if configured).
+/// - `Default`: full pipeline — entry-safety → ACHAR.
+/// - `ObserverOnly`: only the observer-disjunction phase.
+/// - `GrammarOnly`: only the ACHAR grammar phase.
 ///
-/// Each exclusive mode is triggered by a dedicated CLI flag. When no flag is
-/// given, `Default` runs all phases in order, stopping at the first accepted
-/// invariant.
+/// Each exclusive mode is triggered by a dedicated CLI flag (`--inv-observer`,
+/// `--inv-grammar`).  When no flag is given, `Default` runs all phases in
+/// order, stopping at the first accepted invariant.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum SynthesisMode {
-    /// Full pipeline: entry-safety → observer → ACHAR → LLM.
+    /// Full pipeline: entry-safety → ACHAR.
     #[default]
     Default,
-    /// Only the pattern-matching (algorithmic) phase.
-    AlgorithmicOnly,
     /// Only the observer-disjunction phase.
     ObserverOnly,
     /// Only the ACHAR grammar phase.
@@ -139,7 +127,6 @@ impl SynthesisMode {
     pub fn name(&self) -> &'static str {
         match self {
             SynthesisMode::Default => "default",
-            SynthesisMode::AlgorithmicOnly => "algorithmic-only",
             SynthesisMode::ObserverOnly => "observer-only",
             SynthesisMode::GrammarOnly => "achar-only",
         }
@@ -148,7 +135,6 @@ impl SynthesisMode {
 
 /// Runtime configuration for the loop-invariant synthesis pass.
 pub struct InvariantConfig {
-    pub llm: Option<LlmInvariantConfig>,
     /// Which generators are active and in what order.
     pub mode: SynthesisMode,
     /// Skip analysis of functions with more than this many instructions,
@@ -159,18 +145,10 @@ pub struct InvariantConfig {
 impl Default for InvariantConfig {
     fn default() -> Self {
         Self {
-            llm: None,
             mode: SynthesisMode::Default,
             max_function_size: 500,
         }
     }
-}
-
-pub struct LlmInvariantConfig {
-    pub backend: Box<dyn LlmBackend>,
-    pub max_tries: usize,
-    pub force: bool,
-    pub prompt_template: Option<String>,
 }
 
 pub fn analyze(
@@ -200,18 +178,18 @@ pub fn analyze(
 /// # Cyclic path
 ///
 /// 1. Back edges are detected and excluded from the topological order.
-/// 2. If `precomputed` invariants are supplied and non-empty they are used as-is
-///    (unless `force_llm` overrides them).
-/// 3. Otherwise [`synthesize_loop_invariants`] is called, which tries
-///    algorithmic, CHC, Houdini, Template, and LLM strategies in sequence.
-/// 4. The accepted invariants are injected into `reach` at loop headers before
-///    the final [`run_backward`] call.
+/// 2. If `precomputed` invariants are supplied and non-empty, exit closure is
+///    checked first; if it passes they are used directly.
+/// 3. Otherwise [`synthesize_loop_invariants`] is called with the active
+///    candidate generators (entry-safety, ACHAR).
+/// 4. Accepted invariants are injected into `reach` at loop headers before the
+///    final [`run_backward`] call.
 ///
 /// # Parameters
 ///
 /// * `tables` — interprocedural must/not-may summaries and cached loop
 ///   invariants produced by a prior module-level pass.
-/// * `config` — controls which synthesis strategies are enabled.
+/// * `config` — controls which synthesis generators are enabled.
 /// * `precomputed` — invariants computed ahead of time by the driver's
 ///   [`discover_loop_invariants`] pass; avoids redundant synthesis work.
 pub fn analyze_with_tables(
@@ -237,16 +215,13 @@ pub fn analyze_with_tables(
     }
 
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
-    let force_llm = config
-        .and_then(|config| config.llm.as_ref())
-        .is_some_and(|llm| llm.force);
 
     // Compute assertion-specific backward states once; shared by exit-closure
     // checking and synthesis so neither call repeats the backward pass.
     let assertion_postconditions = compute_preliminary_backward_states(cfg, site, &excluded)?;
 
     if let Some(precomputed) = precomputed {
-        if !precomputed.is_empty() && !force_llm {
+        if !precomputed.is_empty() {
             // config=None signals the observer pattern: invariants skip exit closure and
             // are verified by run_backward directly.  In the regular (config=Some) path,
             // check exit closure first to see whether the precomputed invariant is strong
@@ -286,7 +261,6 @@ pub fn analyze_with_tables(
         cfg,
         function,
         &assertion_postconditions,
-        &site.location,
         oracle,
         config,
         debug_names,
@@ -307,48 +281,16 @@ pub fn analyze_with_tables(
 
 /// Core bidirectional analysis pass.
 ///
-/// This function implements the combined may/must check described in the paper:
+/// Implements the combined may/must check:
 ///
-/// 1. **Forward reach injection** — for each loop header `h` the accepted loop
-///    invariant is conjuncted into `summary.reach` at `h`, establishing the
-///    forward overapproximation of reachable states.  Back edges are blocked so
-///    the [`RuleEngine`] can run in topological order.
-///
-/// 2. **Backward state seeding** — the weakest precondition of `NOT obligation`
-///    is computed at the assertion node and stored as its initial `state`.  This
-///    encodes the condition under which the assertion could be violated.
-///
-/// 3. **Fixpoint** — [`RuleEngine::run_to_fixpoint`] propagates both `reach`
-///    (forward) and `state` (backward) simultaneously using the transfer
-///    functions and edge guards of the CFG.
-///
-/// 4. **Decision** at the function entry node:
-///    - `reach AND state` satisfiable → [`Judgement::BugFound`] with a concrete
-///      model.
+/// 1. **Forward reach injection** — loop invariants are conjuncted into `reach`
+///    at loop headers; back edges are blocked so the engine runs in topological order.
+/// 2. **Backward state seeding** — WP of `NOT obligation` is set at the assertion node.
+/// 3. **Fixpoint** — [`RuleEngine::run_to_fixpoint`] propagates both directions.
+/// 4. **Decision** at the function entry:
+///    - `reach AND state` satisfiable → [`Judgement::BugFound`].
 ///    - `reach AND state` unsatisfiable → [`Judgement::Verified`].
-///    - Neither can be determined → [`Judgement::Unknown`].
-/// Core bidirectional analysis pass.
-///
-/// This function implements the combined may/must check described in the paper:
-///
-/// 1. **Forward reach injection** — for each loop header `h` the accepted loop
-///    invariant is conjuncted into `summary.reach` at `h`, establishing the
-///    forward overapproximation of reachable states.  Back edges are blocked so
-///    the [`RuleEngine`] can run in topological order.
-///
-/// 2. **Backward state seeding** — the weakest precondition of `NOT obligation`
-///    is computed at the assertion node and stored as its initial `state`.  This
-///    encodes the condition under which the assertion could be violated.
-///
-/// 3. **Fixpoint** — [`RuleEngine::run_to_fixpoint`] propagates both `reach`
-///    (forward) and `state` (backward) simultaneously using the transfer
-///    functions and edge guards of the CFG.
-///
-/// 4. **Decision** at the function entry node:
-///    - `reach AND state` satisfiable → [`Judgement::BugFound`] with a concrete
-///      model.
-///    - `reach AND state` unsatisfiable → [`Judgement::Verified`].
-///    - Neither can be determined → [`Judgement::Unknown`].
+///    - Neither → [`Judgement::Unknown`].
 fn run_backward(
     cfg: &AbstractCfg,
     site: &AssertionSite,
@@ -424,27 +366,18 @@ pub fn discover_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
     oracle: &Oracle,
+    config: Option<&InvariantConfig>,
     debug_names: &HashMap<String, String>,
 ) -> Option<Vec<(CfgNodeId, Formula)>> {
-    synthesize_loop_invariants(
-        cfg,
-        function,
-        &BTreeMap::new(),
-        "",
-        oracle,
-        None,
-        debug_names,
-    )
-    .ok()
+    synthesize_loop_invariants(cfg, function, &BTreeMap::new(), oracle, config, debug_names).ok()
 }
 
 /// Invariant synthesis pipeline for a cyclic CFG.
 ///
 /// Accepts `assertion_postconditions` (WP of `NOT obligation` propagated
-/// backward with back edges blocked) and an optional `assertion_location` string
-/// for LLM context.  Pass `&BTreeMap::new()` and `""` from
+/// backward with back edges blocked).  Pass `&BTreeMap::new()` from
 /// [`discover_loop_invariants`] (the pre-pass with no assertion site); pass
-/// the computed postconditions and the site label from [`analyze_with_tables`].
+/// the computed postconditions from [`analyze_with_tables`].
 ///
 /// For each detected loop (innermost-first) the function tries the enabled
 /// candidate strategies in order.  When `assertion_postconditions` is empty,
@@ -457,7 +390,6 @@ fn synthesize_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
     assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    assertion_location: &str,
     oracle: &Oracle,
     config: Option<&InvariantConfig>,
     debug_names: &HashMap<String, String>,
@@ -465,8 +397,6 @@ fn synthesize_loop_invariants(
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
     let mode = config.map(|c| &c.mode).unwrap_or(&SynthesisMode::Default);
-    let llm_config = config.and_then(|c| c.llm.as_ref());
-    let force_llm = llm_config.is_some_and(|llm| llm.force);
     let mut accepted = Vec::<(CfgNodeId, Formula)>::new();
 
     for (index, loop_info) in loops.into_iter().enumerate() {
@@ -482,42 +412,6 @@ fn synthesize_loop_invariants(
             index + 1, loop_info.header, loop_info.body
         );
         let mut accepted_candidate = None;
-
-        // Algorithmic phase: pattern-matched candidates from guards and body effects.
-        // Only runs in AlgorithmicOnly mode.
-        if accepted_candidate.is_none()
-            && !force_llm
-            && *mode == SynthesisMode::AlgorithmicOnly
-        {
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {}: trying algorithmic generator",
-                index + 1
-            );
-            let candidates = algorithmic_candidates(&loop_info, cfg);
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} algorithmic: {} candidates",
-                index + 1, candidates.len()
-            );
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} algorithmic candidates: {}",
-                index + 1, format_candidates(&candidates, debug_names)
-            );
-            accepted_candidate = first_accepted_candidate(
-                function,
-                index + 1,
-                "algorithmic",
-                &loop_info,
-                cfg,
-                &candidates,
-                oracle,
-                assertion_postconditions,
-                &accepted,
-                debug_names,
-            );
-        }
 
         // Entry-safety phase: `init_fact || safety` candidates.
         // Runs in Default mode (phase 1 of the default pipeline).
@@ -652,79 +546,6 @@ fn synthesize_loop_invariants(
                     &accepted,
                     debug_names,
                 );
-            }
-        }
-
-        // LLM CEGIS — if configured, queries an LLM with CEGIS feedback.
-        // Runs in all modes (when no algorithmic phase succeeded).
-        if accepted_candidate.is_none() {
-            if let Some(llm) = llm_config {
-                log::debug!(
-                    target: "loop_invariant",
-                    "function {function} loop {}: trying llm generator",
-                    index + 1
-                );
-                let variable_sorts = collect_variable_sorts(&loop_info, cfg);
-                let exit_postcondition =
-                    exit_postcondition_for_loop(&loop_info, assertion_postconditions, cfg);
-                let mut attempts = Vec::<CegisAttempt>::new();
-                for _ in 0..llm.max_tries.max(1) {
-                    let ctx = build_full_loop_context(
-                        LoopContext {
-                            function: function.to_string(),
-                            loop_id: index + 1,
-                        },
-                        &loop_info,
-                        cfg,
-                        assertion_location.to_string(),
-                        exit_postcondition.clone(),
-                        attempts.clone(),
-                    );
-                    let prompt = build_loop_invariant_prompt(&ctx, llm.prompt_template.as_deref());
-                    let Some(raw) = llm.backend.propose(&prompt) else {
-                        log::debug!(
-                            target: "loop_invariant",
-                            "function {function} loop {} llm candidate: <none>", index + 1
-                        );
-                        continue;
-                    };
-                    let Some(candidate) = parse_candidate(&raw, &variable_sorts) else {
-                        log::debug!(
-                            target: "loop_invariant",
-                            "function {function} loop {} llm candidate parse failed: {}",
-                            index + 1, raw.trim()
-                        );
-                        continue;
-                    };
-                    let result = check_loop_invariant_verbose(
-                        &loop_info,
-                        cfg,
-                        &candidate,
-                        oracle,
-                        assertion_postconditions,
-                        &accepted,
-                    );
-                    log::debug!(
-                        target: "loop_invariant",
-                        "function {function} loop {} llm candidate {} => {}",
-                        index + 1,
-                        pretty_formula_with_names(&candidate, debug_names),
-                        render_invariant_result(&result)
-                    );
-                    if result == InvariantCheckResult::Accepted {
-                        log::info!(
-                            target: "loop_invariant",
-                            "function {function} loop {}: llm accepted invariant: {}",
-                            index + 1, pretty_formula_with_names(&candidate, debug_names)
-                        );
-                        accepted_candidate = Some(candidate);
-                        break;
-                    }
-                    attempts.push(CegisAttempt {
-                        candidate,
-                        failure: render_invariant_result(&result),
-                    });
-                }
             }
         }
 
@@ -897,39 +718,59 @@ fn first_accepted_candidate(
     })
 }
 
-/// Return true if `formula` is a structural tautology that contributes nothing
-/// to a proof.  Checks comparison atoms where both sides are identical after
-/// normalization (e.g. `select(m, 0) <= select(m, 0)`).
+/// Return true if `formula` is a tautology that contributes nothing to a proof.
+///
+/// Checks two classes:
+/// * Structural: both sides of a comparison are identical (e.g. `x <= x`).
+/// * Complementary disjunctions: two atoms in an `Or` together cover all
+///   integers, e.g. `(a <= b) || (b <= a)` (total order) or
+///   `(a < b) || (a >= b)` (complement). These pass all invariant checks
+///   trivially but encode no information about program state.
 fn is_tautology(formula: &Formula) -> bool {
     match formula {
         Formula::Le(a, b) | Formula::Ge(a, b) | Formula::Eq(a, b) => {
             format!("{a:?}") == format!("{b:?}")
         }
         Formula::And(items) => items.iter().all(is_tautology),
-        Formula::Or(items) => items.iter().any(is_tautology),
+        Formula::Or(items) => {
+            if items.iter().any(is_tautology) {
+                return true;
+            }
+            // Check all pairs for complementary coverage.
+            for i in 0..items.len() {
+                for j in (i + 1)..items.len() {
+                    if atoms_cover_all_integers(&items[i], &items[j]) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
         _ => false,
     }
 }
 
-fn exit_postcondition_for_loop(
-    loop_info: &crate::may_must_analysis::loops::LoopInfo,
-    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    cfg: &AbstractCfg,
-) -> Formula {
-    let mut postconditions = Vec::new();
-    for edge_id in &loop_info.exit_edges {
-        let Ok(edge) = cfg.edge(*edge_id) else {
-            continue;
-        };
-        let Some(postcondition) = assertion_postconditions.get(&edge.target) else {
-            continue;
-        };
-        if *postcondition == Formula::False {
-            continue;
+/// Return true if `f1 || f2` is always true for integer-valued terms.
+///
+/// Covers two patterns:
+/// * Complementary ops with the same terms: `a < b || a >= b`, `a <= b || a > b`.
+/// * Total-order swapped: `a <= b || b <= a` (integers are totally ordered).
+fn atoms_cover_all_integers(f1: &Formula, f2: &Formula) -> bool {
+    let key = |a: &crate::common::formula::Term, b: &crate::common::formula::Term| {
+        (format!("{a:?}"), format!("{b:?}"))
+    };
+    match (f1, f2) {
+        // Complementary: f1 and f2 partition the integer line.
+        (Formula::Lt(a1, b1), Formula::Ge(a2, b2))
+        | (Formula::Ge(a1, b1), Formula::Lt(a2, b2))
+        | (Formula::Le(a1, b1), Formula::Gt(a2, b2))
+        | (Formula::Gt(a1, b1), Formula::Le(a2, b2)) => key(a1, b1) == key(a2, b2),
+        // Swapped total-order: Le(a,b) || Le(b,a) = a<=b || b<=a = True.
+        (Formula::Le(a1, b1), Formula::Le(a2, b2)) | (Formula::Ge(a1, b1), Formula::Ge(a2, b2)) => {
+            key(a1, b1) == key(b2, a2)
         }
-        postconditions.push(postcondition.clone());
+        _ => false,
     }
-    Formula::or_all(postconditions)
 }
 
 fn render_invariant_result(result: &InvariantCheckResult) -> String {

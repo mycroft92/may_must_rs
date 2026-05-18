@@ -13,14 +13,10 @@
 //! 2. **Call order / recursion detection** — [`recursive_functions`] identifies
 //!    mutually recursive functions so their summaries can be flagged.
 //!
-//! 3. **Loop invariant pre-computation** — before the per-assertion backward
-//!    pass, [`discover_loop_invariants`] is called for each looping function.
-//!    The results are cached in [`SummaryTables`] and reused across multiple
-//!    assertions in the same function.
-//!
-//! 4. **Per-function verification** — [`analyze_with_summaries`] lowers a
-//!    [`FunctionGraph`] via the adapter, retrieves or synthesises loop
-//!    invariants, and calls [`analyze_with_tables`] for each [`AssertionSite`].
+//! 3. **Per-function verification** — [`analyze_with_summaries`] lowers a
+//!    [`FunctionGraph`] via the adapter, synthesises loop invariants once per
+//!    function via [`discover_loop_invariants`], and calls [`analyze_with_tables`]
+//!    for each [`AssertionSite`].
 //!
 //! # Observer pattern for cyclic callees
 //!
@@ -198,9 +194,7 @@ pub fn analyze_module_with_provider(
 /// 2. Iteratively infer [`ReturnSummary`] entries for all in-module functions
 ///    (up to `graphs.len()` rounds to converge mutual calls).
 /// 3. Convert inferred summaries to must/not-may entries in [`SummaryTables`].
-/// 4. Pre-compute and cache loop invariants for every looping function via
-///    [`discover_loop_invariants`].
-/// 5. Run [`analyze_with_summaries`] for each function using `inv_config` to
+/// 4. Run [`analyze_with_summaries`] for each function using `inv_config` to
 ///    control the invariant search, and collect per-procedure reports.
 pub fn analyze_module_with_llm(
     graphs: &[FunctionGraph],
@@ -265,24 +259,6 @@ pub fn analyze_module_with_llm(
         );
     }
     let mut reports = Vec::new();
-    for graph in graphs {
-        let adapted = if summaries.is_empty() && memory_pure.is_empty() {
-            adapt(graph)
-        } else {
-            adapt_with_purity_and_summaries(graph, memory_pure, &summaries, &alias)
-        };
-        let Ok(adapted) = adapted else {
-            continue;
-        };
-        if adapted.cfg.topological_order().is_some() {
-            continue;
-        }
-        if let Some(invariants) =
-            discover_loop_invariants(&adapted.cfg, &adapted.name, oracle, &adapted.debug_names)
-        {
-            summary_tables.set_loop_invariants(adapted.name.clone(), invariants);
-        }
-    }
     for graph in graphs {
         let report = match analyze_with_summaries(
             graph,
@@ -378,7 +354,13 @@ pub fn analyze_with_summaries(
             (!invariants.is_empty()).then(|| invariants.to_vec())
         })
         .or_else(|| {
-            discover_loop_invariants(&adapted.cfg, &adapted.name, oracle, &adapted.debug_names)
+            discover_loop_invariants(
+                &adapted.cfg,
+                &adapted.name,
+                oracle,
+                config,
+                &adapted.debug_names,
+            )
         });
     let precomputed = precomputed_owned.as_deref();
 
@@ -1482,10 +1464,6 @@ mod tests {
                     .find(|procedure| procedure.procedure == "subject")
                     .expect("subject procedure report");
                 assert_eq!(subject.verdict(), SafetyVerdict::Safe);
-                assert!(
-                    !report.summaries.get_loop_invariants("subject").is_empty(),
-                    "expected a loop invariant to be stored"
-                );
             },
         );
     }

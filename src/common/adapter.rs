@@ -3082,62 +3082,6 @@ fn memory_contains_var(memory: &crate::common::formula::Memory, name: &str) -> b
     }
 }
 
-/// Constructs a [`HornModel`] from the function's return summary for use by the CHC solver.
-///
-/// The Horn model packages the return-summary relation together with the function's formal
-/// parameter variables and any call references whose results appear in the summary formula.
-/// It is consumed by the CHC layer to verify relational properties across call chains.
-///
-/// Returns `None` when [`compute_return_summary`] returns `None` (void functions, functions
-/// with no integer return, or functions with unresolved cycles).
-pub fn build_horn_model(
-    graph: &FunctionGraph,
-    procedure: &AdaptedProcedure,
-) -> Option<crate::may_must_analysis::chc::HornModel> {
-    let summary = compute_return_summary(graph, procedure)?;
-    let retval_var = Var::int(summary.retval_name.clone());
-    let params = summary
-        .formal_parameters
-        .iter()
-        .map(|name| Var::int(name.clone()))
-        .collect::<Vec<_>>();
-    let call_refs = graph
-        .vertices
-        .iter()
-        .filter_map(|instruction| {
-            if instruction.get_opcode() != InstructionOpcode::Call {
-                return None;
-            }
-            let callee = instruction.get_called_function()?;
-            if callee == "may_assert" || callee.starts_with("llvm.") {
-                return None;
-            }
-            let result_var = Var::int(local_name(&graph.name, *instruction));
-            if !formula_contains_var(&summary.relation, result_var.name()) {
-                return None;
-            }
-            let actual_args = instruction
-                .get_call_args()
-                .into_iter()
-                .filter_map(|arg| lower_numeric_value(&graph.name, arg).ok())
-                .collect::<Vec<_>>();
-            Some(crate::may_must_analysis::chc::CallRef {
-                callee,
-                actual_args,
-                result_var,
-                result_sort: Sort::Int,
-            })
-        })
-        .collect();
-    Some(crate::may_must_analysis::chc::HornModel {
-        function: summary.function,
-        params,
-        retval_var,
-        summary_formula: summary.relation,
-        call_refs,
-    })
-}
-
 /// Upper bound (inclusive) on the result of a `zext` from a `w`-bit unsigned integer.
 /// Returns `None` if the value doesn't fit in `i64` (i.e. `w >= 64`).
 fn zext_upper_bound(w: u32) -> Option<i64> {

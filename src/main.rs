@@ -10,15 +10,10 @@ use common::llvm_utils::llvm_wrap::{initialize_target, Context, Module};
 use common::llvm_utils::program_graph::{dump_graphs, generate_program_graph, FunctionGraph};
 use common::oracle::Oracle;
 use env_logger::{Builder, Env};
-use may_must_analysis::backward::{self, InvariantConfig, LlmInvariantConfig, SynthesisMode};
+use may_must_analysis::backward::{self, InvariantConfig, SynthesisMode};
 use may_must_analysis::driver::{ModuleReport, SafetyVerdict};
-use may_must_analysis::llm_provider::SubprocessLlmBackend;
 use may_must_analysis::providers::NoProvider;
 use std::path::Path;
-
-const DEFAULT_LLM_SCRIPT: &str = "tools/llm_invariant.py";
-const DEFAULT_LLM_MODEL: &str = "gpt-5.3";
-const DEFAULT_LLM_TRIES: usize = 5;
 
 fn main() {
     let version = concat!(
@@ -39,32 +34,6 @@ fn main() {
         .arg(arg!(--"show-summaries" "Print inferred summaries"))
         .arg(arg!(--"debug-invariants" "Enable loop invariant debug logging"))
         .arg(arg!(--"diff-debug" "Print each rule firing and new predicates added"))
-        .arg(arg!(--"llm-invariants" "Ask an LLM backend for loop invariants"))
-        .arg(arg!(--"llm-force" "Use LLM invariant search before all other phases"))
-        .arg(
-            arg!(--"llm-tries" <N> "Maximum LLM invariant proposals")
-                .required(false)
-                .value_parser(value_parser!(usize))
-                .default_value("5"),
-        )
-        .arg(
-            arg!(--"llm-model" <MODEL> "LLM backend model name")
-                .required(false)
-                .value_parser(value_parser!(String))
-                .default_value(DEFAULT_LLM_MODEL),
-        )
-        .arg(
-            arg!(--"llm-script" <PATH> "LLM subprocess script")
-                .required(false)
-                .value_parser(value_parser!(String))
-                .default_value(DEFAULT_LLM_SCRIPT),
-        )
-        .arg(
-            arg!(--"llm-prompt-template" <FILE> "Prompt template file")
-                .required(false)
-                .value_parser(value_parser!(String)),
-        )
-        .arg(arg!(--"algorithmic" "Run only the pattern-matching invariant phase"))
         .arg(arg!(--"inv-observer" "Run only the observer-disjunction invariant phase"))
         .arg(arg!(--"inv-grammar" "Run only the ACHAR grammar-based invariant phase"))
         .arg(
@@ -113,37 +82,11 @@ fn init_logging(debug_invariants: bool, diff_debug: bool) {
 }
 
 fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
-    let llm_enabled = matches.get_flag("llm-invariants") || matches.get_flag("llm-force");
-    let llm = llm_enabled.then(|| {
-        let script_path = matches
-            .get_one::<String>("llm-script")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_LLM_SCRIPT.to_string());
-        let model = matches
-            .get_one::<String>("llm-model")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
-        let max_tries = *matches
-            .get_one::<usize>("llm-tries")
-            .unwrap_or(&DEFAULT_LLM_TRIES);
-        let prompt_template = matches
-            .get_one::<String>("llm-prompt-template")
-            .and_then(|path| std::fs::read_to_string(path).ok());
-        LlmInvariantConfig {
-            backend: Box::new(SubprocessLlmBackend { script_path, model }),
-            max_tries,
-            force: matches.get_flag("llm-force"),
-            prompt_template,
-        }
-    });
-
     let max_function_size = *matches
         .get_one::<usize>("max-function-size")
         .unwrap_or(&500);
 
-    let mode = if matches.get_flag("algorithmic") {
-        SynthesisMode::AlgorithmicOnly
-    } else if matches.get_flag("inv-observer") {
+    let mode = if matches.get_flag("inv-observer") {
         SynthesisMode::ObserverOnly
     } else if matches.get_flag("inv-grammar") {
         SynthesisMode::GrammarOnly
@@ -152,7 +95,6 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
     };
 
     InvariantConfig {
-        llm,
         mode,
         max_function_size,
     }
