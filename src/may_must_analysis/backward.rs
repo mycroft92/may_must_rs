@@ -489,7 +489,7 @@ fn synthesize_loop_invariants(
             && !force_llm
             && *mode == SynthesisMode::AlgorithmicOnly
         {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: trying algorithmic generator",
                 index + 1
@@ -526,7 +526,7 @@ fn synthesize_loop_invariants(
             && !assertion_postconditions.is_empty()
             && *mode == SynthesisMode::Default
         {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: trying entry-safety generator",
                 index + 1
@@ -565,7 +565,7 @@ fn synthesize_loop_invariants(
             && !assertion_postconditions.is_empty()
             && matches!(mode, SynthesisMode::Default | SynthesisMode::ObserverOnly);
         if run_observer {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: trying observer generator",
                 index + 1
@@ -622,7 +622,7 @@ fn synthesize_loop_invariants(
         let run_achar = accepted_candidate.is_none()
             && matches!(mode, SynthesisMode::Default | SynthesisMode::GrammarOnly);
         if run_achar {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: trying achar generator",
                 index + 1
@@ -659,7 +659,7 @@ fn synthesize_loop_invariants(
         // Runs in all modes (when no algorithmic phase succeeded).
         if accepted_candidate.is_none() {
             if let Some(llm) = llm_config {
-                log::info!(
+                log::debug!(
                     target: "loop_invariant",
                     "function {function} loop {}: trying llm generator",
                     index + 1
