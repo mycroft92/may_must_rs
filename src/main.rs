@@ -10,7 +10,7 @@ use common::llvm_utils::llvm_wrap::{initialize_target, Context, Module};
 use common::llvm_utils::program_graph::{dump_graphs, generate_program_graph, FunctionGraph};
 use common::oracle::Oracle;
 use env_logger::{Builder, Env};
-use may_must_analysis::backward::{self, InvariantConfig, LlmInvariantConfig};
+use may_must_analysis::backward::{self, InvariantConfig, LlmInvariantConfig, SynthesisMode};
 use may_must_analysis::driver::{ModuleReport, SafetyVerdict};
 use may_must_analysis::llm_provider::SubprocessLlmBackend;
 use may_must_analysis::providers::NoProvider;
@@ -40,7 +40,7 @@ fn main() {
         .arg(arg!(--"debug-invariants" "Enable loop invariant debug logging"))
         .arg(arg!(--"diff-debug" "Print each rule firing and new predicates added"))
         .arg(arg!(--"llm-invariants" "Ask an LLM backend for loop invariants"))
-        .arg(arg!(--"llm-force" "Use LLM invariant search before algorithmic search"))
+        .arg(arg!(--"llm-force" "Use LLM invariant search before all other phases"))
         .arg(
             arg!(--"llm-tries" <N> "Maximum LLM invariant proposals")
                 .required(false)
@@ -64,7 +64,9 @@ fn main() {
                 .required(false)
                 .value_parser(value_parser!(String)),
         )
-        .arg(arg!(--"inv-grammar" "Enable grammar-based (ACHAR) invariant synthesis"))
+        .arg(arg!(--"algorithmic" "Run only the pattern-matching invariant phase"))
+        .arg(arg!(--"inv-observer" "Run only the observer-disjunction invariant phase"))
+        .arg(arg!(--"inv-grammar" "Run only the ACHAR grammar-based invariant phase"))
         .arg(
             arg!(--"max-function-size" <N> "Skip analysis of functions with more than N instructions (default: 500; 0 = unlimited)")
                 .required(false)
@@ -139,10 +141,19 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
         .get_one::<usize>("max-function-size")
         .unwrap_or(&500);
 
+    let mode = if matches.get_flag("algorithmic") {
+        SynthesisMode::AlgorithmicOnly
+    } else if matches.get_flag("inv-observer") {
+        SynthesisMode::ObserverOnly
+    } else if matches.get_flag("inv-grammar") {
+        SynthesisMode::GrammarOnly
+    } else {
+        SynthesisMode::Default
+    };
+
     InvariantConfig {
         llm,
-        skip_algorithmic: false,
-        grammar: matches.get_flag("inv-grammar"),
+        mode,
         max_function_size,
     }
 }

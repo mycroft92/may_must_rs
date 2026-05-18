@@ -27,19 +27,14 @@
 //!
 //! # Invariant synthesis pipeline
 //!
-//! For each loop (innermost-first) the following phases are tried in order:
+//! The active generators and their order are controlled by [`SynthesisMode`]:
 //!
-//! 1. **Algorithmic** — pattern-matched candidates from loop guards and body effects.
-//!    Checked with full exit closure.
-//! 2. **Observer disjunction** — `counter <= k || NOT(violation_at_k)` candidates
-//!    derived from `select` terms in exit-edge violation formulas.  Tried with full
-//!    exit closure first (Phase A); falls back to Phase-B (skip exit closure, rely
-//!    on `run_backward`) when exit closure fails (e.g. due to HavocMemory).
-//! 3. **Init-disjunction** — `init_fact || safety` fallback when no counter pattern
-//!    is present.  Always uses Phase-B.
-//! 4. **Grammar** (stub) — ACHAR-style grammar-based synthesis; currently returns
-//!    no candidates.
-//! 5. **LLM CEGIS** — if configured, queries an LLM backend with CEGIS feedback.
+//! * **Default** (no flag): entry-safety → observer → ACHAR → LLM.
+//! * **`--algorithmic`**: only the pattern-matching phase (then LLM).
+//! * **`--inv-observer`**: only the observer-disjunction phase (then LLM).
+//! * **`--inv-grammar`**: only the ACHAR grammar phase (then LLM).
+//!
+//! Each candidate is checked with [`check_loop_invariant_verbose`] from [`loops`].
 //!
 //! Each candidate is checked with [`check_loop_invariant_verbose`] from [`loops`].
 
@@ -117,16 +112,34 @@ pub enum BackwardError {
     Oracle(#[from] OracleError),
 }
 
-/// Runtime configuration for the loop-invariant synthesis pass.
+/// Selects which invariant synthesis generators are active.
 ///
-/// `skip_algorithmic` suppresses the fast pattern-based phase.  `grammar`
-/// enables the ACHAR grammar-based synthesis phase (currently a stub).
-/// When `llm` is `Some` and `force` is set, LLM CEGIS runs before algorithmic.
+/// - `Default`: full pipeline — entry-safety → observer → ACHAR → LLM.
+/// - `AlgorithmicOnly`: only the pattern-matching phase (then LLM if configured).
+/// - `ObserverOnly`: only the observer-disjunction phase (then LLM if configured).
+/// - `GrammarOnly`: only the ACHAR grammar phase (then LLM if configured).
+///
+/// Each exclusive mode is triggered by a dedicated CLI flag. When no flag is
+/// given, `Default` runs all phases in order, stopping at the first accepted
+/// invariant.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum SynthesisMode {
+    /// Full pipeline: entry-safety → observer → ACHAR → LLM.
+    #[default]
+    Default,
+    /// Only the pattern-matching (algorithmic) phase.
+    AlgorithmicOnly,
+    /// Only the observer-disjunction phase.
+    ObserverOnly,
+    /// Only the ACHAR grammar phase.
+    GrammarOnly,
+}
+
+/// Runtime configuration for the loop-invariant synthesis pass.
 pub struct InvariantConfig {
     pub llm: Option<LlmInvariantConfig>,
-    pub skip_algorithmic: bool,
-    /// Enable the grammar-based (ACHAR) synthesis phase.
-    pub grammar: bool,
+    /// Which generators are active and in what order.
+    pub mode: SynthesisMode,
     /// Skip analysis of functions with more than this many instructions,
     /// returning UNKNOWN immediately. 0 means unlimited.
     pub max_function_size: usize,
@@ -136,8 +149,7 @@ impl Default for InvariantConfig {
     fn default() -> Self {
         Self {
             llm: None,
-            skip_algorithmic: false,
-            grammar: false,
+            mode: SynthesisMode::Default,
             max_function_size: 500,
         }
     }
@@ -441,7 +453,7 @@ fn synthesize_loop_invariants(
 ) -> Result<Vec<(CfgNodeId, Formula)>, BackwardError> {
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
-    let skip_algorithmic = config.is_some_and(|c| c.skip_algorithmic);
+    let mode = config.map(|c| &c.mode).unwrap_or(&SynthesisMode::Default);
     let llm_config = config.and_then(|c| c.llm.as_ref());
     let force_llm = llm_config.is_some_and(|llm| llm.force);
     let mut accepted = Vec::<(CfgNodeId, Formula)>::new();
@@ -454,9 +466,12 @@ fn synthesize_loop_invariants(
         );
         let mut accepted_candidate = None;
 
-        // Phase 1: Algorithmic — pattern-matched candidates from guards and body effects.
-        // Checked with full exit closure.
-        if !skip_algorithmic && !force_llm {
+        // Algorithmic phase: pattern-matched candidates from guards and body effects.
+        // Only runs in AlgorithmicOnly mode.
+        if accepted_candidate.is_none()
+            && !force_llm
+            && *mode == SynthesisMode::AlgorithmicOnly
+        {
             let candidates = algorithmic_candidates(&loop_info, cfg);
             log::debug!(
                 target: "loop_invariant",
@@ -477,10 +492,13 @@ fn synthesize_loop_invariants(
             );
         }
 
-        // Phase 2: Init-disjunction — `init_fact || safety`.
-        // Generates candidates from preheader store facts + direct exit violations.
-        // Always Phase-B: exit closure skipped; run_backward discharges the obligation.
-        if accepted_candidate.is_none() && !assertion_postconditions.is_empty() {
+        // Entry-safety phase: `init_fact || safety` candidates.
+        // Runs in Default mode (phase 1 of the default pipeline).
+        // Phase-B: exit closure skipped; run_backward discharges the obligation.
+        if accepted_candidate.is_none()
+            && !assertion_postconditions.is_empty()
+            && *mode == SynthesisMode::Default
+        {
             let candidates =
                 entry_safety_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
             log::debug!(
@@ -502,11 +520,14 @@ fn synthesize_loop_invariants(
             );
         }
 
-        // Phase 3: Observer disjunction — `counter <= k || NOT(violation_at_k)`.
-        // Derived from select-term indices in exit-edge violation formulas.
+        // Observer phase: `counter <= k || NOT(violation_at_k)` candidates.
+        // Runs in Default (phase 2) and ObserverOnly modes.
         // Phase A: full exit closure (preferred).
-        // Phase B: skip exit closure (Phase-B pattern) if Phase A fails.
-        if accepted_candidate.is_none() && !assertion_postconditions.is_empty() {
+        // Phase B: skip exit closure if Phase A fails.
+        let run_observer = accepted_candidate.is_none()
+            && !assertion_postconditions.is_empty()
+            && matches!(mode, SynthesisMode::Default | SynthesisMode::ObserverOnly);
+        if run_observer {
             let candidates =
                 observer_disjunction_candidates(&loop_info, cfg, assertion_postconditions);
             log::debug!(
@@ -528,7 +549,6 @@ fn synthesize_loop_invariants(
                     debug_names,
                 );
                 if accepted_candidate.is_none() {
-                    // Phase-B: skip exit closure; run_backward discharges the obligation.
                     accepted_candidate = first_accepted_candidate(
                         function,
                         index + 1,
@@ -545,9 +565,11 @@ fn synthesize_loop_invariants(
             }
         }
 
-        // Phase 4: Grammar-based (ACHAR) — enabled via --inv-grammar; stub for now.
-        let grammar_enabled = config.is_some_and(|c| c.grammar);
-        if accepted_candidate.is_none() && grammar_enabled {
+        // Grammar (ACHAR) phase: grammar-guided enumeration over the loop vocabulary.
+        // Runs in Default (phase 3) and GrammarOnly modes.
+        let run_grammar = accepted_candidate.is_none()
+            && matches!(mode, SynthesisMode::Default | SynthesisMode::GrammarOnly);
+        if run_grammar {
             let candidates =
                 grammar::grammar_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
             log::debug!(
@@ -571,7 +593,8 @@ fn synthesize_loop_invariants(
             }
         }
 
-        // Phase 5: LLM CEGIS — if configured, queries an LLM with CEGIS feedback.
+        // LLM CEGIS — if configured, queries an LLM with CEGIS feedback.
+        // Runs in all modes (when no algorithmic phase succeeded).
         if accepted_candidate.is_none() {
             if let Some(llm) = llm_config {
                 let variable_sorts = collect_variable_sorts(&loop_info, cfg);
