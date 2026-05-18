@@ -650,6 +650,19 @@ fn scan_term_for_arrays(term: &Term, out: &mut BTreeSet<String>) {
 /// Knowing a callee is pure lets the lowering attach [`CallMemoryEffect::PreservesMemory`]
 /// to its call site, which prevents the backward analysis from havocing the memory array
 /// at that point.
+///
+/// In addition to module-local functions inferred as pure, this function seeds the result
+/// with any call to a known-pure external function (see [`is_known_pure_external`]) found
+/// anywhere in `graphs`.  This handles declaration-only externals such as
+/// `__may_nondet_raw` that have no body and therefore never appear as graph entries.
+///
+/// # TODO: user-specified pure functions
+///
+/// There is currently no way for users to declare an arbitrary external function as pure
+/// or to attach a return-value contract (e.g. `nondet_bounded(lo, hi) returns lo..hi`).
+/// A future extension should let callers pass an explicit `extra_pure: &BTreeSet<String>`
+/// (or a richer annotation map) that is merged into the result here, so that domain-specific
+/// stubs can participate in the analysis without modifying this file.
 pub fn infer_memory_pure_functions(graphs: &[FunctionGraph]) -> BTreeSet<String> {
     let mut impure = BTreeSet::<String>::new();
     for graph in graphs {
@@ -673,7 +686,7 @@ pub fn infer_memory_pure_functions(graphs: &[FunctionGraph]) -> BTreeSet<String>
                     continue;
                 }
                 if let Some(callee) = instruction.get_called_function() {
-                    if callee == "may_assert" {
+                    if callee == "may_assert" || is_known_pure_external(&callee) {
                         continue;
                     }
                     if impure.contains(&callee) {
@@ -689,11 +702,39 @@ pub fn infer_memory_pure_functions(graphs: &[FunctionGraph]) -> BTreeSet<String>
         }
     }
 
-    graphs
+    let mut pure: BTreeSet<String> = graphs
         .iter()
         .map(|graph| graph.name.clone())
         .filter(|name| !impure.contains(name))
-        .collect()
+        .collect();
+
+    // Seed with known-pure externals that appear at any call site in the module.
+    // These have no body so they are invisible to the store-scanning pass above.
+    for graph in graphs {
+        for instruction in &graph.vertices {
+            if instruction.get_opcode() != InstructionOpcode::Call {
+                continue;
+            }
+            if let Some(callee) = instruction.get_called_function() {
+                if is_known_pure_external(&callee) {
+                    pure.insert(callee);
+                }
+            }
+        }
+    }
+
+    pure
+}
+
+/// Returns `true` for external functions that are known to be memory-pure (they read no
+/// memory and write no memory) and whose return value is an unconstrained nondeterministic
+/// value of the appropriate type.
+///
+/// Recognises `__may_nondet_raw`, the single declaration-only stub that backs all
+/// `nondet_*()` macros in `verification.h`.  Without this predicate the purity inference
+/// would conservatively mark every caller as impure.
+fn is_known_pure_external(name: &str) -> bool {
+    name.starts_with("__may_nondet_")
 }
 
 /// Collects the names of every non-sentinel callee referenced anywhere in `graphs`.
