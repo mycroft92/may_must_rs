@@ -45,7 +45,7 @@ use crate::common::adapter::AssertionSite;
 use crate::common::formula::{Formula, ModelValue, SmtModel};
 use crate::common::oracle::{Oracle, OracleError};
 use crate::common::source::SourceLocation;
-use crate::may_must_analysis::grammar;
+use crate::may_must_analysis::achar;
 use crate::may_must_analysis::llm_provider::{
     build_full_loop_context, build_loop_invariant_prompt, collect_variable_sorts, parse_candidate,
     CegisAttempt, LlmBackend,
@@ -571,7 +571,7 @@ fn synthesize_loop_invariants(
             && matches!(mode, SynthesisMode::Default | SynthesisMode::GrammarOnly);
         if run_grammar {
             let candidates =
-                grammar::grammar_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
+                achar::grammar_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} grammar candidates: {}",
