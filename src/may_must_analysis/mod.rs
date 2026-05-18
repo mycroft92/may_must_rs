@@ -1,6 +1,7 @@
 pub mod backward;
 pub mod chc;
 pub mod driver;
+pub mod grammar;
 pub mod llm_provider;
 pub mod llm_response_parser;
 pub mod loops;

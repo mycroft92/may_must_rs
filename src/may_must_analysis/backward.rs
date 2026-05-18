@@ -25,20 +25,23 @@
 //! when none are available.  [`discover_loop_invariants`] is a lighter
 //! invariant-only path used by the interprocedural driver before full analysis.
 //!
-//! # Invariant synthesis
+//! # Invariant synthesis pipeline
 //!
-//! Three algorithmic strategies are tried in order before an optional LLM-guided
-//! CEGIS loop:
+//! For each loop (innermost-first) the following phases are tried in order:
 //!
-//! 1. **Algorithmic** — pattern-matched candidates derived from loop guards and
-//!    transfer effects (counter bounds, predicate assignments, …).
-//! 2. **CHC** — Constrained Horn Clause solving for simple counter patterns.
-//! 3. **Houdini** — weakening a large template set until an inductive subset
-//!    remains.
+//! 1. **Algorithmic** — pattern-matched candidates from loop guards and body effects.
+//!    Checked with full exit closure.
+//! 2. **Observer disjunction** — `counter <= k || NOT(violation_at_k)` candidates
+//!    derived from `select` terms in exit-edge violation formulas.  Tried with full
+//!    exit closure first (Phase A); falls back to Phase-B (skip exit closure, rely
+//!    on `run_backward`) when exit closure fails (e.g. due to HavocMemory).
+//! 3. **Init-disjunction** — `init_fact || safety` fallback when no counter pattern
+//!    is present.  Always uses Phase-B.
+//! 4. **Grammar** (stub) — ACHAR-style grammar-based synthesis; currently returns
+//!    no candidates.
+//! 5. **LLM CEGIS** — if configured, queries an LLM backend with CEGIS feedback.
 //!
-//! Each candidate is checked with [`check_loop_invariant_verbose`] from
-//! [`loops`].  Loops are processed innermost-first so that inner invariants are
-//! available when checking outer ones.
+//! Each candidate is checked with [`check_loop_invariant_verbose`] from [`loops`].
 
 #![allow(dead_code)]
 
@@ -47,14 +50,15 @@ use crate::common::adapter::AssertionSite;
 use crate::common::formula::{Formula, ModelValue, SmtModel};
 use crate::common::oracle::{Oracle, OracleError};
 use crate::common::source::SourceLocation;
+use crate::may_must_analysis::grammar;
 use crate::may_must_analysis::llm_provider::{
     build_full_loop_context, build_loop_invariant_prompt, collect_variable_sorts, parse_candidate,
     CegisAttempt, LlmBackend,
 };
 use crate::may_must_analysis::loops::{
-    algorithmic_candidates, chc_loop_invariant, check_loop_invariant_verbose,
-    collect_loop_body_int_constants, detect_loops, entry_safety_candidates, houdini_candidates,
-    normalize_candidate, sort_innermost_first, InvariantCheckResult,
+    algorithmic_candidates, check_loop_invariant_verbose, detect_loops, entry_safety_candidates,
+    normalize_candidate, observer_disjunction_candidates, sort_innermost_first,
+    InvariantCheckResult,
 };
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::providers::LoopContext;
@@ -113,41 +117,16 @@ pub enum BackwardError {
     Oracle(#[from] OracleError),
 }
 
-/// Enumeration of the invariant-synthesis strategies available to
-/// [`synthesize_loop_invariants`].
-///
-/// Strategies are tried in the order listed in [`InvariantConfig::methods`].
-/// When the list is empty the default ordering is `Chc → Houdini → Template`.
-///
-/// # Variants
-///
-/// * `Chc` — Constrained Horn Clause solving for simple counter patterns (fast, specific).
-/// * `Houdini` — weakening a large template set until an inductive subset remains (slower, general).
-/// * `Template` — reserved for custom user-provided invariants (currently unused).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum InvariantMethod {
-    Chc,
-    Houdini,
-    Template,
-}
-
 /// Runtime configuration for the loop-invariant synthesis pass.
 ///
-/// An empty `methods` list enables the full default strategy sequence.
-/// `skip_algorithmic` suppresses the fast pattern-based candidates even when
-/// `methods` includes them — used when callers know the patterns will not match.
-/// When `llm` is `Some` and `force` is set, LLM-guided CEGIS is attempted
-/// before (or instead of) algorithmic strategies.
-///
-/// # Fields
-///
-/// * `methods` — strategies to try in order; empty means use default sequence.
-/// * `llm` — optional configuration for LLM-guided CEGIS candidate generation.
-/// * `skip_algorithmic` — if true, skip the fast pattern-matching phase.
+/// `skip_algorithmic` suppresses the fast pattern-based phase.  `grammar`
+/// enables the ACHAR grammar-based synthesis phase (currently a stub).
+/// When `llm` is `Some` and `force` is set, LLM CEGIS runs before algorithmic.
 pub struct InvariantConfig {
-    pub methods: Vec<InvariantMethod>,
     pub llm: Option<LlmInvariantConfig>,
     pub skip_algorithmic: bool,
+    /// Enable the grammar-based (ACHAR) synthesis phase.
+    pub grammar: bool,
     /// Skip analysis of functions with more than this many instructions,
     /// returning UNKNOWN immediately. 0 means unlimited.
     pub max_function_size: usize,
@@ -156,9 +135,9 @@ pub struct InvariantConfig {
 impl Default for InvariantConfig {
     fn default() -> Self {
         Self {
-            methods: Vec::new(),
             llm: None,
             skip_algorithmic: false,
+            grammar: false,
             max_function_size: 500,
         }
     }
@@ -462,9 +441,8 @@ fn synthesize_loop_invariants(
 ) -> Result<Vec<(CfgNodeId, Formula)>, BackwardError> {
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
-    let methods = selected_methods(config);
-    let skip_algorithmic = config.is_some_and(|config| config.skip_algorithmic);
-    let llm_config = config.and_then(|config| config.llm.as_ref());
+    let skip_algorithmic = config.is_some_and(|c| c.skip_algorithmic);
+    let llm_config = config.and_then(|c| c.llm.as_ref());
     let force_llm = llm_config.is_some_and(|llm| llm.force);
     let mut accepted = Vec::<(CfgNodeId, Formula)>::new();
 
@@ -472,20 +450,18 @@ fn synthesize_loop_invariants(
         log::debug!(
             target: "loop_invariant",
             "function {function} loop {} header {:?} body {:?}",
-            index + 1,
-            loop_info.header,
-            loop_info.body
+            index + 1, loop_info.header, loop_info.body
         );
-        let variable_sorts = collect_variable_sorts(&loop_info, cfg);
         let mut accepted_candidate = None;
 
+        // Phase 1: Algorithmic — pattern-matched candidates from guards and body effects.
+        // Checked with full exit closure.
         if !skip_algorithmic && !force_llm {
             let candidates = algorithmic_candidates(&loop_info, cfg);
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} algorithmic candidates: {}",
-                index + 1,
-                format_candidates(&candidates, debug_names)
+                index + 1, format_candidates(&candidates, debug_names)
             );
             accepted_candidate = first_accepted_candidate(
                 function,
@@ -495,26 +471,23 @@ fn synthesize_loop_invariants(
                 cfg,
                 &candidates,
                 oracle,
-                &assertion_postconditions,
+                assertion_postconditions,
                 &accepted,
                 debug_names,
             );
         }
 
+        // Phase 2: Init-disjunction — `init_fact || safety`.
+        // Generates candidates from preheader store facts + direct exit violations.
+        // Always Phase-B: exit closure skipped; run_backward discharges the obligation.
         if accepted_candidate.is_none() && !assertion_postconditions.is_empty() {
             let candidates =
                 entry_safety_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} entry-safety candidates: {}",
-                index + 1,
-                format_candidates(&candidates, debug_names)
+                index + 1, format_candidates(&candidates, debug_names)
             );
-            // Exit closure is intentionally skipped here (empty postconditions map).
-            // Entry-safety candidates are inductive by construction; the authoritative
-            // discharge of the assertion obligation is performed by the subsequent
-            // run_backward bidirectional check — the same observer-invariant pattern
-            // used in driver.rs for cyclic callee summaries.
             accepted_candidate = first_accepted_candidate(
                 function,
                 index + 1,
@@ -529,70 +502,81 @@ fn synthesize_loop_invariants(
             );
         }
 
-        if accepted_candidate.is_none() && methods.contains(&InvariantMethod::Chc) {
-            let candidates = chc_loop_invariant(&loop_info, cfg)
-                .into_iter()
-                .collect::<Vec<_>>();
+        // Phase 3: Observer disjunction — `counter <= k || NOT(violation_at_k)`.
+        // Derived from select-term indices in exit-edge violation formulas.
+        // Phase A: full exit closure (preferred).
+        // Phase B: skip exit closure (Phase-B pattern) if Phase A fails.
+        if accepted_candidate.is_none() && !assertion_postconditions.is_empty() {
+            let candidates =
+                observer_disjunction_candidates(&loop_info, cfg, assertion_postconditions);
             log::debug!(
                 target: "loop_invariant",
-                "function {function} loop {} CHC candidates: {}",
-                index + 1,
-                format_candidates(&candidates, debug_names)
+                "function {function} loop {} observer candidates: {}",
+                index + 1, format_candidates(&candidates, debug_names)
             );
-            accepted_candidate = first_accepted_candidate(
-                function,
-                index + 1,
-                "chc",
-                &loop_info,
-                cfg,
-                &candidates,
-                oracle,
-                &assertion_postconditions,
-                &accepted,
-                debug_names,
-            );
+            if !candidates.is_empty() {
+                accepted_candidate = first_accepted_candidate(
+                    function,
+                    index + 1,
+                    "observer (phase-A)",
+                    &loop_info,
+                    cfg,
+                    &candidates,
+                    oracle,
+                    assertion_postconditions,
+                    &accepted,
+                    debug_names,
+                );
+                if accepted_candidate.is_none() {
+                    // Phase-B: skip exit closure; run_backward discharges the obligation.
+                    accepted_candidate = first_accepted_candidate(
+                        function,
+                        index + 1,
+                        "observer (phase-B)",
+                        &loop_info,
+                        cfg,
+                        &candidates,
+                        oracle,
+                        &BTreeMap::new(),
+                        &accepted,
+                        debug_names,
+                    );
+                }
+            }
         }
 
-        if accepted_candidate.is_none() && methods.contains(&InvariantMethod::Houdini) {
-            let header_wp = assertion_postconditions
-                .get(&loop_info.header)
-                .cloned()
-                .unwrap_or(Formula::True);
-            let loop_constants = collect_loop_body_int_constants(&loop_info, cfg);
-            let candidates = houdini_candidates(&variable_sorts, &header_wp, &loop_constants);
+        // Phase 4: Grammar-based (ACHAR) — enabled via --inv-grammar; stub for now.
+        let grammar_enabled = config.is_some_and(|c| c.grammar);
+        if accepted_candidate.is_none() && grammar_enabled {
+            let candidates =
+                grammar::grammar_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
             log::debug!(
                 target: "loop_invariant",
-                "function {function} loop {} houdini candidates: {}",
-                index + 1,
-                format_candidates(&candidates, debug_names)
+                "function {function} loop {} grammar candidates: {}",
+                index + 1, format_candidates(&candidates, debug_names)
             );
-            accepted_candidate = first_accepted_candidate(
-                function,
-                index + 1,
-                "houdini",
-                &loop_info,
-                cfg,
-                &candidates,
-                oracle,
-                &assertion_postconditions,
-                &accepted,
-                debug_names,
-            );
+            if !candidates.is_empty() {
+                accepted_candidate = first_accepted_candidate(
+                    function,
+                    index + 1,
+                    "grammar",
+                    &loop_info,
+                    cfg,
+                    &candidates,
+                    oracle,
+                    assertion_postconditions,
+                    &accepted,
+                    debug_names,
+                );
+            }
         }
 
-        if accepted_candidate.is_none() && methods.contains(&InvariantMethod::Template) {
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} template candidates: []",
-                index + 1
-            );
-            accepted_candidate = try_template_invariant();
-        }
-
+        // Phase 5: LLM CEGIS — if configured, queries an LLM with CEGIS feedback.
         if accepted_candidate.is_none() {
             if let Some(llm) = llm_config {
+                let variable_sorts = collect_variable_sorts(&loop_info, cfg);
                 let exit_postcondition =
-                    exit_postcondition_for_loop(&loop_info, &assertion_postconditions, cfg);
+                    exit_postcondition_for_loop(&loop_info, assertion_postconditions, cfg);
                 let mut attempts = Vec::<CegisAttempt>::new();
                 for _ in 0..llm.max_tries.max(1) {
                     let ctx = build_full_loop_context(
@@ -610,8 +594,7 @@ fn synthesize_loop_invariants(
                     let Some(raw) = llm.backend.propose(&prompt) else {
                         log::debug!(
                             target: "loop_invariant",
-                            "function {function} loop {} llm candidate: <none>",
-                            index + 1
+                            "function {function} loop {} llm candidate: <none>", index + 1
                         );
                         continue;
                     };
@@ -619,8 +602,7 @@ fn synthesize_loop_invariants(
                         log::debug!(
                             target: "loop_invariant",
                             "function {function} loop {} llm candidate parse failed: {}",
-                            index + 1,
-                            raw.trim()
+                            index + 1, raw.trim()
                         );
                         continue;
                     };
@@ -629,7 +611,7 @@ fn synthesize_loop_invariants(
                         cfg,
                         &candidate,
                         oracle,
-                        &assertion_postconditions,
+                        assertion_postconditions,
                         &accepted,
                     );
                     log::debug!(
@@ -654,18 +636,16 @@ fn synthesize_loop_invariants(
         if accepted_candidate.is_none() {
             log::debug!(
                 target: "loop_invariant",
-                "function {function} loop {} accepted no invariant",
-                index + 1
+                "function {function} loop {} accepted no invariant", index + 1
             );
             return Err(BackwardError::CyclicCfgUnsupported);
         }
 
-        let candidate = accepted_candidate.expect("checked accepted candidate presence");
+        let candidate = accepted_candidate.expect("checked above");
         log::debug!(
             target: "loop_invariant",
             "function {function} loop {} accepted invariant: {}",
-            index + 1,
-            pretty_formula_with_names(&candidate, debug_names)
+            index + 1, pretty_formula_with_names(&candidate, debug_names)
         );
         accepted.push((loop_info.header, candidate));
     }
@@ -764,25 +744,6 @@ fn precomputed_satisfy_exit_closure(
     Ok(true)
 }
 
-fn selected_methods(config: Option<&InvariantConfig>) -> Vec<InvariantMethod> {
-    let Some(config) = config else {
-        return vec![
-            InvariantMethod::Chc,
-            InvariantMethod::Houdini,
-            InvariantMethod::Template,
-        ];
-    };
-    if config.methods.is_empty() {
-        vec![
-            InvariantMethod::Chc,
-            InvariantMethod::Houdini,
-            InvariantMethod::Template,
-        ]
-    } else {
-        config.methods.clone()
-    }
-}
-
 fn conjunct_loop_invariants(invariants: &[(CfgNodeId, Formula)]) -> BTreeMap<CfgNodeId, Formula> {
     let mut combined = BTreeMap::new();
     for (header, invariant) in invariants {
@@ -828,10 +789,6 @@ fn first_accepted_candidate(
         );
         (result == InvariantCheckResult::Accepted).then_some(normalized)
     })
-}
-
-fn try_template_invariant() -> Option<Formula> {
-    None
 }
 
 fn exit_postcondition_for_loop(

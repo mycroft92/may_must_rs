@@ -82,37 +82,3 @@ pub fn param_relative_templates(retval_name: &str, params: &[Var]) -> Vec<Formul
     }
     formulas
 }
-
-pub fn solve_loop_chc(
-    counter: Var,
-    bound: Var,
-    init: Option<i64>,
-    increment: i64,
-    violation: Option<Formula>,
-) -> Option<Formula> {
-    let counter_term = Term::Var(counter);
-    let bound_term = Term::Var(bound);
-    let lower = init.map(|value| Formula::ge(counter_term.clone(), Term::int(value)));
-    let upper = if increment >= 0 {
-        Some(Formula::le(counter_term, bound_term))
-    } else {
-        None
-    };
-    let mut parts = Vec::new();
-    if let Some(lower) = lower {
-        parts.push(lower);
-    }
-    if let Some(upper) = upper {
-        parts.push(upper);
-    }
-    if let Some(violation) = violation {
-        if violation == Formula::False {
-            return Some(Formula::and_all(parts));
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(Formula::and_all(parts))
-    }
-}

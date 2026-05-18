@@ -2,28 +2,22 @@
 //!
 //! # Responsibilities
 //!
-//! This module is responsible for three related tasks:
-//!
 //! 1. **Detection** — [`detect_loops`] identifies natural loops in the CFG by
 //!    finding back edges and computing the corresponding loop bodies.
 //!
-//! 2. **Candidate generation** — [`algorithmic_candidates`], [`houdini_candidates`],
-//!    and [`chc_loop_invariant`] produce formula candidates using different
-//!    strategies; the caller (in `backward.rs`) tries them in order.
+//! 2. **Candidate generation** — [`algorithmic_candidates`],
+//!    [`observer_disjunction_candidates`], and [`entry_safety_candidates`] produce
+//!    formula candidates using different strategies; the caller (in `backward.rs`)
+//!    tries them in order.
 //!
 //! 3. **Invariant checking** — [`check_loop_invariant_verbose`] performs the
 //!    three-part soundness check for a candidate formula:
-//!    - **Initiation**: the invariant holds on entry to the loop (checked by
-//!      showing the violation condition is infeasible at the function entry).
-//!    - **Inductiveness**: if the invariant holds at the header and the back
-//!      edge is taken, it still holds at the header on the next iteration
-//!      (checked by implication at the header after one step through the body).
-//!    - **Exit closure** (optional): for each loop exit edge whose target has a
-//!      non-trivial `assertion_postcondition`, the invariant together with the
-//!      exit guard implies the postcondition.  This check ties the invariant to
-//!      the specific assertion being proved.  It is intentionally skipped in
-//!      `observer_summary_invariants` (see `driver.rs`) because the final
-//!      `analyze_with_tables` call performs the authoritative discharge.
+//!    - **Initiation**: the invariant holds on entry to the loop.
+//!    - **Inductiveness**: the invariant is preserved by one loop iteration.
+//!    - **Exit closure** (optional): for each exit edge, the invariant implies
+//!      the assertion postcondition.  Pass `&BTreeMap::new()` to skip (Phase-B
+//!      pattern) when the caller relies on `run_backward` to discharge the
+//!      obligation instead.
 //!
 //! # Nested loops
 //!
@@ -40,7 +34,6 @@ use crate::common::abstract_cfg::{
 };
 use crate::common::formula::{Formula, Memory, Sort, Term, Var};
 use crate::common::oracle::{Oracle, Validity};
-use crate::may_must_analysis::chc;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Structural description of a natural loop.
@@ -287,99 +280,6 @@ pub fn algorithmic_candidates(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula
         }
     }
     candidates
-}
-
-/// Generate a large template set of linear arithmetic candidates (Houdini-style).
-///
-/// For every integer variable visible in the loop, and for every constant that
-/// appears in the assertion postcondition (`header_wp`) or in the loop body,
-/// this generates:
-/// - Simple bounds `var >= c` and `var <= c`.
-/// - Range conjunctions `var >= lo && var <= hi` for all pairs (lo, hi).
-/// - Pairwise variable comparisons `v1 <= v2`, `v1 >= v2`, and `v1+1 <= v2`.
-///
-/// The constants `{-1, 0, 1}` are always included.  The caller is expected to
-/// feed these through [`check_loop_invariant_verbose`] and keep only those that
-/// pass, gradually weakening to the largest inductive conjunction (Houdini
-/// algorithm).
-///
-/// # Strategy characteristics
-///
-/// - **Generality**: covers linear arithmetic patterns; generates O(vars^2 * constants^2).
-/// - **Cost**: expensive; each candidate requires a solver query.
-/// - **Applicability**: works well for loops with counter patterns and linear bounds.
-pub fn houdini_candidates(
-    variable_sorts: &BTreeMap<String, Sort>,
-    header_wp: &Formula,
-    loop_constants: &BTreeSet<i64>,
-) -> Vec<Formula> {
-    let constants = collect_int_constants(header_wp)
-        .into_iter()
-        .chain(loop_constants.iter().copied())
-        .chain([-1, 0, 1])
-        .collect::<BTreeSet<_>>();
-    let vars = variable_sorts
-        .iter()
-        .filter_map(|(name, sort)| (*sort == Sort::Int).then_some(Var::int(name.clone())))
-        .collect::<Vec<_>>();
-    let mut candidates = Vec::new();
-    for var in &vars {
-        for constant in &constants {
-            let term = Term::Var(var.clone());
-            candidates.push(Formula::ge(term.clone(), Term::int(*constant)));
-            candidates.push(Formula::le(term, Term::int(*constant)));
-        }
-        let constants_vec = constants.iter().copied().collect::<Vec<_>>();
-        for (index, lower) in constants_vec.iter().enumerate() {
-            for upper in constants_vec.iter().skip(index + 1) {
-                candidates.push(Formula::and(
-                    Formula::ge(Term::Var(var.clone()), Term::int(*lower)),
-                    Formula::le(Term::Var(var.clone()), Term::int(*upper)),
-                ));
-            }
-        }
-    }
-    for left in &vars {
-        for right in &vars {
-            if left == right {
-                continue;
-            }
-            candidates.push(Formula::le(
-                Term::Var(left.clone()),
-                Term::Var(right.clone()),
-            ));
-            candidates.push(Formula::ge(
-                Term::Var(left.clone()),
-                Term::Var(right.clone()),
-            ));
-            candidates.push(Formula::le(
-                Term::add(Term::Var(left.clone()), Term::int(1)),
-                Term::Var(right.clone()),
-            ));
-        }
-    }
-    candidates
-}
-
-/// Derive a loop invariant by solving a Constrained Horn Clause (CHC) system.
-///
-/// Currently handles the common pattern `i < n` / `i < bound` on the back edge
-/// guard: delegates to [`chc::solve_loop_chc`] to produce a closed-form
-/// invariant such as `0 <= i && i <= n`.  Returns `None` if the guard does not
-/// match the expected pattern.
-///
-/// # Strategy characteristics
-///
-/// - **Speed**: fast; delegates to a dedicated CHC solver.
-/// - **Specificity**: targets counter-loop patterns (i < bound).
-/// - **Limitations**: only handles counter patterns; generic loops get `None`.
-pub fn chc_loop_invariant(info: &LoopInfo, cfg: &AbstractCfg) -> Option<Formula> {
-    let guard = &info.back_edge_guard;
-    if let Formula::Lt(Term::Var(counter), Term::Var(bound)) = guard {
-        return chc::solve_loop_chc(counter.clone(), bound.clone(), Some(0), 1, None);
-    }
-    let _ = cfg;
-    None
 }
 
 pub fn check_loop_invariant(
@@ -810,55 +710,6 @@ fn term_mentions_var(term: &Term, name: &str) -> bool {
     }
 }
 
-fn collect_int_constants(formula: &Formula) -> Vec<i64> {
-    let mut constants = Vec::new();
-    collect_int_constants_formula(formula, &mut constants);
-    constants
-}
-
-fn collect_int_constants_formula(formula: &Formula, out: &mut Vec<i64>) {
-    match formula {
-        Formula::True | Formula::False | Formula::Var(_) => {}
-        Formula::Not(inner) => collect_int_constants_formula(inner, out),
-        Formula::And(items) | Formula::Or(items) => {
-            for item in items {
-                collect_int_constants_formula(item, out);
-            }
-        }
-        Formula::Implies(lhs, rhs) => {
-            collect_int_constants_formula(lhs, out);
-            collect_int_constants_formula(rhs, out);
-        }
-        Formula::Eq(lhs, rhs)
-        | Formula::Lt(lhs, rhs)
-        | Formula::Le(lhs, rhs)
-        | Formula::Gt(lhs, rhs)
-        | Formula::Ge(lhs, rhs) => {
-            collect_int_constants_term(lhs, out);
-            collect_int_constants_term(rhs, out);
-        }
-        Formula::MemoryEq(_, _) => {}
-    }
-}
-
-fn collect_int_constants_term(term: &Term, out: &mut Vec<i64>) {
-    match term {
-        Term::Int(value) => out.push(*value),
-        Term::Var(_) | Term::Real(_) => {}
-        Term::BoolToInt(inner) => collect_int_constants_formula(inner, out),
-        Term::Select(_, index) => collect_int_constants_term(index, out),
-        Term::Add(lhs, rhs)
-        | Term::Sub(lhs, rhs)
-        | Term::Mul(lhs, rhs)
-        | Term::Div(lhs, rhs)
-        | Term::Rem(lhs, rhs) => {
-            collect_int_constants_term(lhs, out);
-            collect_int_constants_term(rhs, out);
-        }
-        Term::Neg(inner) => collect_int_constants_term(inner, out),
-    }
-}
-
 /// Compute a forward over-approximation of states at `header` on first entry.
 ///
 /// Propagates SP (strongest postcondition) from the function entry through the
@@ -1232,73 +1083,152 @@ fn summarize_inner_loops(
     (headers, blocked_nodes)
 }
 
-/// Collect all integer literal constants from the loop body.
+/// Generate observer-disjunction invariant candidates: `counter <= k || NOT(violation_at_k)`.
 ///
-/// Scans all assignment targets and memory stores for integer literals, which
-/// Collect the memory regions and scalar variable names written by the loop body.
+/// For each `select(region, k)` index term appearing in exit-edge violation formulas, and
+/// for the loop counter extracted from the back-edge guard (`counter < bound` form), produces:
 ///
-/// Returns two sets:
-/// - `regions`: every `MemoryStore { region }` target inside the loop body.
-/// - `vars`: every `Assign { target }` scalar variable name written inside the loop body.
+///   `counter <= k  ||  NOT(violation_conjunct_involving_select(region, k))`
 ///
-/// Both node-level effects and edge-level phi-assignment effects between body nodes are
-/// included.  Used by the loop-relevance pre-filter in `precomputed_satisfy_exit_closure`
-/// to decide whether a loop can possibly affect a given exit postcondition.
-pub fn loop_write_regions_and_vars(
+/// These candidates are designed to pass full exit closure for safe programs: the right
+/// disjunct IS the assertion's safety condition, so `invariant AND violation` is immediately
+/// infeasible at the exit.  The left disjunct covers the case where the loop has not yet
+/// processed index `k` (so the safety condition need not hold yet at that point).
+///
+/// Returns an empty list when the back-edge guard does not match `counter < bound`, or
+/// when no `select` terms appear in the exit violations.
+pub fn observer_disjunction_candidates(
     info: &LoopInfo,
     cfg: &AbstractCfg,
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut regions = BTreeSet::new();
-    let mut vars = BTreeSet::new();
-
-    let collect = |effects: &[TransferEffect],
-                   regions: &mut BTreeSet<String>,
-                   vars: &mut BTreeSet<String>| {
-        for effect in effects {
-            match effect {
-                TransferEffect::MemoryStore { region, .. } => {
-                    regions.insert(region.clone());
-                }
-                TransferEffect::Assign { target, .. } => {
-                    vars.insert(target.name().to_string());
-                }
-                _ => {}
-            }
-        }
+    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
+) -> Vec<Formula> {
+    let Some(counter) = extract_back_edge_counter(info) else {
+        return vec![];
     };
 
-    for node_id in &info.body {
-        let Ok(node) = cfg.node(*node_id) else {
+    let mut candidates = Vec::new();
+    for exit_edge in &info.exit_edges {
+        let Ok(edge) = cfg.edge(*exit_edge) else {
             continue;
         };
-        collect(&node.transfer.effects, &mut regions, &mut vars);
-        // Also collect phi-node assignments on edges between body nodes.
-        for edge_id in cfg.outgoing_edges(*node_id) {
-            let Ok(edge) = cfg.edge(edge_id) else {
+        let Some(violation) = assertion_postconditions.get(&edge.target) else {
+            continue;
+        };
+        if *violation == Formula::False {
+            continue;
+        }
+        for atom in formula_conjuncts(violation) {
+            let indices = collect_select_indices_in_formula(atom);
+            if indices.is_empty() {
+                continue;
+            }
+            let Some(safety) = negate_comparison(atom) else {
                 continue;
             };
-            if info.body.contains(&edge.target) {
-                collect(&edge.effects, &mut regions, &mut vars);
+            for index in indices {
+                push_nontrivial(
+                    &mut candidates,
+                    Formula::or(
+                        Formula::le(Term::Var(counter.clone()), index),
+                        safety.clone(),
+                    ),
+                );
             }
         }
     }
-    (regions, vars)
+    candidates
 }
 
-/// Generate invariant candidates of the form `counter == init || safety`.
+/// Extract the counter variable from a back-edge guard of the form `counter < bound`
+/// or `counter <= bound`.  Returns `None` for all other guard shapes.
+fn extract_back_edge_counter(info: &LoopInfo) -> Option<Var> {
+    match &info.back_edge_guard {
+        Formula::Lt(Term::Var(counter), _) | Formula::Le(Term::Var(counter), _) => {
+            (counter.sort() == Sort::Int).then(|| counter.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Return the top-level conjuncts of a formula.
 ///
-/// When the preheader stores a constant to a scalar region (e.g. `j = 0`) and the
-/// assertion violation at loop exit implies a safety condition (e.g. `array[0] >= menor`),
-/// the combined candidate `select(j_region, 0) == 0 || array[0] >= menor` captures
-/// invariants that neither the algorithmic nor Houdini phases generate.
+/// If `formula` is `And(items)`, returns references to each item.
+/// Otherwise returns a one-element slice containing the formula itself.
+fn formula_conjuncts(formula: &Formula) -> Vec<&Formula> {
+    match formula {
+        Formula::And(items) => items.iter().collect(),
+        other => vec![other],
+    }
+}
+
+/// Collect all `select(memory, index)` index terms that appear directly in a formula.
+fn collect_select_indices_in_formula(formula: &Formula) -> Vec<Term> {
+    let mut out = Vec::new();
+    collect_select_indices_formula(formula, &mut out);
+    out
+}
+
+fn collect_select_indices_formula(formula: &Formula, out: &mut Vec<Term>) {
+    match formula {
+        Formula::Lt(l, r)
+        | Formula::Le(l, r)
+        | Formula::Gt(l, r)
+        | Formula::Ge(l, r)
+        | Formula::Eq(l, r) => {
+            collect_select_indices_term(l, out);
+            collect_select_indices_term(r, out);
+        }
+        Formula::Not(inner) => collect_select_indices_formula(inner, out),
+        Formula::And(items) | Formula::Or(items) => {
+            for item in items {
+                collect_select_indices_formula(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_select_indices_term(term: &Term, out: &mut Vec<Term>) {
+    match term {
+        Term::Select(_, index) => out.push(*index.clone()),
+        Term::Add(l, r) | Term::Sub(l, r) | Term::Mul(l, r) | Term::Div(l, r) | Term::Rem(l, r) => {
+            collect_select_indices_term(l, out);
+            collect_select_indices_term(r, out);
+        }
+        Term::Neg(inner) => collect_select_indices_term(inner, out),
+        _ => {}
+    }
+}
+
+/// Negate a comparison precisely: Lt↔Ge, Le↔Gt, Gt↔Le, Ge↔Lt, Not(f)→f.
+///
+/// Returns `None` for compound formulas (And, Or, Implies) where precise negation
+/// would require De Morgan expansion — callers should wrap with `Formula::not` instead.
+fn negate_comparison(formula: &Formula) -> Option<Formula> {
+    Some(match formula {
+        Formula::Lt(l, r) => Formula::ge(l.clone(), r.clone()),
+        Formula::Le(l, r) => Formula::gt(l.clone(), r.clone()),
+        Formula::Gt(l, r) => Formula::le(l.clone(), r.clone()),
+        Formula::Ge(l, r) => Formula::lt(l.clone(), r.clone()),
+        Formula::Not(inner) => *inner.clone(),
+        _ => return None,
+    })
+}
+
+/// Generate fallback invariant candidates of the form `counter == init || safety`.
+///
+/// Used when [`observer_disjunction_candidates`] produces no candidates (e.g. because
+/// the back-edge guard is not a simple `counter < bound`).
 ///
 /// Two candidate sets are generated:
-/// 1. **Direct**: `counter == init || NOT(violation_at_exit_target)` — uses the assertion
-///    violation formula directly without backward-propagating through the loop body.  This
-///    avoids loop-path conditions that inflate the formula and defeat inductiveness.
-/// 2. **Propagated**: `counter == init || NOT(exit_header)` — uses the violation condition
-///    backward-propagated to the header.  Included as a fallback when the direct form
-///    is too weak.
+/// 1. **Direct**: `init_fact || NOT(violation_at_exit_target)` using the assertion
+///    violation formula directly from the exit-edge target — avoids loop-path conditions
+///    that inflate the formula and defeat inductiveness.
+/// 2. **Propagated**: `init_fact || NOT(exit_header)` using the violation condition
+///    backward-propagated to the header — fallback when the direct form is too weak.
+///
+/// These candidates are always checked with the Phase-B pattern (exit closure skipped);
+/// `run_backward` performs the authoritative obligation discharge.
 pub fn entry_safety_candidates(
     info: &LoopInfo,
     cfg: &AbstractCfg,
@@ -1538,32 +1468,6 @@ fn preheader_store_facts_at_header(
     header_incoming.unwrap_or_default()
 }
 
-/// are used by [`houdini_candidates`] to construct bound templates.
-pub fn collect_loop_body_int_constants(info: &LoopInfo, cfg: &AbstractCfg) -> BTreeSet<i64> {
-    let mut constants = BTreeSet::new();
-    for node_id in &info.body {
-        let Ok(node) = cfg.node(*node_id) else {
-            continue;
-        };
-        for effect in &node.transfer.effects {
-            match effect {
-                TransferEffect::Assign {
-                    value: AssignValue::Term(Term::Int(value)),
-                    ..
-                }
-                | TransferEffect::MemoryStore {
-                    value: Term::Int(value),
-                    ..
-                } => {
-                    constants.insert(*value);
-                }
-                _ => {}
-            }
-        }
-    }
-    constants
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1629,17 +1533,6 @@ mod tests {
         assert!(candidates.contains(&Formula::and(
             Formula::ge(Term::var("i", Sort::Int), Term::int(0)),
             Formula::le(Term::var("i", Sort::Int), Term::var("n", Sort::Int)),
-        )));
-    }
-
-    #[test]
-    fn houdini_candidates_include_range_conjunctions() {
-        let variable_sorts = BTreeMap::from([("i".to_string(), Sort::Int)]);
-        let loop_constants = BTreeSet::from([5]);
-        let candidates = houdini_candidates(&variable_sorts, &Formula::True, &loop_constants);
-        assert!(candidates.contains(&Formula::and(
-            Formula::ge(Term::var("i", Sort::Int), Term::int(0)),
-            Formula::le(Term::var("i", Sort::Int), Term::int(5)),
         )));
     }
 }

@@ -10,7 +10,7 @@ use common::llvm_utils::llvm_wrap::{initialize_target, Context, Module};
 use common::llvm_utils::program_graph::{dump_graphs, generate_program_graph, FunctionGraph};
 use common::oracle::Oracle;
 use env_logger::{Builder, Env};
-use may_must_analysis::backward::{self, InvariantConfig, InvariantMethod, LlmInvariantConfig};
+use may_must_analysis::backward::{self, InvariantConfig, LlmInvariantConfig};
 use may_must_analysis::driver::{ModuleReport, SafetyVerdict};
 use may_must_analysis::llm_provider::SubprocessLlmBackend;
 use may_must_analysis::providers::NoProvider;
@@ -64,9 +64,7 @@ fn main() {
                 .required(false)
                 .value_parser(value_parser!(String)),
         )
-        .arg(arg!(--"inv-chc" "Enable CHC invariant candidates"))
-        .arg(arg!(--"inv-houdini" "Enable Houdini invariant candidates"))
-        .arg(arg!(--"inv-template" "Enable template invariant candidates"))
+        .arg(arg!(--"inv-grammar" "Enable grammar-based (ACHAR) invariant synthesis"))
         .arg(
             arg!(--"max-function-size" <N> "Skip analysis of functions with more than N instructions (default: 500; 0 = unlimited)")
                 .required(false)
@@ -113,17 +111,6 @@ fn init_logging(debug_invariants: bool, diff_debug: bool) {
 }
 
 fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
-    let mut methods = Vec::new();
-    if matches.get_flag("inv-chc") {
-        methods.push(InvariantMethod::Chc);
-    }
-    if matches.get_flag("inv-houdini") {
-        methods.push(InvariantMethod::Houdini);
-    }
-    if matches.get_flag("inv-template") {
-        methods.push(InvariantMethod::Template);
-    }
-
     let llm_enabled = matches.get_flag("llm-invariants") || matches.get_flag("llm-force");
     let llm = llm_enabled.then(|| {
         let script_path = matches
@@ -153,9 +140,9 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
         .unwrap_or(&500);
 
     InvariantConfig {
-        methods,
         llm,
         skip_algorithmic: false,
+        grammar: matches.get_flag("inv-grammar"),
         max_function_size,
     }
 }
