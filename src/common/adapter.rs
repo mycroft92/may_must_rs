@@ -734,7 +734,17 @@ pub fn infer_memory_pure_functions(graphs: &[FunctionGraph]) -> BTreeSet<String>
 /// `nondet_*()` macros in `verification.h`.  Without this predicate the purity inference
 /// would conservatively mark every caller as impure.
 fn is_known_pure_external(name: &str) -> bool {
-    name.starts_with("__may_nondet_")
+    if name.starts_with("__may_nondet_") {
+        return true;
+    }
+    // LLVM stack-pointer intrinsics: save/restore the stack pointer, used by
+    // VLAs (`int array[n]`).  They do not modify program-visible memory, so
+    // treating them as HavocMemory would incorrectly drop store facts from the
+    // preheader and break loop-invariant reasoning over VLA loops (see
+    // `tests/array-1.c`).
+    matches!(name, "llvm.stacksave" | "llvm.stackrestore")
+        || name.starts_with("llvm.stacksave.")
+        || name.starts_with("llvm.stackrestore.")
 }
 
 /// Collects the names of every non-sentinel callee referenced anywhere in `graphs`.

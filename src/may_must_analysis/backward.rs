@@ -155,7 +155,12 @@ impl Default for InvariantConfig {
             mode: SynthesisMode::Default,
             max_function_size: 500,
             achar_timeout: std::time::Duration::from_secs(10),
-            bmc_bound: None,
+            // Default to a small BMC bound so that programs where invariant
+            // synthesis cannot prove safety still have a chance to report a
+            // concrete BugFound (e.g. `tests/array-2.c`, where one unrolled
+            // iteration exhibits the violation).  The CLI's `--bmc-bound`
+            // overrides this if a larger budget is desired.
+            bmc_bound: Some(2),
         }
     }
 }

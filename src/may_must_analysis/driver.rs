@@ -399,14 +399,38 @@ pub fn analyze_with_summaries(
     let mut failures = Vec::new();
     for (site, result) in site_results {
         match result {
-            Ok(result) => assertions.push(result),
+            Ok(result) => {
+                log::info!(
+                    target: "engine_verdict",
+                    "function {} assertion #{} ({}): {:?} [engine=invariant-analysis]",
+                    adapted.name,
+                    site.id,
+                    site.location,
+                    result.judgement
+                );
+                assertions.push(result);
+            }
             Err(BackwardError::CyclicCfgUnsupported) => {
                 // Invariant synthesis failed. Try BMC as a bug-finding fallback.
                 if let Some(bound) = bmc_bound {
                     if let Some(bmc_result) = bmc::bmc_check(&adapted.cfg, site, oracle, bound) {
+                        log::info!(
+                            target: "engine_verdict",
+                            "function {} assertion #{} ({}): {:?} [engine=bmc bound={}]",
+                            adapted.name,
+                            site.id,
+                            site.location,
+                            bmc_result.judgement,
+                            bound,
+                        );
                         assertions.push(bmc_result);
                         continue;
                     }
+                    log::info!(
+                        target: "engine_verdict",
+                        "function {} assertion #{} ({}): UNKNOWN [engine=bmc bound={} exhausted]",
+                        adapted.name, site.id, site.location, bound
+                    );
                 }
                 failures.push(format!(
                     "assertion #{} ({}): CFG has a cycle and no loop invariant was accepted",
@@ -1585,6 +1609,49 @@ mod tests {
                 SafetyVerdict::Safe,
                 "vtable dispatch should be Verified but got {:?}",
                 main_report.verdict()
+            );
+        });
+    }
+
+    #[test]
+    fn array_1_verified() {
+        // array-1: loop iterates `for (j=0; j<SIZE; j++)` with SIZE=1, writing
+        // array[j]=nondet and tightening `menor = min(menor, array[j])`.  After
+        // the loop, `array[0] >= menor` holds because `menor` is the running min.
+        // ACHAR finds the invariant `((j==0)||(array[0]>=menor)) && (SIZE==1)`
+        // via the `counter-assert-disj+imm` tier (Tier 2b): the conjoined
+        // immutable preheader fact `SIZE==1` rules out the spurious SIZE=0
+        // exit-closure case.
+        with_bc_graphs("array-1", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let proc = procedure(&report, "main");
+            assert_eq!(
+                proc.verdict(),
+                SafetyVerdict::Safe,
+                "array-1 must be Verified: array[0]>=menor is always safe"
+            );
+        });
+    }
+
+    #[test]
+    fn array_2_not_verified() {
+        // array-2 is identical to array-1 except the assertion is strict:
+        // `array[0] > menor` (vs. `>=`).  The body forces `menor <= array[0]`
+        // (non-strict), so when `menor_orig <= array[0]`, the body sets
+        // `menor = array[0]` and the assertion FAILS.  With the default
+        // BMC fallback (`bmc_bound = Some(2)`) array-2 is reported UNSAFE
+        // automatically when invariant synthesis fails.
+        with_bc_graphs("array-2", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let proc = procedure(&report, "main");
+            assert_eq!(
+                proc.verdict(),
+                SafetyVerdict::Unsafe,
+                "array-2 must be UNSAFE via BMC fallback when invariant analysis fails"
             );
         });
     }

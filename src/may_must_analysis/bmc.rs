@@ -143,7 +143,11 @@ pub fn bmc_check(
 /// Propagates `NOT obligation` backward in one topological pass — no fixpoint,
 /// no `reach` component, no intermediate SMT calls.  One `feasibility_with_model`
 /// at the entry: SAT means a real counterexample exists at this unroll depth.
-fn bmc_sat_check(cfg: &AbstractCfg, site: &AssertionSite, oracle: &Oracle) -> Option<AssertionResult> {
+fn bmc_sat_check(
+    cfg: &AbstractCfg,
+    site: &AssertionSite,
+    oracle: &Oracle,
+) -> Option<AssertionResult> {
     // Acyclicity guard — returns None if back edges weren't removed.
     let topo = cfg.topological_order()?;
 
@@ -171,14 +175,18 @@ fn bmc_sat_check(cfg: &AbstractCfg, site: &AssertionSite, oracle: &Oracle) -> Op
             continue;
         };
         for edge_id in cfg.incoming_edges(node) {
-            let Ok(edge) = cfg.edge(edge_id) else { continue };
+            let Ok(edge) = cfg.edge(edge_id) else {
+                continue;
+            };
             let edge = edge.clone();
             // edge.transfer().wp(node_state) — same as notmay_pre's edge_pre
             let edge_pre = edge.transfer().wp(&node_state);
             // AND guard — same as notmay_pre's post_at_source
             let guarded = Formula::and(edge.guard.clone(), edge_pre);
             // source.transfer.wp(guarded) — same as notmay_pre's pre_at_source
-            let Ok(src_node) = cfg.node(edge.source) else { continue };
+            let Ok(src_node) = cfg.node(edge.source) else {
+                continue;
+            };
             let src_pre = src_node.transfer.wp(&guarded);
             // OR-join — same as join_state in node_summary.rs
             let acc = state.entry(edge.source).or_insert(Formula::False);
@@ -197,9 +205,19 @@ fn bmc_sat_check(cfg: &AbstractCfg, site: &AssertionSite, oracle: &Oracle) -> Op
         site_id: site.id,
         site_label: site.location.clone(),
         source_location: site.source_location.clone().into(),
-        judgement: Judgement::BugFound { model: report.model },
-        entry_summary: NodeSummary { node: cfg.entry(), reach: Formula::True, state: entry_state },
-        assertion_summary: NodeSummary { node: site.node, reach: Formula::True, state: neg_obligation },
+        judgement: Judgement::BugFound {
+            model: report.model,
+        },
+        entry_summary: NodeSummary {
+            node: cfg.entry(),
+            reach: Formula::True,
+            state: entry_state,
+        },
+        assertion_summary: NodeSummary {
+            node: site.node,
+            reach: Formula::True,
+            state: neg_obligation,
+        },
         debug_names: HashMap::new(),
     })
 }
