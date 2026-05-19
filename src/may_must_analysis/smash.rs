@@ -48,7 +48,6 @@ use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{
     analyze_with_tables, AssertionResult, BackwardError, InvariantConfig,
 };
-use crate::may_must_analysis::bmc;
 use crate::may_must_analysis::loops::VerifiedLoopInvariant;
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::rules::Judgement;
@@ -254,39 +253,18 @@ pub fn run_smash(
     };
 
     // ── Must direction ───────────────────────────────────────────────────
-    let bmc_bound = config.and_then(|c| c.bmc_bound);
-    if let Some(bound) = bmc_bound {
-        if let Some(bmc_result) = bmc::bmc_check(cfg, site, oracle, bound) {
-            // BMC found a concrete bug.  Record a must-path summary so that
-            // future steps (cross-procedure propagation, ACHAR pruning) can
-            // consume it.
-            let entry_state = match &bmc_result.judgement {
-                Judgement::BugFound { .. } => bmc_result.entry_summary.state.clone(),
-                _ => Formula::True,
-            };
-            let must_path = MustPathSummary {
-                procedure: procedure_name.to_string(),
-                site_id: site.id,
-                entry_state,
-                bmc_bound: bound,
-            };
-            log::info!(
-                target: "engine_verdict",
-                "function {procedure_name} assertion #{} ({}): {:?} [engine=must/bmc bound={bound}]",
-                site.id, site.location, bmc_result.judgement
-            );
-            return SmashRunResult {
-                assertion: bmc_result,
-                engine: VerdictEngine::MustBmc { bound },
-                new_must_paths: vec![must_path],
-            };
-        }
-        log::info!(
-            target: "engine_verdict",
-            "function {procedure_name} assertion #{} ({}): Unknown [engine=must/bmc bound={bound} exhausted]",
-            site.id, site.location
-        );
-    }
+    //
+    // BMC was previously called here as a stopgap forward-MUST
+    // realization.  Per the strict QUERY_REFACTOR path, we now wait for
+    // the paper-equivalent forward MUST (loop-summary based,
+    // under-approximate, paired with backward NOT-MAY) to mature.  The
+    // `bmc::bmc_check` engine remains available for explicit invocation
+    // but is no longer auto-invoked from the analysis path.
+    //
+    // The result of cutting BMC: cyclic programs whose safety we cannot
+    // prove via backward NOT-MAY become UNKNOWN instead of UNSAFE.
+    // UNKNOWN is sound (no false claims); a real bug witness will arrive
+    // when the paper-equivalent forward MUST direction is wired in.
 
     // ── Final: may's Unknown (or an empty Unknown if may also errored) ──
     let assertion = may_unknown_or_error.unwrap_or_else(|| empty_unknown_result(site, debug_names));
