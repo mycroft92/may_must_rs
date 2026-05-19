@@ -157,6 +157,15 @@ fn bmc_sat_check(cfg: &AbstractCfg, site: &AssertionSite, oracle: &Oracle) -> Op
     // Backward pass: process each node (reverse topo = successors before
     // predecessors).  For each node that has a state, propagate it backward
     // through every incoming edge and OR-join into the source node's state.
+    //
+    // This is exactly the `notmay_pre` rule from `rules.rs:204`, applied once
+    // per edge in topological order instead of inside a fixpoint loop, with
+    // `join_state` (OR) at merge points.  The proof engine runs the same
+    // computation but also fires `notmay_pre_pruned` (one SMT query per edge)
+    // to prune infeasible paths early using `reach`.  For bug-finding on an
+    // acyclic CFG there is no `reach` component, so pruning is skipped and the
+    // cost is O(1) SMT queries (one feasibility check at the entry) versus
+    // O(edges) for the proof engine path.
     for &node in topo.iter().rev() {
         let Some(node_state) = state.get(&node).cloned() else {
             continue;
@@ -164,13 +173,14 @@ fn bmc_sat_check(cfg: &AbstractCfg, site: &AssertionSite, oracle: &Oracle) -> Op
         for edge_id in cfg.incoming_edges(node) {
             let Ok(edge) = cfg.edge(edge_id) else { continue };
             let edge = edge.clone();
-            // WP through edge effects (phi assignments, etc.), then AND guard.
+            // edge.transfer().wp(node_state) — same as notmay_pre's edge_pre
             let edge_pre = edge.transfer().wp(&node_state);
+            // AND guard — same as notmay_pre's post_at_source
             let guarded = Formula::and(edge.guard.clone(), edge_pre);
-            // WP through the source node's transfer fn.
+            // source.transfer.wp(guarded) — same as notmay_pre's pre_at_source
             let Ok(src_node) = cfg.node(edge.source) else { continue };
             let src_pre = src_node.transfer.wp(&guarded);
-            // OR-join into the accumulated source state.
+            // OR-join — same as join_state in node_summary.rs
             let acc = state.entry(edge.source).or_insert(Formula::False);
             *acc = Formula::or(acc.clone(), src_pre);
         }
