@@ -42,38 +42,23 @@ Paper:
 
 ## Refactor roadmap (staged, in order)
 
-1. **Types first.** Add `Query`, `QueryResult`, `SummaryKey`,
-   `InProgressQuery`.  No behaviour change yet.
-2. **Worklist scheduler.** Replace the bottom-up driver loop with a
-   demand-driven worklist.  Top-level assertions become initial queries.
-3. **Calls become query-mediated, with eager inlining as an
-   optimization.** Today the eager `ReturnSummary` inlining in
-   `adapter.rs:1194` is the *only* call-handling path, and it implicitly
-   assumes `precondition = True` — semantically a single summary that
-   covers all contexts.  The paper requires reuse to **check
-   applicability** against the current query context.  Eager inlining
-   stays as an optimization when an existing summary is *semantically
-   equivalent* to the paper's contextual summary (same projected pre and
-   post over the procedure interface).  When the call's caller-side pre
-   doesn't match an existing summary, spawn a sub-query.
-4. **Contextual summary creation.**  Implement real
-   `CREATE_MUSTSUMMARY` and `CREATE_NOTMAYSUMMARY` from completed query
-   results.  Project to procedure interface (formals + return + visible
-   memory) by quantifying out callee locals.
-5. **Subsumption-aware tables.**  Replace structural dedup in
-   `summaries.rs:9` with `MERGE_MAY_SUMMARY` / `MERGE_MUST_SUMMARY`
-   subsumption checks: "is this query already covered by an existing
-   summary?"
-6. **Query-local evidence.** Track `N_e` (per-region pre/post info), not
-   just `blocked_edges`.  Needed to reconstruct contextual summaries.
-7. **In-progress query tracking for recursion.**  Check if a new query
-   is subsumed by an active one — paper's recursive query management.
-   Demote the current CHC-based path (`driver.rs:198`) to an alternative
-   strategy, not the primary algorithm.
-8. **Keep `compute_return_summary`** (`adapter.rs:1651`) as an
-   optimization shortcut.  When its inferred summary is exactly the
-   paper's `MustSummary(True, post)`, reuse it directly; otherwise fall
-   back to query-driven analysis to derive a context-specific summary.
+| Step | Task ID | QUERY_REFACTOR §10 step | Status |
+|---|---|---|---|
+| Types first (`Query`, `QueryResult`, `SummaryKey`, `InProgressQuery`) | #15 | 1 | ✅ done |
+| Projection helper (`project_to_interface`) | #20 | 2 | ✅ done |
+| Scheduler skeleton (per-procedure, queue + dispatch) | #15 | 3 | ✅ done |
+| CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY at query completion | #17 | 4–5 | ✅ done |
+| Subsumption-aware reuse (forward_may_usesummary checks pre via implies) | #18 | 6 | ✅ done |
+| 6A — Scheduler reshape to per-module | #16 | (decomposed) | ✅ done |
+| 6B — Module-level Scheduler ownership; bridge `sched.table` → legacy `SummaryTables` between procedures | #16 | 6 (cont'd) | in progress |
+| 6C — Cut `compute_return_summary` from analysis path; contextual summaries alone | #16 | 7 + 8 | pending |
+| Per-region `N_e` evidence (only if test-motivated) | #19 | (skipped unless needed) | pending |
+| In-progress query subsumption for recursion | #21 | 9 | pending |
+
+The "6A / 6B / 6C" labels are sub-decomposition of task #16 (call
+mediation) introduced for commit-sized checkpoints.  They are now
+canonically tracked here; commit messages and code comments reference
+this table.
 
 Loop machinery (ACHAR, observer, entry-safety) stays as the internal
 procedure analyzer.  Only the interprocedural orchestration and summary
