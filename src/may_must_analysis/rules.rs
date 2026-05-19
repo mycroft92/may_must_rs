@@ -1,25 +1,44 @@
-//! Local propagation rules for the bidirectional may/must fixpoint.
+//! Local propagation rules for the SMASH-paper analysis directions.
 //!
 //! [`RuleEngine`] owns the per-node [`NodeSummary`] map for one CFG and drives
-//! the two interleaved propagation passes:
+//! the propagation passes that implement the paper's directions:
 //!
-//! - **Forward pass** (`must_post` / `must_post_usesummary`): propagates
-//!   `reach` along outgoing edges, accumulating reachability evidence.
-//! - **Backward pass** (`notmay_pre` / `notmay_pre_usesummary`): propagates
-//!   `state` (WP of violation) backward along incoming edges.
+//! - **Forward MAY** (over-approx SP): [`forward_may_post`],
+//!   [`forward_may_usesummary`].  Widens `reach` via disjunction.  In
+//!   SMASH-paper terminology this is the MAY family — used to prune backward
+//!   not-may propagation in [`notmay_pre_pruned`].
+//! - **Backward NOT-MAY** (over-approx WP): [`notmay_pre`],
+//!   [`notmay_pre_usesummary`], [`notmay_pre_pruned`].  Propagates `state`
+//!   (WP of the violation post) backward.  Proves safety when `reach ∧ state`
+//!   at the entry is infeasible.
+//! - **Forward MUST** (under-approx, feasibility-checked SP):
+//!   [`forward_must_post`] (scaffolding).  Currently NOT wired into
+//!   [`run_to_fixpoint`] because `TransferFn::sp` does not yet model memory.
+//!   The functional realization of forward MUST is backward NOT-MAY on a CFG
+//!   that is acyclic — either natively, or after BMC unrolling.  See
+//!   [`crate::may_must_analysis::bmc::bmc_check`] and
+//!   `design_notes/SMASH_FORWARD_MUST.md`.
 //!
-//! After each backward step an optional pruning check
-//! (`notmay_pre_pruned`) uses the [`Oracle`] to detect edges whose
-//! `reach ∧ state` is already infeasible, permanently blocking those paths
-//! from further propagation.
+//! # Debug logging convention
 //!
-//! [`run_to_fixpoint`] orchestrates both passes until no new edges are blocked.
-//! The caller then inspects the entry-node summary with [`verified`] /
-//! [`bugfound`] to obtain the final [`Judgement`].
+//! Every rule application emits a `log::debug!(target: "rules", ...)` line
+//! whose first token is the rule name in `[brackets]` and whose body names
+//! the formula it added (or the action it took).  This makes a trace of
+//! a fixpoint run mechanically reconstructible — `RUST_LOG=rules=debug`
+//! shows exactly which rule changed which node summary, in order.  The
+//! verdict-producing methods ([`verified`], [`bugfound`], [`must_bugfound`])
+//! follow the same convention.
 //!
 //! [`run_to_fixpoint`]: RuleEngine::run_to_fixpoint
 //! [`verified`]: RuleEngine::verified
 //! [`bugfound`]: RuleEngine::bugfound
+//! [`forward_may_post`]: RuleEngine::forward_may_post
+//! [`forward_may_usesummary`]: RuleEngine::forward_may_usesummary
+//! [`forward_must_post`]: RuleEngine::forward_must_post
+//! [`notmay_pre`]: RuleEngine::notmay_pre
+//! [`notmay_pre_usesummary`]: RuleEngine::notmay_pre_usesummary
+//! [`notmay_pre_pruned`]: RuleEngine::notmay_pre_pruned
+//! [`must_bugfound`]: RuleEngine::must_bugfound
 
 #![allow(dead_code)]
 
@@ -508,8 +527,18 @@ impl<'a> RuleEngine<'a> {
     /// means no reachable state can violate the assertion, so the assertion
     /// holds on all reachable paths.
     pub fn verified(&self, entry: CfgNodeId, oracle: &Oracle) -> Result<bool, RuleError> {
-        let result = oracle.check_summary(self.summary(entry)?)?;
-        Ok(result.feasibility == Feasibility::Infeasible)
+        let summary = self.summary(entry)?;
+        let result = oracle.check_summary(summary)?;
+        let verified = result.feasibility == Feasibility::Infeasible;
+        log::debug!(
+            target: "rules",
+            "[verified] entry {:?}: reach={} state={} → {}",
+            entry,
+            fmt_formula(&summary.reach),
+            fmt_formula(&summary.state),
+            if verified { "Verified (reach∧state UNSAT)" } else { "not verified" }
+        );
+        Ok(verified)
     }
 
     /// Returns a potential counterexample if a bug was found, or `None` if the
@@ -547,18 +576,34 @@ impl<'a> RuleEngine<'a> {
         cfg_is_acyclic: bool,
     ) -> Result<Option<Option<SmtModel>>, RuleError> {
         if !cfg_is_acyclic {
-            // Cyclic CFGs use injected loop invariants in `reach`, which is an
-            // over-approximation tight enough to prove safety but loose enough
-            // that `reach ∧ state` SAT models can be spurious.  Don't declare
-            // BugFound from this path — the SMASH orchestrator will invoke
-            // BMC (forward MUST) to find real bugs.
+            log::debug!(
+                target: "rules",
+                "[bugfound] entry {:?}: cfg is cyclic — skipping unsound reach∧state \
+                 heuristic (deferring bug-finding to BMC)",
+                entry,
+            );
             return Ok(None);
         }
-        let result = oracle.check_summary(self.summary(entry)?)?;
-        Ok(match result.feasibility {
-            Feasibility::Feasible => Some(result.model),
-            Feasibility::Infeasible | Feasibility::Unknown => None,
-        })
+        let summary = self.summary(entry)?;
+        let result = oracle.check_summary(summary)?;
+        match result.feasibility {
+            Feasibility::Feasible => {
+                log::debug!(
+                    target: "rules",
+                    "[bugfound] entry {:?}: reach∧state SAT on acyclic CFG → BugFound (witness retained)",
+                    entry,
+                );
+                Ok(Some(result.model))
+            }
+            Feasibility::Infeasible | Feasibility::Unknown => {
+                log::debug!(
+                    target: "rules",
+                    "[bugfound] entry {:?}: reach∧state {:?} → no bug",
+                    entry, result.feasibility,
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// **Paper-equivalent BugFound check** — under-approximate forward MUST.
@@ -585,15 +630,13 @@ impl<'a> RuleEngine<'a> {
     ) -> Result<Option<Option<SmtModel>>, RuleError> {
         let must_reach_pre = &self.summary(assertion_site)?.must_reach;
         if *must_reach_pre == Formula::False {
-            // No concrete path has reached the assertion site yet.
+            log::debug!(
+                target: "rules",
+                "[must_bugfound] site {:?}: must_reach is False — no concrete witness",
+                assertion_site,
+            );
             return Ok(None);
         }
-        // `must_reach[site]` is the pre-state of the assertion site (before
-        // its own transfer fires).  The assertion's obligation is checked
-        // AFTER the site's effects execute, so apply SP through the site's
-        // transfer to get the post-state, then conjoin with the violation.
-        // This mirrors how the backward side seeds `state[site]` with
-        // `WP(site.transfer, ¬obligation)`.
         let post = self
             .cfg
             .node(assertion_site)
@@ -604,10 +647,24 @@ impl<'a> RuleEngine<'a> {
             .sp(must_reach_pre);
         let combined = Formula::and(post, violation.clone());
         let report = oracle.feasibility_with_model(&combined)?;
-        Ok(match report.feasibility {
-            Feasibility::Feasible => Some(report.model),
-            Feasibility::Infeasible | Feasibility::Unknown => None,
-        })
+        match report.feasibility {
+            Feasibility::Feasible => {
+                log::debug!(
+                    target: "rules",
+                    "[must_bugfound] site {:?}: SP(site.transfer, must_reach) ∧ ¬obligation SAT → real BugFound",
+                    assertion_site,
+                );
+                Ok(Some(report.model))
+            }
+            Feasibility::Infeasible | Feasibility::Unknown => {
+                log::debug!(
+                    target: "rules",
+                    "[must_bugfound] site {:?}: {:?} — no real witness",
+                    assertion_site, report.feasibility,
+                );
+                Ok(None)
+            }
+        }
     }
 }
 
