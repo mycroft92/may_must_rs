@@ -41,9 +41,10 @@ Totals: ~51 UNKNOWN · 3 UNSOUND · 7 MISSED · 105 files.
 
 ### MISSED (wrong verdict on unsafe program)
 
-- `c/loops/array-2` — currently UNKNOWN; `--bmc-bound 1` finds the bug
-  (BugFound after 1 loop iteration). Need to plumb BMC into the benchmark
-  runner to count this as fixed.
+- `c/loops/array-2` — direct analysis returns UNKNOWN; `--bmc-bound 1` finds
+  the bug (BugFound after 1 loop iteration, regression test added in v0.12.x).
+  Benchmark runner does not pass `--bmc-bound` yet; plumb it in to count this
+  as fixed in the SV-COMP score.
 - `c/loops/ludcmp`
 - `c/loops/nec20`
 - `c/loops/sum01_bug02.i`
@@ -97,14 +98,14 @@ full exit closure — needs re-benchmark after this change.)
 ## Current Backlog
 
 - **Memory-relational invariant templates** — `c/loops/array-1` is SAFE (v0.9.0)
-  via entry-safety candidates.  `c/loops/array-2` correctly returns UNKNOWN (v0.10.1)
-  after fixing a soundness bug where variable-valued preheader store facts produced
-  tautological invariants that falsely verified the program as SAFE.  The remaining
-  gap: a *cross-region relational* candidate generator producing `select(R1,i) <= select(R2,j)`
-  templates from assertion postconditions would let the tool report BugFound for
-  array-2 (the relational candidate `menor <= array[0]` would fail exit closure since
-  `array[0] > menor` is unsatisfied when they are equal) and extend coverage to other
-  memory-relational cases.
+  via entry-safety candidates.  `c/loops/array-2` is findable as UNSAFE via
+  `--bmc-bound 1` (v0.12.x) but returns UNKNOWN from direct invariant analysis,
+  which cannot express cross-region relations.  The remaining gap for invariant-
+  based coverage: a *cross-region relational* candidate generator producing
+  `select(R1,i) <= select(R2,j)` templates from assertion postconditions.  The
+  candidate `menor <= array[0]` would fail exit closure (since `array[0] > menor`
+  is the violation) and extend coverage to other memory-relational cases where BMC
+  is not practical (large or symbolic loop bounds).
 
 ## Loop Exit Summaries
 
