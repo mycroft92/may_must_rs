@@ -240,29 +240,33 @@ impl QueryPostFingerprint {
     }
 }
 
-/// Contextual summary table: multiple `NotMaySummary` and contextual
-/// `MustSummary` entries per procedure, plus loop invariants keyed by
-/// `(procedure, fingerprint)`.
+/// Contextual summary table — the **single source of truth** for
+/// interprocedural summaries in the query-driven architecture.
 ///
-/// Coexists with the current `SummaryTables` during the refactor.  The
-/// existing types (`MaySummary` for forward MAY summaries, `NotMaySummary`)
-/// stay as the over-approximate side; the new `ContextualMustSummary` is
-/// the under-approximate side.
+/// Holds multiple contextual `(pre, post)` entries per procedure for each
+/// summary kind, plus loop invariants.  Subsumption-aware merge methods
+/// keep the table size bounded.  Replaces the legacy `SummaryTables` that
+/// was tied to the eager-inlined `compute_return_summary` workflow.
+///
+/// # Fields
+///
+/// - `notmay`: over-approximate safety summaries (SMASH-paper `NOT-MAY`).
+/// - `must`: under-approximate concrete-reachability summaries
+///   (SMASH-paper `MUST`).  Currently only populated on the acyclic
+///   bugfound path; will fill in when DART-style forward MUST is wired in.
+/// - `forward_may`: over-approximate forward-reach summaries (SMASH-paper
+///   `MAY`).  Consumed by `forward_may_usesummary` to widen caller `reach`.
+/// - `loop_invariants`: per-procedure ACHAR-verified invariants used to
+///   seed `reach` at loop headers (see `design_notes/LOOPS.md`).  Keyed by
+///   procedure name only today; query-post fingerprinting is a future
+///   enhancement (see [`QueryPostFingerprint`]).
 #[derive(Clone, Debug, Default)]
 pub struct ContextualSummaryTable {
-    /// Contextual not-may summaries (over-approximate; safety).
     pub notmay: BTreeMap<ProcedureName, Vec<NotMaySummary>>,
-    /// Contextual must summaries (under-approximate; concrete witness).
     pub must: BTreeMap<ProcedureName, Vec<ContextualMustSummary>>,
-    /// Over-approximate forward-may summaries (renamed from the old
-    /// MustSummary in v0.15.0).  Consumed by `forward_may_usesummary` to
-    /// widen `reach` at call sites.
-    pub may: BTreeMap<ProcedureName, Vec<MaySummary>>,
-    /// Loop invariants keyed by `(procedure, query-post fingerprint)`.
-    pub loop_invariants: BTreeMap<
-        (ProcedureName, QueryPostFingerprint),
-        Vec<(crate::common::abstract_cfg::CfgNodeId, Formula)>,
-    >,
+    pub forward_may: BTreeMap<ProcedureName, Vec<MaySummary>>,
+    pub loop_invariants:
+        BTreeMap<ProcedureName, Vec<(crate::common::abstract_cfg::CfgNodeId, Formula)>>,
 }
 
 impl ContextualSummaryTable {
@@ -284,8 +288,90 @@ impl ContextualSummaryTable {
             .unwrap_or(&[])
     }
 
-    pub fn may(&self, procedure: &str) -> &[MaySummary] {
-        self.may.get(procedure).map(|v| v.as_slice()).unwrap_or(&[])
+    pub fn forward_may(&self, procedure: &str) -> &[MaySummary] {
+        self.forward_may
+            .get(procedure)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Initialises an empty `notmay` entry for `procedure`.  Useful when a
+    /// procedure has been analysed but produced no summaries.
+    pub fn init_notmay(&mut self, procedure: impl Into<ProcedureName>) {
+        self.notmay.entry(procedure.into()).or_default();
+    }
+
+    /// Initialises an empty `forward_may` entry for `procedure`.
+    pub fn init_forward_may(&mut self, procedure: impl Into<ProcedureName>) {
+        self.forward_may.entry(procedure.into()).or_default();
+    }
+
+    /// Structural-dedup insert (no subsumption check).  Use `merge_notmay`
+    /// when subsumption matters.
+    pub fn add_notmay(
+        &mut self,
+        procedure: impl Into<ProcedureName>,
+        summary: NotMaySummary,
+    ) -> bool {
+        let entries = self.notmay.entry(procedure.into()).or_default();
+        if entries.contains(&summary) {
+            false
+        } else {
+            entries.push(summary);
+            true
+        }
+    }
+
+    /// Structural-dedup insert (no subsumption check).  Use `merge_must`
+    /// when subsumption matters.
+    pub fn add_forward_may(
+        &mut self,
+        procedure: impl Into<ProcedureName>,
+        summary: MaySummary,
+    ) -> bool {
+        let entries = self.forward_may.entry(procedure.into()).or_default();
+        if entries.contains(&summary) {
+            false
+        } else {
+            entries.push(summary);
+            true
+        }
+    }
+
+    /// Replaces the loop invariants for `procedure`.  Each element is
+    /// `(header_node_id, invariant_formula)`.
+    pub fn set_loop_invariants(
+        &mut self,
+        procedure: impl Into<ProcedureName>,
+        invariants: Vec<(crate::common::abstract_cfg::CfgNodeId, Formula)>,
+    ) {
+        self.loop_invariants.insert(procedure.into(), invariants);
+    }
+
+    /// Returns loop invariants for `procedure`, or empty if none.
+    pub fn get_loop_invariants(
+        &self,
+        procedure: &str,
+    ) -> &[(crate::common::abstract_cfg::CfgNodeId, Formula)] {
+        self.loop_invariants
+            .get(procedure)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// All procedure names referenced by any of the four maps.
+    pub fn all_procedure_names(&self) -> Vec<ProcedureName> {
+        let mut names: Vec<ProcedureName> = self
+            .notmay
+            .keys()
+            .chain(self.must.keys())
+            .chain(self.forward_may.keys())
+            .chain(self.loop_invariants.keys())
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Adds a `NotMaySummary` with merge-with-subsumption semantics
