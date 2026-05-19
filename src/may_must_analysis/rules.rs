@@ -425,16 +425,45 @@ impl<'a> RuleEngine<'a> {
     /// Returns a potential counterexample if a bug was found, or `None` if the
     /// analysis could not confirm a violation.
     ///
-    /// Returns `Some(model)` when the oracle finds `reach ∧ state` feasible at
-    /// the entry node, where `model` is `Some(witness)` if the solver produced
-    /// a concrete state or `None` if it only confirmed feasibility without a
-    /// model.  Returns `None` when the combined formula is infeasible or the
-    /// oracle returns `Unknown`.
+    /// # Soundness (v0.15.0+)
+    ///
+    /// This check inspects `reach ∧ state` at the entry node.  In SMASH-paper
+    /// terms both components are **MAY-family over-approximations**:
+    ///
+    /// - `reach` is forward SP, widened at loop headers by injected invariants
+    ///   and at call sites by MAY summaries (disjunctive `join_reach`).
+    /// - `state` is backward WP, propagated over the same widened control flow.
+    ///
+    /// Combining two over-approximations and finding a satisfying model does
+    /// **not** in general prove a real bug — the witness may sit entirely in
+    /// the over-approximation gap (a state that's spuriously in both reach
+    /// and state without corresponding to any concrete execution).  This is
+    /// the root cause of the historical false-UNSAFE verdicts on
+    /// `linear_sea.ch`, `veris_NetBSD-libc_loop.i`, and `bin-suffix-5`.
+    ///
+    /// Sound BugFound verdicts require an **under-approximate** witness — see
+    /// [`crate::may_must_analysis::bmc::bmc_check`] (MUST direction in the
+    /// SMASH orchestrator).
+    ///
+    /// To keep this method usable for legitimately acyclic CFGs without
+    /// MAY-summary widening — where SP/WP are precise modulo SMT — the caller
+    /// must explicitly confirm the CFG is acyclic via the `cfg_is_acyclic`
+    /// parameter.  When the CFG has back edges, this method returns `None`
+    /// (no bug reported); callers should defer to BMC for those programs.
     pub fn bugfound(
         &self,
         entry: CfgNodeId,
         oracle: &Oracle,
+        cfg_is_acyclic: bool,
     ) -> Result<Option<Option<SmtModel>>, RuleError> {
+        if !cfg_is_acyclic {
+            // Cyclic CFGs use injected loop invariants in `reach`, which is an
+            // over-approximation tight enough to prove safety but loose enough
+            // that `reach ∧ state` SAT models can be spurious.  Don't declare
+            // BugFound from this path — the SMASH orchestrator will invoke
+            // BMC (forward MUST) to find real bugs.
+            return Ok(None);
+        }
         let result = oracle.check_summary(self.summary(entry)?)?;
         Ok(match result.feasibility {
             Feasibility::Feasible => Some(result.model),

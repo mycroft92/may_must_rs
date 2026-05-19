@@ -101,7 +101,8 @@ Priority order:
 
 ## Soundness Debt (fix before broadening)
 
-These items can produce a **wrong `Verified`** on a program that is actually unsafe.
+These items can produce a **wrong `Verified`** or a **wrong `UNSAFE`** on a
+program where the assertion holds (or doesn't).
 
 - **`udiv`/`urem` treated as signed** — DONE.  `Assume(lhs >= 0)`, `Assume(rhs >= 0)`,
   `Assume(result >= 0)` already injected.
@@ -109,17 +110,29 @@ These items can produce a **wrong `Verified`** on a program that is actually uns
   `Assume(lhs >= 0)` and `Assume(rhs >= 0)` before any `ult/ule/ugt/uge`.
 - **Phase-B bypassing exit closure** — DONE (`0.11.0`).  Removed for assertion
   verification.  See [[feedback_phase_b_soundness]] in memory.
+- **`bugfound` from `reach ∧ state` on cyclic CFGs** — DONE (`0.15.0`).  Combining
+  two MAY-family over-approximations (forward SP `reach` and backward WP `state`)
+  and finding a satisfying model does **not** prove a real bug — the witness can
+  sit entirely in the over-approximation gap.  Fix: `RuleEngine::bugfound` now
+  requires `cfg_is_acyclic = true`.  Cyclic CFGs defer to BMC (under-approximate
+  MUST direction).  This was the root cause of false-UNSAFE on `linear_sea.ch`,
+  `veris_NetBSD-libc_loop.i`, and `bin-suffix-5`.
 
 ## Known Benchmark Gaps (as of `170bab6`, 2026-05-19)
 
 Reference: `benchmarks/sv-comp/RESULTS.md`, latest run.
 Totals: ~51 UNKNOWN · 3 UNSOUND · 7 MISSED · 105 files.
 
-### UNSOUND (false-SAFE — wrong `Verified` on unsafe program)
+### UNSOUND (previously false-UNSAFE — fixed in `0.15.0`)
 
-- `c/loops/linear_sea.ch` — expected SAFE, got UNSAFE
-- `c/loops/veris.c_NetBSD-libc_loop.i` — expected SAFE, got UNSAFE
-- `c/loop-invariants/bin-suffix-5` — expected SAFE, got UNSAFE
+The following SAFE programs were reported UNSAFE before the cyclic-`bugfound`
+fix; they should now report UNKNOWN (or SAFE if invariant synthesis succeeds):
+
+- `c/loops/linear_sea.ch` — was false UNSAFE, expected SAFE.
+- `c/loops/veris.c_NetBSD-libc_loop.i` — was false UNSAFE, expected SAFE.
+- `c/loop-invariants/bin-suffix-5` — was false UNSAFE, expected SAFE.
+
+These need a benchmark re-run on `stable` to confirm.
 
 ### MISSED (UNKNOWN on programs we should solve)
 

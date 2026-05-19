@@ -341,7 +341,12 @@ fn run_backward(
     engine.set_state(site.node, pre_at_assertion)?;
     engine.run_to_fixpoint(&order, tables, oracle)?;
 
-    let bug = engine.bugfound(cfg.entry(), oracle)?;
+    // BugFound from the combined `reach ∧ state` check is only sound on
+    // acyclic CFGs (no loop-invariant widening).  Cyclic CFGs defer bug
+    // finding to BMC (forward MUST) in the SMASH orchestrator — see the
+    // soundness note on `RuleEngine::bugfound`.
+    let cfg_is_acyclic = cfg.detect_back_edges().is_empty();
+    let bug = engine.bugfound(cfg.entry(), oracle, cfg_is_acyclic)?;
     let judgement = if let Some(model) = bug {
         Judgement::BugFound { model }
     } else if engine.verified(cfg.entry(), oracle)? {
