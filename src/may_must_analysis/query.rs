@@ -27,10 +27,11 @@
 
 #![allow(dead_code)]
 
-use crate::common::formula::{Formula, SmtModel};
+use crate::common::abstract_cfg::substitute_var_in_formula;
+use crate::common::formula::{Formula, Memory, SmtModel, Term, Var};
 use crate::common::oracle::{Oracle, OracleError, Validity};
 use crate::may_must_analysis::summaries::{MaySummary, NotMaySummary, ProcedureName};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A demand-driven query asking one Hoare-style question of one procedure.
 ///
@@ -409,6 +410,447 @@ impl ContextualSummaryTable {
 
 // ── Unit tests ──────────────────────────────────────────────────────────
 
+// ── Projection to procedure interface ────────────────────────────────────
+
+/// Identifies the procedure-interface boundary used by `project_to_interface`.
+///
+/// **What counts as "interface"** (and survives projection):
+/// - Formal parameters (callers can name them by passing actuals).
+/// - The return value `{procedure}$__retval` (renamed to the caller's
+///   call-result variable when the summary is applied).
+/// - All memory regions, by current policy.  This preserves heap/stack
+///   content and globals verbatim — see `design_notes/QUERY_REFACTOR.md`
+///   §5.  An escape analysis can be added later to additionally drop
+///   regions provably not referenced by any caller; doing so is
+///   precision-improving, not soundness-affecting.
+///
+/// **What gets eliminated:**
+/// - Local SSA scalar variables `{procedure}$%N` other than formals.
+///   We substitute via captured equalities `v == e` where `e` mentions
+///   only interface symbols; if substitution can't reach all locals,
+///   the projection fails and no summary is emitted (sound: callers
+///   simply re-spawn the query).
+pub struct ProcedureInterface {
+    /// Procedure being projected.
+    pub procedure: ProcedureName,
+    /// SSA names of formal parameters (e.g. `["P$%0", "P$%1"]`).  These are
+    /// the *only* `P$%*` names that survive projection; everything else with
+    /// that prefix is treated as a local to eliminate.
+    pub formals: BTreeSet<String>,
+}
+
+impl ProcedureInterface {
+    /// Build an interface descriptor.  Formal parameters must be supplied
+    /// explicitly — there is no syntactic way to distinguish a formal from
+    /// a local SSA register (both look like `P$%N`).
+    pub fn new(
+        procedure: impl Into<ProcedureName>,
+        formals: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            procedure: procedure.into(),
+            formals: formals.into_iter().collect(),
+        }
+    }
+
+    /// Returns `true` if `name` is an interface scalar variable.
+    ///
+    /// Interface scalars: formals, the synthetic retval, and *any* variable
+    /// that doesn't look like a procedure-local (so external SMT-level
+    /// quantifiers, globals reduced to scalars, etc. are preserved).
+    pub fn is_interface_scalar(&self, name: &str) -> bool {
+        if self.formals.contains(name) {
+            return true;
+        }
+        let retval = format!("{}$__retval", self.procedure);
+        if name == retval {
+            return true;
+        }
+        // Anything starting with `{procedure}$%` and not in formals is a
+        // local SSA register — NOT interface.
+        let local_prefix = format!("{}$%", self.procedure);
+        if name.starts_with(&local_prefix) {
+            return false;
+        }
+        // Anything starting with `{procedure}$stack` or `{procedure}$call`
+        // is a local prefix for region/temp names; treat as non-interface
+        // for scalars but the *memory regions* are preserved separately.
+        // (Region preservation lives in the projector; this method only
+        // judges scalar interface membership.)
+        let stack_prefix = format!("{}$stack", self.procedure);
+        let call_prefix = format!("{}$call", self.procedure);
+        if name.starts_with(&stack_prefix) || name.starts_with(&call_prefix) {
+            // These are region names that may show up syntactically as
+            // bare vars in some contexts; we defer to the memory branch.
+            // Treat them as interface here so they don't trigger scalar
+            // elimination — the projector only removes `P$%*` scalars.
+            return true;
+        }
+        // Anything else (globals, `__ext_*`, foreign module symbols) is
+        // interface by default.
+        true
+    }
+}
+
+/// Project `formula` so it mentions only interface scalars (per
+/// [`ProcedureInterface::is_interface_scalar`]).  All memory `select` /
+/// `store` chains over any region are preserved verbatim — including
+/// procedure-local stack regions, by the current policy.
+///
+/// Returns:
+/// - `Some(projected)` if every non-interface scalar was eliminated by
+///   substitution of an `Eq(local, expr)` equality, where `expr` mentions
+///   only interface things.
+/// - `None` if any non-interface scalar survives substitution.  This means
+///   the summary cannot be safely emitted; callers must re-analyse the
+///   procedure under the caller's specific context.
+///
+/// # Soundness
+///
+/// Substitution `local := expr` is **semantically equivalent** when `local`
+/// was defined by `local == expr` in the formula being projected (which is
+/// the standard SSA shape produced by the adapter).  No widening occurs:
+/// the resulting summary has the *same* set of models, restricted to the
+/// projection of the interface variables.  This is the only safe path —
+/// dropping conjuncts to "eliminate" stuck locals would widen the formula,
+/// which is unsound for both NotMay (broader pre claims unproven safety)
+/// and Must (broader pre claims unwitnessed reachability).
+///
+/// # Debug-watchpoint
+///
+/// When projection returns `None`, the offending non-interface scalars
+/// are logged on target `"projection"` at info level.  These are
+/// candidate places to investigate for precision loss (e.g., a phi-node
+/// whose value couldn't be tied to interface inputs, or a conditional
+/// store whose unevaluated branch left a `select(_, branch_local)`).
+pub fn project_to_interface(formula: &Formula, interface: &ProcedureInterface) -> Option<Formula> {
+    // Collect substitution candidates: equalities `Eq(Var(local), expr)`
+    // or `Eq(expr, Var(local))` where local is a non-interface scalar.
+    let mut substitutions: BTreeMap<String, Term> = BTreeMap::new();
+    collect_local_definitions(formula, interface, &mut substitutions);
+
+    // Resolve chained substitutions to a fixpoint.  E.g. if we have
+    // `%15 -> %13 < %14`, `%13 -> select(stack2, 0)`, `%14 -> select(stack1, 0)`,
+    // resolve `%15` to `select(stack2, 0) < select(stack1, 0)`.
+    let resolved = resolve_substitution_chain(substitutions);
+
+    // Apply substitutions throughout the formula.
+    let mut projected = formula.clone();
+    for (name, replacement) in &resolved {
+        // `substitute_var_in_formula` handles all formula/term variants.
+        // We construct a Var with Int sort by default; the underlying
+        // substitution is sort-agnostic for our purposes (it only matches
+        // by name).  See note in abstract_cfg.rs.
+        let target_var = Var::new(name.clone(), guess_sort_of(replacement));
+        projected = substitute_var_in_formula(&target_var, replacement, &projected);
+    }
+
+    // Verify no non-interface scalars remain.
+    let remaining = find_non_interface_scalars(&projected, interface);
+    if !remaining.is_empty() {
+        log::info!(
+            target: "projection",
+            "project_to_interface({}): could not eliminate {:?} — discarding summary. \
+             Debug-watchpoint: these locals were not bound by an Eq(local, interface-only-expr) \
+             conjunct in the formula being projected.",
+            interface.procedure,
+            remaining,
+        );
+        return None;
+    }
+
+    Some(projected)
+}
+
+/// Walk `formula` collecting `Eq(Var(local), expr)` equalities where
+/// `local` is a non-interface scalar.  Used by `project_to_interface` to
+/// build the substitution map.
+///
+/// We collect equalities from positive positions only (inside conjunctions
+/// and the top-level structure).  Equalities buried inside negations,
+/// disjunctions, or implications are NOT treated as definitions — they
+/// may not hold on every model.
+fn collect_local_definitions(
+    formula: &Formula,
+    interface: &ProcedureInterface,
+    out: &mut BTreeMap<String, Term>,
+) {
+    match formula {
+        Formula::Eq(lhs, rhs) => {
+            // Try both directions: local == expr  or  expr == local.
+            if let Some((name, replacement)) = local_equality_pair(lhs, rhs, interface) {
+                // First-write-wins.  If we already substituted this name,
+                // keep the earlier binding (in SSA each name has at most
+                // one definition anyway).
+                out.entry(name).or_insert(replacement);
+            } else if let Some((name, replacement)) = local_equality_pair(rhs, lhs, interface) {
+                out.entry(name).or_insert(replacement);
+            }
+        }
+        Formula::And(parts) => {
+            for p in parts {
+                collect_local_definitions(p, interface, out);
+            }
+        }
+        // Conservative: don't peer into negations, disjunctions, implications.
+        _ => {}
+    }
+}
+
+/// If `lhs` is `Var(local-non-interface-scalar)`, return the pair
+/// `(local_name, rhs)`.  Otherwise return `None`.
+///
+/// We do NOT require `rhs` to mention only interface things here — the
+/// transitive resolution in [`resolve_substitution_chain`] handles
+/// chains like `%3 == %2 + 1, %2 == p$%0 * 2`.  Collecting every local
+/// equality regardless of RHS purity lets the resolver substitute
+/// `%2 → p$%0 * 2` into `%3`'s RHS during fixpoint iteration.
+fn local_equality_pair(
+    lhs: &Term,
+    rhs: &Term,
+    interface: &ProcedureInterface,
+) -> Option<(String, Term)> {
+    let Term::Var(var) = lhs else {
+        return None;
+    };
+    if interface.is_interface_scalar(var.name()) {
+        return None;
+    }
+    Some((var.name().to_string(), rhs.clone()))
+}
+
+/// Returns `true` if `term` references any non-interface scalar.
+fn term_mentions_non_interface_scalar(term: &Term, interface: &ProcedureInterface) -> bool {
+    match term {
+        Term::Var(v) => !interface.is_interface_scalar(v.name()),
+        Term::Int(_) | Term::Real(_) => false,
+        Term::BoolToInt(inner) => formula_mentions_non_interface_scalar(inner, interface),
+        Term::Select(_mem, idx) => term_mentions_non_interface_scalar(idx, interface),
+        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b) | Term::Rem(a, b) => {
+            term_mentions_non_interface_scalar(a, interface)
+                || term_mentions_non_interface_scalar(b, interface)
+        }
+        Term::Neg(inner) => term_mentions_non_interface_scalar(inner, interface),
+    }
+}
+
+/// Returns `true` if `formula` references any non-interface scalar.
+fn formula_mentions_non_interface_scalar(
+    formula: &Formula,
+    interface: &ProcedureInterface,
+) -> bool {
+    match formula {
+        Formula::True | Formula::False => false,
+        Formula::Var(v) => !interface.is_interface_scalar(v.name()),
+        Formula::Not(inner) => formula_mentions_non_interface_scalar(inner, interface),
+        Formula::And(parts) | Formula::Or(parts) => parts
+            .iter()
+            .any(|p| formula_mentions_non_interface_scalar(p, interface)),
+        Formula::Implies(lhs, rhs) => {
+            formula_mentions_non_interface_scalar(lhs, interface)
+                || formula_mentions_non_interface_scalar(rhs, interface)
+        }
+        Formula::Eq(a, b)
+        | Formula::Lt(a, b)
+        | Formula::Le(a, b)
+        | Formula::Gt(a, b)
+        | Formula::Ge(a, b) => {
+            term_mentions_non_interface_scalar(a, interface)
+                || term_mentions_non_interface_scalar(b, interface)
+        }
+        Formula::MemoryEq(a, b) => {
+            memory_mentions_non_interface_scalar(a, interface)
+                || memory_mentions_non_interface_scalar(b, interface)
+        }
+    }
+}
+
+fn memory_mentions_non_interface_scalar(memory: &Memory, interface: &ProcedureInterface) -> bool {
+    match memory {
+        Memory::Var(_) => false,
+        Memory::Store(mem, idx, val) => {
+            memory_mentions_non_interface_scalar(mem, interface)
+                || term_mentions_non_interface_scalar(idx, interface)
+                || term_mentions_non_interface_scalar(val, interface)
+        }
+    }
+}
+
+/// Resolve chained substitutions to a fixpoint.  Returns a new map where
+/// every replacement term mentions only interface scalars (or the
+/// substitution failed and the unresolved entries are still present).
+fn resolve_substitution_chain(mut subst: BTreeMap<String, Term>) -> BTreeMap<String, Term> {
+    // Bounded iteration — chains are short in practice (SSA register
+    // dependency depth).  8 iterations is plenty; a hard cap prevents
+    // infinite loops if the map contains a cycle (which SSA never does
+    // but defensive code is cheap).
+    for _ in 0..8 {
+        let snapshot = subst.clone();
+        let mut changed = false;
+        for (_, value) in subst.iter_mut() {
+            let new_value = apply_subst_to_term(value, &snapshot);
+            if format!("{new_value:?}") != format!("{value:?}") {
+                *value = new_value;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    subst
+}
+
+fn apply_subst_to_term(term: &Term, subst: &BTreeMap<String, Term>) -> Term {
+    match term {
+        Term::Var(v) => subst.get(v.name()).cloned().unwrap_or_else(|| term.clone()),
+        Term::Int(_) | Term::Real(_) => term.clone(),
+        Term::BoolToInt(inner) => Term::bool_to_int(apply_subst_to_formula(inner, subst)),
+        Term::Select(mem, idx) => Term::select((**mem).clone(), apply_subst_to_term(idx, subst)),
+        Term::Add(a, b) => Term::add(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst)),
+        Term::Sub(a, b) => Term::sub(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst)),
+        Term::Mul(a, b) => Term::mul(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst)),
+        Term::Div(a, b) => Term::div(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst)),
+        Term::Rem(a, b) => Term::rem(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst)),
+        Term::Neg(inner) => Term::neg(apply_subst_to_term(inner, subst)),
+    }
+}
+
+fn apply_subst_to_formula(formula: &Formula, subst: &BTreeMap<String, Term>) -> Formula {
+    match formula {
+        Formula::True | Formula::False | Formula::Var(_) | Formula::MemoryEq(_, _) => {
+            formula.clone()
+        }
+        Formula::Not(inner) => Formula::not(apply_subst_to_formula(inner, subst)),
+        Formula::And(parts) => Formula::and_all(
+            parts
+                .iter()
+                .map(|p| apply_subst_to_formula(p, subst))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Or(parts) => Formula::or_all(
+            parts
+                .iter()
+                .map(|p| apply_subst_to_formula(p, subst))
+                .collect::<Vec<_>>(),
+        ),
+        Formula::Implies(lhs, rhs) => Formula::implies(
+            apply_subst_to_formula(lhs, subst),
+            apply_subst_to_formula(rhs, subst),
+        ),
+        Formula::Eq(a, b) => {
+            Formula::eq(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst))
+        }
+        Formula::Lt(a, b) => {
+            Formula::lt(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst))
+        }
+        Formula::Le(a, b) => {
+            Formula::le(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst))
+        }
+        Formula::Gt(a, b) => {
+            Formula::gt(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst))
+        }
+        Formula::Ge(a, b) => {
+            Formula::ge(apply_subst_to_term(a, subst), apply_subst_to_term(b, subst))
+        }
+    }
+}
+
+/// Crude sort inference for substitution.  `substitute_var_in_formula`
+/// matches by name; the sort attached to the target `Var` is unused by
+/// the substitution itself but kept for type-consistency.
+fn guess_sort_of(term: &Term) -> crate::common::formula::Sort {
+    match term {
+        Term::Real(_) => crate::common::formula::Sort::Real,
+        // BoolToInt produces an Int; everything else we use is Int-sorted.
+        _ => crate::common::formula::Sort::Int,
+    }
+}
+
+/// Collect names of non-interface scalars remaining in `formula`.
+fn find_non_interface_scalars(
+    formula: &Formula,
+    interface: &ProcedureInterface,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    walk_formula_collect_non_interface(formula, interface, &mut out);
+    out
+}
+
+fn walk_formula_collect_non_interface(
+    formula: &Formula,
+    interface: &ProcedureInterface,
+    out: &mut BTreeSet<String>,
+) {
+    match formula {
+        Formula::True | Formula::False => {}
+        Formula::Var(v) => {
+            if !interface.is_interface_scalar(v.name()) {
+                out.insert(v.name().to_string());
+            }
+        }
+        Formula::Not(inner) => walk_formula_collect_non_interface(inner, interface, out),
+        Formula::And(parts) | Formula::Or(parts) => {
+            for p in parts {
+                walk_formula_collect_non_interface(p, interface, out);
+            }
+        }
+        Formula::Implies(lhs, rhs) => {
+            walk_formula_collect_non_interface(lhs, interface, out);
+            walk_formula_collect_non_interface(rhs, interface, out);
+        }
+        Formula::Eq(a, b)
+        | Formula::Lt(a, b)
+        | Formula::Le(a, b)
+        | Formula::Gt(a, b)
+        | Formula::Ge(a, b) => {
+            walk_term_collect_non_interface(a, interface, out);
+            walk_term_collect_non_interface(b, interface, out);
+        }
+        Formula::MemoryEq(a, b) => {
+            walk_memory_collect_non_interface(a, interface, out);
+            walk_memory_collect_non_interface(b, interface, out);
+        }
+    }
+}
+
+fn walk_term_collect_non_interface(
+    term: &Term,
+    interface: &ProcedureInterface,
+    out: &mut BTreeSet<String>,
+) {
+    match term {
+        Term::Var(v) => {
+            if !interface.is_interface_scalar(v.name()) {
+                out.insert(v.name().to_string());
+            }
+        }
+        Term::Int(_) | Term::Real(_) => {}
+        Term::BoolToInt(inner) => walk_formula_collect_non_interface(inner, interface, out),
+        Term::Select(_mem, idx) => walk_term_collect_non_interface(idx, interface, out),
+        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b) | Term::Rem(a, b) => {
+            walk_term_collect_non_interface(a, interface, out);
+            walk_term_collect_non_interface(b, interface, out);
+        }
+        Term::Neg(inner) => walk_term_collect_non_interface(inner, interface, out),
+    }
+}
+
+fn walk_memory_collect_non_interface(
+    memory: &Memory,
+    interface: &ProcedureInterface,
+    out: &mut BTreeSet<String>,
+) {
+    match memory {
+        Memory::Var(_) => {}
+        Memory::Store(mem, idx, val) => {
+            walk_memory_collect_non_interface(mem, interface, out);
+            walk_term_collect_non_interface(idx, interface, out);
+            walk_term_collect_non_interface(val, interface, out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +1074,119 @@ mod tests {
         assert_ne!(
             QueryPostFingerprint::of_post(&f1),
             QueryPostFingerprint::of_post(&f3)
+        );
+    }
+
+    // ── Projection ─────────────────────────────────────────────────────
+
+    fn int_var(name: &str) -> Term {
+        Term::Var(Var::new(name, Sort::Int))
+    }
+
+    fn iface_with_no_formals(procedure: &str) -> ProcedureInterface {
+        ProcedureInterface::new(procedure, std::iter::empty())
+    }
+
+    #[test]
+    fn projection_keeps_formals_and_retval() {
+        let iface = ProcedureInterface::new("p", vec!["p$%0".to_string(), "p$%1".to_string()]);
+        // (p$%0 == p$%1) ∧ (p$__retval == p$%0)  — every var is interface.
+        let formula = Formula::and(
+            Formula::eq(int_var("p$%0"), int_var("p$%1")),
+            Formula::eq(int_var("p$__retval"), int_var("p$%0")),
+        );
+        let projected = project_to_interface(&formula, &iface).expect("should succeed");
+        // Result must mention only interface vars.  No further restriction —
+        // the formula is unchanged because every variable was interface.
+        assert!(find_non_interface_scalars(&projected, &iface).is_empty());
+    }
+
+    #[test]
+    fn projection_substitutes_local_via_equality() {
+        // Procedure `p` has one formal `p$%0` and a local `p$%1` defined
+        // as `p$%1 == p$%0 + 1`.  Summary post `p$%1 > 5`.
+        // Projection should substitute `p$%1` and yield `p$%0 + 1 > 5`.
+        let iface = ProcedureInterface::new("p", vec!["p$%0".to_string()]);
+        let formula = Formula::and(
+            Formula::eq(int_var("p$%1"), Term::add(int_var("p$%0"), Term::int(1))),
+            Formula::gt(int_var("p$%1"), Term::int(5)),
+        );
+        let projected = project_to_interface(&formula, &iface).expect("should succeed");
+        assert!(
+            find_non_interface_scalars(&projected, &iface).is_empty(),
+            "no local should remain after substitution"
+        );
+    }
+
+    #[test]
+    fn projection_substitutes_chained_locals() {
+        // %3 == %2 + 1, %2 == p$%0 * 2, post (%3 > 0).
+        // After resolve_substitution_chain: %3 → (p$%0 * 2) + 1.
+        let iface = ProcedureInterface::new("p", vec!["p$%0".to_string()]);
+        let formula = Formula::and_all(vec![
+            Formula::eq(int_var("p$%3"), Term::add(int_var("p$%2"), Term::int(1))),
+            Formula::eq(int_var("p$%2"), Term::mul(int_var("p$%0"), Term::int(2))),
+            Formula::gt(int_var("p$%3"), Term::int(0)),
+        ]);
+        let projected = project_to_interface(&formula, &iface).expect("should succeed");
+        assert!(find_non_interface_scalars(&projected, &iface).is_empty());
+    }
+
+    #[test]
+    fn projection_fails_when_local_has_no_definition() {
+        // Local `p$%5` appears in a comparison but has no `Eq` definition.
+        // Projection must return None.
+        let iface = iface_with_no_formals("p");
+        let formula = Formula::gt(int_var("p$%5"), Term::int(0));
+        let projected = project_to_interface(&formula, &iface);
+        assert!(
+            projected.is_none(),
+            "must discard summary when local can't be eliminated"
+        );
+    }
+
+    #[test]
+    fn projection_preserves_select_over_memory_region() {
+        // `select(global$g, 0) > 0`  — `global$g` is a memory region, not a
+        // scalar.  Projection must preserve verbatim regardless of formals.
+        let iface = iface_with_no_formals("p");
+        let formula = Formula::gt(
+            Term::select(Memory::var("global$g"), Term::int(0)),
+            Term::int(0),
+        );
+        let projected = project_to_interface(&formula, &iface).expect("should succeed");
+        // Must still mention `global$g` after projection.
+        assert_eq!(format!("{projected:?}"), format!("{formula:?}"));
+    }
+
+    #[test]
+    fn projection_preserves_local_stack_region() {
+        // Per current policy (preserve all regions), `select(p$stack0, 5) ==
+        // 7` survives projection even though `p$stack0` is a local region.
+        // Escape analysis (future work) can additionally drop this when
+        // proven non-escaping.
+        let iface = iface_with_no_formals("p");
+        let formula = Formula::eq(
+            Term::select(Memory::var("p$stack0"), Term::int(5)),
+            Term::int(7),
+        );
+        let projected = project_to_interface(&formula, &iface).expect("should succeed");
+        assert_eq!(format!("{projected:?}"), format!("{formula:?}"));
+    }
+
+    #[test]
+    fn projection_doesnt_collect_from_under_negation() {
+        // `¬(p$%1 == 5)` should NOT be treated as a definition of p$%1.
+        // After projection, p$%1 is not eliminated; result is None.
+        let iface = iface_with_no_formals("p");
+        let formula = Formula::and(
+            Formula::not(Formula::eq(int_var("p$%1"), Term::int(5))),
+            Formula::gt(int_var("p$%1"), Term::int(0)),
+        );
+        let projected = project_to_interface(&formula, &iface);
+        assert!(
+            projected.is_none(),
+            "equality under negation is not a definition"
         );
     }
 }
