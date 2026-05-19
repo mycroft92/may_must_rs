@@ -60,10 +60,9 @@ Summaries from both directions feed into callers:
 When inferring summaries for cyclic (looping) callees
 (`infer_cyclic_observer_summary` in `driver.rs`), the authoritative
 verification is the `analyze_with_tables` call, which runs the full
-bidirectional check. Intermediate invariant candidate synthesis in
-`observer_summary_invariants` only needs to produce an inductive invariant —
-exit closure there is intentionally skipped because the obligation is verified
-by `analyze_with_tables`.
+bidirectional check. `observer_summary_invariants` now performs all three
+checks (initiation, inductiveness, exit closure) and returns
+`Vec<VerifiedLoopInvariant>` — these are passed directly to `analyze_with_tables`.
 
 ## Key Semantic Boundaries
 
@@ -77,8 +76,18 @@ by `analyze_with_tables`.
   one assertion. `run_backward` is its core. `synthesize_loop_invariants`
   handles cyclic CFGs.
 - **`loops.rs`**: `check_loop_invariant_verbose` checks initiation,
-  inductiveness, and optionally exit closure. Pass `&BTreeMap::new()` for
-  `assertion_postconditions` when exit closure should be skipped.
+  inductiveness, and optionally exit closure.
+  **Invariant strength**: two kinds, enforced at the type level:
+  - **`VerifiedLoopInvariant`** — passes all three checks (initiation +
+    inductiveness + exit closure against real `assertion_postconditions`). The
+    *only* type accepted by `run_backward`. Produced by `synthesize_loop_invariants`
+    (when postconditions are non-empty), `verify_precomputed`, and
+    `observer_summary_invariants`.
+  - **InductiveHint** — `(CfgNodeId, Formula)` pair that passes only initiation
+    + inductiveness (`&BTreeMap::new()` passed for exit closure). Legal **only**
+    in the pre-pass (`discover_loop_invariants`). Must be upgraded to
+    `VerifiedLoopInvariant` via `verify_precomputed` before reaching `run_backward`.
+    **Never** pass raw hints to `run_backward` directly.
   **Inductiveness pitfall**: the inductiveness check computes `WP(body, I)` and
   calls `oracle.implies(I, WP(body, I))`. Any `Assume(c)` on a fresh
   call-return variable inside the loop body (e.g. from a `nondet_*()` call in
@@ -285,11 +294,13 @@ For each `call` instruction where the callee has a known `ReturnSummary`:
 
 - Prefer `UNKNOWN` over an unsound `Verified` claim.
 - Mark heavy approximations with `APPROX_HEAVY:` comments.
-- An invariant is sound only when both initiation and inductiveness pass.
-  Exit closure is an additional check that ties invariants to the specific
-  assertion — it is not required for inductive correctness, but it IS required
-  for the invariant to directly discharge the obligation. When skipping it,
-  ensure `analyze_with_tables` does the discharge instead.
+- An invariant is sound only when all three checks pass: initiation,
+  inductiveness, and exit closure against the real assertion postconditions.
+  Exit closure ties the invariant to the specific obligation — without it the
+  invariant may be inductive but irrelevant to the assertion.
+  The `VerifiedLoopInvariant` type enforces this: it is only constructible
+  through paths that run all three checks. Never bypass the type to pass raw
+  `(CfgNodeId, Formula)` hints to `run_backward`.
 - Do not read `obsolete/`.
 - Keep generated `.ll`, `.bc`, and DOT files out of source control.
 

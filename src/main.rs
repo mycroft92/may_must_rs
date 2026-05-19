@@ -42,6 +42,18 @@ fn main() {
                 .value_parser(value_parser!(usize))
                 .default_value("500"),
         )
+        .arg(
+            arg!(--"achar-timeout" <SECS> "Time budget in seconds for the ACHAR CEGIS loop invariant synthesis phase per loop (default: 10)")
+                .required(false)
+                .value_parser(value_parser!(u64))
+                .default_value("10"),
+        )
+        .arg(
+            arg!(--"bmc-bound" <K> "When invariant synthesis fails, try bounded model checking up to K loop iterations as a bug-finding fallback (0 = disabled)")
+                .required(false)
+                .value_parser(value_parser!(usize))
+                .default_value("0"),
+        )
         .get_matches();
 
     init_logging(
@@ -86,6 +98,11 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
         .get_one::<usize>("max-function-size")
         .unwrap_or(&500);
 
+    let achar_timeout_secs = *matches.get_one::<u64>("achar-timeout").unwrap_or(&10);
+
+    let bmc_bound_raw = *matches.get_one::<usize>("bmc-bound").unwrap_or(&0);
+    let bmc_bound = (bmc_bound_raw > 0).then_some(bmc_bound_raw);
+
     let mode = if matches.get_flag("inv-observer") {
         SynthesisMode::ObserverOnly
     } else if matches.get_flag("inv-grammar") {
@@ -97,6 +114,8 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
     InvariantConfig {
         mode,
         max_function_size,
+        achar_timeout: std::time::Duration::from_secs(achar_timeout_secs),
+        bmc_bound,
     }
 }
 

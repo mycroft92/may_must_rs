@@ -55,7 +55,8 @@ use crate::common::formula::{Formula, Memory, ModelValue, SmtModel, Sort, Term, 
 use crate::common::oracle::{Feasibility, Oracle};
 use crate::may_must_analysis::loops::{
     check_loop_invariant_verbose, extract_back_edge_counter, formula_conjuncts,
-    forward_reach_at_header, negate_comparison, InnerInvariants, InvariantCheckResult, LoopInfo,
+    forward_reach_at_header, negate_comparison, preheader_store_facts_at_header, InnerInvariants,
+    InvariantCheckResult, LoopInfo,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -114,11 +115,14 @@ fn eval_term(term: &Term, state: &IceState) -> Option<i64> {
             let idx_val = eval_term(idx, state)?;
             match mem.as_ref() {
                 Memory::Var(name) => {
-                    // Use default array value; may not match a specific index but
-                    // is the best approximation from Z3's ArrayDefault model.
-                    let default = state.arrays.get(name.as_str()).copied()?;
-                    let _ = idx_val; // index not used with ArrayDefault
-                    Some(default)
+                    // Try per-index value first.  model_bindings stores per-index
+                    // values as scalars keyed "region[idx]" when different indices
+                    // have different values in Z3's model.
+                    if let Some(&v) = state.scalars.get(&format!("{name}[{idx_val}]")) {
+                        return Some(v);
+                    }
+                    // Fall back to the ArrayDefault uniform background value.
+                    state.arrays.get(name.as_str()).copied()
                 }
                 _ => None,
             }
@@ -592,6 +596,101 @@ fn violation_negation_atoms(
     atoms
 }
 
+// ── Predicate atom collection ─────────────────────────────────────────────────
+
+/// Collect atomic predicate atoms directly from the loop CFG structure.
+///
+/// Mines edge guards and `Assume` / `Assign { Predicate }` effects from every
+/// node and edge in the loop body (including exit edges and the back edge).
+/// Each collected atomic comparison and its precise negation are included.
+///
+/// These atoms are tried before the combinatorial vocabulary expansion because
+/// they are the predicates the programmer explicitly wrote — they are the
+/// natural building blocks for loop invariants.
+fn collect_predicate_atoms(info: &LoopInfo, cfg: &AbstractCfg) -> Vec<Formula> {
+    let mut raw: Vec<Formula> = Vec::new();
+
+    // Edge guards: all edges with source in the loop body.
+    for &node_id in &info.body {
+        for edge_id in cfg.outgoing_edges(node_id) {
+            if let Ok(edge) = cfg.edge(edge_id) {
+                collect_atomic_comparisons(&edge.guard, &mut raw);
+            }
+        }
+    }
+
+    // Assume and Predicate-Assign effects in loop body nodes.
+    for &node_id in &info.body {
+        if let Ok(node) = cfg.node(node_id) {
+            for effect in &node.transfer.effects {
+                match effect {
+                    TransferEffect::Assume(f) => collect_atomic_comparisons(f, &mut raw),
+                    TransferEffect::Assign {
+                        value: AssignValue::Predicate(f),
+                        ..
+                    } => collect_atomic_comparisons(f, &mut raw),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Add precise negations.
+    let negated: Vec<Formula> = raw.iter().filter_map(negate_comparison).collect();
+    raw.extend(negated);
+
+    // Filter LLVM internals, deduplicate.
+    raw.retain(|f| !formula_contains_vla_var(f));
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    raw.retain(|f| seen.insert(format!("{f:?}")));
+    raw
+}
+
+/// Recursively extract atomic comparisons (Le/Lt/Ge/Gt/Eq) from a formula.
+fn collect_atomic_comparisons(formula: &Formula, out: &mut Vec<Formula>) {
+    match formula {
+        Formula::Le(..) | Formula::Lt(..) | Formula::Ge(..) | Formula::Gt(..) | Formula::Eq(..) => {
+            out.push(formula.clone());
+        }
+        Formula::Not(inner) => collect_atomic_comparisons(inner, out),
+        Formula::And(parts) | Formula::Or(parts) => {
+            for p in parts {
+                collect_atomic_comparisons(p, out);
+            }
+        }
+        Formula::Implies(lhs, rhs) => {
+            collect_atomic_comparisons(lhs, out);
+            collect_atomic_comparisons(rhs, out);
+        }
+        _ => {}
+    }
+}
+
+/// Returns true if any variable in the formula contains `__vla_expr`.
+fn formula_contains_vla_var(formula: &Formula) -> bool {
+    match formula {
+        Formula::Le(a, b)
+        | Formula::Lt(a, b)
+        | Formula::Ge(a, b)
+        | Formula::Gt(a, b)
+        | Formula::Eq(a, b) => term_contains_vla_var(a) || term_contains_vla_var(b),
+        Formula::Not(f) => formula_contains_vla_var(f),
+        _ => false,
+    }
+}
+
+fn term_contains_vla_var(term: &Term) -> bool {
+    match term {
+        Term::Var(v) => v.name().contains("__vla_expr"),
+        Term::Add(a, b) | Term::Sub(a, b) | Term::Mul(a, b) | Term::Div(a, b) | Term::Rem(a, b) => {
+            term_contains_vla_var(a) || term_contains_vla_var(b)
+        }
+        Term::Neg(a) => term_contains_vla_var(a),
+        Term::Select(_, idx) => term_contains_vla_var(idx),
+        _ => false,
+    }
+}
+
 // ── CEGIS synthesis ───────────────────────────────────────────────────────────
 
 /// Accumulated ICE counterexample states from rejected candidates.
@@ -649,136 +748,80 @@ impl IceFeedback {
 
     /// Returns true if the candidate is already inconsistent with accumulated states,
     /// making an SMT call unnecessary.
-    ///
-    /// Only atoms (simple comparisons) can be evaluated concretely; compound formulas
-    /// (conjunctions, disjunctions) are not pre-screened.
     fn screens_out(&self, candidate: &Formula) -> bool {
-        // For must_hold states: if candidate is false, it will fail initiation/inductiveness.
-        for state in &self.must_hold {
-            if eval_atom(candidate, state) == Some(false) {
-                return true;
+        match candidate {
+            // A disjunction A || B is false iff both A and B are false.
+            // If both disjuncts evaluate to false on any must-hold state, the
+            // whole candidate fails initiation there — screen it out.
+            Formula::Or(parts) => {
+                for state in &self.must_hold {
+                    if parts.iter().all(|p| eval_atom(p, state) == Some(false)) {
+                        return true;
+                    }
+                }
+                false
+            }
+            // Atom / conjunction: standard check
+            _ => {
+                for state in &self.must_hold {
+                    if eval_atom(candidate, state) == Some(false) {
+                        return true;
+                    }
+                }
+                for state in &self.must_not_hold {
+                    if eval_atom(candidate, state) == Some(true) {
+                        return true;
+                    }
+                }
+                false
             }
         }
-        // For must_not_hold states: if candidate is true, exit closure is likely to fail.
-        for state in &self.must_not_hold {
-            if eval_atom(candidate, state) == Some(true) {
-                return true;
-            }
-        }
-        false
     }
 }
 
-/// Try ACHAR candidates with ICE feedback loop.
+/// Try a slice of candidates under the CEGIS loop.
 ///
-/// Unlike [`grammar_candidates`] which returns all candidates for external iteration,
-/// this function drives the check loop internally: after each rejected candidate it
-/// extracts the counterexample witness and uses it to pre-screen remaining candidates
-/// with cheap local evaluation.
-///
-/// Returns the first accepted (normalized) invariant, or `None` if synthesis fails.
-pub fn synthesize_with_cegis(
+/// For each candidate, checks the deadline, applies pre-screening, normalizes,
+/// checks for tautology, runs the full invariant check, and absorbs the failure
+/// witness.  Returns the normalized form of the first accepted candidate, or
+/// `None` if all fail, synthesis times out, or the list is empty.
+#[allow(clippy::too_many_arguments)]
+fn run_tier(
+    tier_name: &str,
+    candidates: &[Formula],
+    postconditions: &BTreeMap<CfgNodeId, Formula>,
     info: &LoopInfo,
     cfg: &AbstractCfg,
-    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    inner: InnerInvariants<'_>,
     oracle: &Oracle,
+    inner: InnerInvariants<'_>,
     function: &str,
     loop_index: usize,
+    feedback: &mut IceFeedback,
+    screened_out: &mut usize,
+    deadline: std::time::Instant,
 ) -> Option<Formula> {
     use crate::may_must_analysis::loops::normalize_candidate;
-
-    let vocab = collect_vocab(info, cfg, assertion_postconditions);
-    if vocab.terms.is_empty() {
-        return None;
-    }
-    let atoms = generate_atoms(&vocab);
-
-    let initial_positive = collect_positive_example(info, cfg, inner, oracle);
-    let initial_negatives = collect_negative_examples(info, cfg, assertion_postconditions, oracle);
-
-    log::debug!(
-        target: "loop_invariant",
-        "achar cegis: function {function} loop {loop_index}: {} atoms; \
-         positive_example={} negative_examples={}",
-        atoms.len(),
-        initial_positive.is_some(),
-        initial_negatives.len()
-    );
-
-    let pos_consistent: Vec<&Formula> = if let Some(ref pos) = initial_positive {
-        filter_positive_consistent(&atoms, pos)
-    } else {
-        atoms.iter().collect()
-    };
-
-    let ice_safety: Vec<&Formula> = if !initial_negatives.is_empty() {
-        find_safety_atoms(&atoms, &initial_negatives)
-    } else {
-        vec![]
-    };
-    let negation_atoms = violation_negation_atoms(info, cfg, assertion_postconditions);
-    let negation_refs: Vec<&Formula> = negation_atoms.iter().collect();
-    let mut all_safety: Vec<&Formula> = ice_safety;
-    for atom in &negation_refs {
-        if !all_safety
-            .iter()
-            .any(|a| format!("{a:?}") == format!("{atom:?}"))
-        {
-            all_safety.push(atom);
+    for candidate in candidates {
+        if std::time::Instant::now() >= deadline {
+            log::debug!(
+                target: "loop_invariant",
+                "achar cegis: function {function} loop {loop_index} tier {tier_name}: timeout"
+            );
+            return None;
         }
-    }
-
-    // Build candidate list in the same priority order as grammar_candidates, but tagged
-    // with whether they are atoms (can be pre-screened cheaply) or compound formulas.
-    let mut candidates: Vec<Formula> = Vec::new();
-    candidates.extend(pos_consistent.iter().map(|a| (*a).clone()));
-    append_pairwise_conjunctions(&mut candidates, &pos_consistent);
-    append_ice_disjunctions(
-        &mut candidates,
-        &pos_consistent,
-        &all_safety,
-        info,
-        cfg,
-        assertion_postconditions,
-    );
-    append_pairwise_disjunctions(&mut candidates, &pos_consistent);
-
-    log::debug!(
-        target: "loop_invariant",
-        "achar cegis: function {function} loop {loop_index}: {} candidates",
-        candidates.len()
-    );
-
-    let atom_count = pos_consistent.len();
-    let mut feedback = IceFeedback::new(initial_positive, initial_negatives);
-    let mut screened_out = 0usize;
-
-    for (idx, candidate) in candidates.iter().enumerate() {
-        // Only atoms (first `atom_count` candidates) can be pre-screened locally.
-        let is_atom = idx < atom_count;
-        if is_atom && feedback.screens_out(candidate) {
-            screened_out += 1;
+        if feedback.screens_out(candidate) {
+            *screened_out += 1;
             continue;
         }
-
         let normalized = normalize_candidate(cfg, info.header, candidate);
         if crate::may_must_analysis::backward::is_tautology(&normalized) {
             continue;
         }
-
-        let result = check_loop_invariant_verbose(
-            info,
-            cfg,
-            candidate,
-            oracle,
-            assertion_postconditions,
-            inner,
-        );
-
+        let result =
+            check_loop_invariant_verbose(info, cfg, candidate, oracle, postconditions, inner);
         log::debug!(
             target: "loop_invariant",
-            "achar cegis: function {function} loop {loop_index} candidate {} => {}",
+            "achar cegis: function {function} loop {loop_index} [{tier_name}] {} => {}",
             crate::may_must_analysis::backward::pretty_formula(&normalized),
             match &result {
                 InvariantCheckResult::Accepted => "accepted",
@@ -787,25 +830,259 @@ pub fn synthesize_with_cegis(
                 InvariantCheckResult::ExitClosureFailed { .. } => "exit closure failed",
             }
         );
-
         if result.is_accepted() {
             log::info!(
                 target: "loop_invariant",
-                "achar cegis: function {function} loop {loop_index}: \
-                 accepted invariant: {} (screened_out={screened_out})",
+                "achar cegis: function {function} loop {loop_index} [{tier_name}]: \
+                 accepted invariant: {}",
                 crate::may_must_analysis::backward::pretty_formula(&normalized)
             );
             return Some(normalized);
         }
-
         feedback.absorb(&result);
+    }
+    None
+}
+
+/// ACHAR loop invariant synthesis with predicate-first atoms, ICE CEGIS feedback, and timeout.
+///
+/// Candidates are generated in tiered priority order and checked with the full
+/// `check_loop_invariant_verbose` three-way test (initiation, inductiveness, optional
+/// exit closure).  After each rejection the failure witness is absorbed into
+/// [`IceFeedback`] so subsequent candidates can be pre-screened cheaply.
+///
+/// # Candidate tiers (tried in order)
+///
+/// **Tier 1 — predicate atoms**: atomic comparisons mined directly from the loop's
+/// CFG edge guards and `Assume` / `Predicate-Assign` effects.  These are the
+/// comparisons the programmer wrote; they are the most targeted candidates.
+///
+/// **Tier 2 — predicate conjunctions**: pairwise conjunctions of predicate atoms.
+///
+/// **Tier 3 — Phase-B predicate disjunctions**: `counter_init || predicate_atom`,
+/// tried *without exit closure* (Phase-B pattern).  Handles invariants that require
+/// the `counter == init` escape hatch because the property holds only after the first
+/// iteration (e.g. cross-region relational invariants where an array element is
+/// uninitialized at loop entry).
+///
+/// **Tier 4 — combinatorial atoms**: all pairwise comparisons over the loop's
+/// vocabulary terms (scalars and `select` terms).  Filtered by positive-consistency
+/// (atoms false at the initial ICE state are dropped).  Includes cross-region
+/// relational comparisons like `menor <= select(array_region, j)`.
+///
+/// **Tier 5 — combinatorial conjunctions**: pairwise conjunctions of combinatorial
+/// atoms (capped at [`MAX_CONJUNCTIONS`]).
+///
+/// **Tier 6 — ICE disjunctions**: `pos_atom || safety_atom` guided by negative ICE
+/// examples (capped at [`MAX_ICE_DISJ`]).
+///
+/// **Tier 7 — Phase-B combinatorial disjunctions**: `counter_init || atom` for ALL
+/// atoms (including those filtered by positive-consistency), without exit closure.
+/// This is the tier that enables cross-region relational invariants such as
+/// `(j == 0) || (menor <= array[0])` for programs like `array-2`.
+///
+/// **Tier 8 — pairwise combinatorial disjunctions**: fallback pairwise disjunctions
+/// (capped at [`MAX_PAIRWISE_DISJ`]).
+///
+/// The loop stops as soon as any tier produces an accepted invariant or `timeout`
+/// elapses.
+pub fn synthesize_with_cegis(
+    info: &LoopInfo,
+    cfg: &AbstractCfg,
+    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
+    inner: InnerInvariants<'_>,
+    oracle: &Oracle,
+    function: &str,
+    loop_index: usize,
+    timeout: std::time::Duration,
+) -> Option<Formula> {
+    let deadline = std::time::Instant::now() + timeout;
+    let empty_pc: BTreeMap<CfgNodeId, Formula> = BTreeMap::new();
+
+    // ── Atom pools ────────────────────────────────────────────────────────────
+    let pred_atoms = collect_predicate_atoms(info, cfg);
+    let vocab = collect_vocab(info, cfg, assertion_postconditions);
+    let combo_atoms = if vocab.terms.is_empty() {
+        vec![]
+    } else {
+        generate_atoms(&vocab)
+    };
+
+    // ── ICE examples ──────────────────────────────────────────────────────────
+    let initial_positive = collect_positive_example(info, cfg, inner, oracle);
+    let initial_negatives = collect_negative_examples(info, cfg, assertion_postconditions, oracle);
+
+    log::debug!(
+        target: "loop_invariant",
+        "achar cegis: function {function} loop {loop_index}: \
+         pred_atoms={} combo_atoms={} positive={} negatives={}",
+        pred_atoms.len(),
+        combo_atoms.len(),
+        initial_positive.is_some(),
+        initial_negatives.len()
+    );
+
+    // ── Filter combo atoms by positive-consistency ────────────────────────────
+    let pos_consistent: Vec<Formula> = if let Some(ref pos) = initial_positive {
+        filter_positive_consistent(&combo_atoms, pos)
+            .into_iter()
+            .cloned()
+            .collect()
+    } else {
+        combo_atoms.clone()
+    };
+
+    // ── Safety atoms for ICE disjunctions ─────────────────────────────────────
+    let ice_safety_refs: Vec<&Formula> = if !initial_negatives.is_empty() {
+        find_safety_atoms(&combo_atoms, &initial_negatives)
+    } else {
+        vec![]
+    };
+    let negation_atoms = violation_negation_atoms(info, cfg, assertion_postconditions);
+    let mut all_safety: Vec<Formula> = ice_safety_refs.into_iter().cloned().collect();
+    for atom in &negation_atoms {
+        if !all_safety
+            .iter()
+            .any(|a| format!("{a:?}") == format!("{atom:?}"))
+        {
+            all_safety.push(atom.clone());
+        }
+    }
+    let all_safety_refs: Vec<&Formula> = all_safety.iter().collect();
+
+    // ── Counter-init equations for Phase-B tiers ──────────────────────────────
+    let store_facts = preheader_store_facts_at_header(cfg, info.header, inner);
+    let counter_inits: Vec<Formula> = store_facts
+        .iter()
+        .filter(|((_, offset), value)| *offset == 0 && matches!(value, Term::Int(_)))
+        .map(|((region, offset), value)| {
+            Formula::eq(
+                Term::select(Memory::var(region.clone()), Term::int(*offset)),
+                value.clone(),
+            )
+        })
+        .collect();
+
+    // ── CEGIS feedback state ──────────────────────────────────────────────────
+    let mut feedback = IceFeedback::new(initial_positive, initial_negatives);
+    let mut screened_out = 0usize;
+
+    macro_rules! tier {
+        ($name:expr, $cands:expr, $pc:expr) => {
+            if let Some(inv) = run_tier(
+                $name,
+                &$cands,
+                $pc,
+                info,
+                cfg,
+                oracle,
+                inner,
+                function,
+                loop_index,
+                &mut feedback,
+                &mut screened_out,
+                deadline,
+            ) {
+                log::debug!(
+                    target: "loop_invariant",
+                    "achar cegis: function {function} loop {loop_index}: \
+                     screened_out={screened_out}"
+                );
+                return Some(inv);
+            }
+            if std::time::Instant::now() >= deadline {
+                log::debug!(
+                    target: "loop_invariant",
+                    "achar cegis: function {function} loop {loop_index}: timeout after tier {}",
+                    $name
+                );
+                return None;
+            }
+        };
+    }
+
+    // Tier 1: predicate atoms from code (no positive-consistency filtering)
+    tier!("pred-atoms", pred_atoms.clone(), assertion_postconditions);
+
+    // Tier 2: pairwise conjunctions of predicate atoms
+    {
+        let pred_refs: Vec<&Formula> = pred_atoms.iter().collect();
+        let mut conj = Vec::new();
+        append_pairwise_conjunctions(&mut conj, &pred_refs);
+        tier!("pred-conj", conj, assertion_postconditions);
+    }
+
+    // Tier 3: Phase-B predicate disjunctions: (counter_init) || pred_atom.
+    // Only active in the pre-pass (no assertion site). When assertion_postconditions
+    // is non-empty, exit closure is required and these candidates are not sound
+    // without it — run_backward does not substitute for exit closure.
+    if !counter_inits.is_empty() && assertion_postconditions.is_empty() {
+        let mut phase_b_pred: Vec<Formula> = Vec::new();
+        for ci in &counter_inits {
+            for atom in &pred_atoms {
+                phase_b_pred.push(Formula::or(ci.clone(), atom.clone()));
+            }
+        }
+        tier!("phase-b-pred", phase_b_pred, &empty_pc);
+    }
+
+    // Tier 4: positive-consistent combinatorial atoms
+    tier!(
+        "combo-atoms",
+        pos_consistent.clone(),
+        assertion_postconditions
+    );
+
+    // Tier 5: pairwise conjunctions of combinatorial atoms
+    {
+        let pos_refs: Vec<&Formula> = pos_consistent.iter().collect();
+        let mut conj = Vec::new();
+        append_pairwise_conjunctions(&mut conj, &pos_refs);
+        tier!("combo-conj", conj, assertion_postconditions);
+    }
+
+    // Tier 6: ICE-guided disjunctions
+    {
+        let pos_refs: Vec<&Formula> = pos_consistent.iter().collect();
+        let mut disj = Vec::new();
+        append_ice_disjunctions(
+            &mut disj,
+            &pos_refs,
+            &all_safety_refs,
+            info,
+            cfg,
+            assertion_postconditions,
+        );
+        tier!("ice-disj", disj, assertion_postconditions);
+    }
+
+    // Tier 7: Phase-B combinatorial disjunctions: (counter_init) || atom.
+    // Includes ALL combo atoms (not just pos-consistent) to reach cross-region
+    // relational invariants. Only active in the pre-pass for the same reason
+    // as Tier 3: exit closure is required during assertion verification.
+    if !counter_inits.is_empty() && assertion_postconditions.is_empty() {
+        let mut phase_b_combo: Vec<Formula> = Vec::new();
+        for ci in &counter_inits {
+            for atom in &combo_atoms {
+                phase_b_combo.push(Formula::or(ci.clone(), atom.clone()));
+            }
+        }
+        tier!("phase-b-combo", phase_b_combo, &empty_pc);
+    }
+
+    // Tier 8: pairwise disjunctions of combinatorial atoms (fallback)
+    {
+        let pos_refs: Vec<&Formula> = pos_consistent.iter().collect();
+        let mut disj = Vec::new();
+        append_pairwise_disjunctions(&mut disj, &pos_refs);
+        tier!("combo-disj", disj, assertion_postconditions);
     }
 
     log::debug!(
         target: "loop_invariant",
         "achar cegis: function {function} loop {loop_index}: \
          no invariant found (screened_out={screened_out}/{})",
-        candidates.len()
+        pred_atoms.len() + combo_atoms.len()
     );
     None
 }

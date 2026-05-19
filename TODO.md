@@ -41,21 +41,33 @@ Totals: ~51 UNKNOWN · 3 UNSOUND · 7 MISSED · 105 files.
 
 ### MISSED (wrong verdict on unsafe program)
 
-- `c/loops/array-2` — needs memory-relational invariant (`menor <= array[0]`)
-  to produce BugFound; currently UNKNOWN (see Current Backlog)
+- `c/loops/array-2` — currently UNKNOWN; `--bmc-bound 1` finds the bug
+  (BugFound after 1 loop iteration). Need to plumb BMC into the benchmark
+  runner to count this as fixed.
 - `c/loops/ludcmp`
 - `c/loops/nec20`
 - `c/loops/sum01_bug02.i`
 - `c/loops/sum04-1.i`
 - `c/loops/verisec_OpenSER_cases1_stripFullBoth_arr.i`
-- `c/loop-invariants/linear-inequality-inv-b` — expected UNSAFE, got SAFE
+- `c/loop-invariants/linear-inequality-inv-b` — `--inv-grammar` previously
+  produced false SAFE (accepted `j==0 || j>=0` without exit closure); fixed
+  in v0.11.0. Now UNKNOWN. May also be findable with `--bmc-bound`.
+
+### UNSOUND (false-SAFE via `--inv-grammar` — fixed in v0.11.0)
+
+- Phase-B tiers 3 and 7 in ACHAR bypassed exit closure even when real
+  assertion postconditions were available. Any inductive candidate was accepted.
+  Fixed: tiers 3/7 now only run in the pre-pass (no assertion site).
+- Entry-safety phase used `&BTreeMap::new()` (no exit closure). Fixed.
+- Observer mode had a phase-B fallback with empty postconditions. Fixed.
 
 ### UNKNOWN breakdown by category
 
 locks 13 · loops 33 · loop-crafted 5 · loop-invariants 0.
-(`array-1` fixed in v0.9.0 by entry-safety candidate synthesis with Phase-B
-discharge — the inductive invariant `(j==0) || (array[0]>=menor)` is accepted
-without exit closure and the bidirectional check proves the assertion.)
+(`array-1` was reported SAFE in v0.9.0 via entry-safety Phase-B; that path is
+now disabled for direct assertion verification (v0.11.0 soundness fix). Whether
+`array-1` remains SAFE depends on whether its entry-safety candidate satisfies
+full exit closure — needs re-benchmark after this change.)
 
 ## Instruction Coverage (sound but lossy — produce ERROR/UNKNOWN today)
 
@@ -93,6 +105,54 @@ without exit closure and the bidirectional check proves the assertion.)
   array-2 (the relational candidate `menor <= array[0]` would fail exit closure since
   `array[0] > menor` is unsatisfied when they are equal) and extend coverage to other
   memory-relational cases.
+
+## Loop Exit Summaries
+
+Loop verification is currently split across `loops.rs` (invariant checking) and `backward.rs`
+(exit-closure discharge). The type `VerifiedLoopInvariant` enforces that only fully-checked
+invariants reach `run_backward`.
+
+### Current: one-step exit closure
+
+`check_loop_invariant_verbose` propagates `Bad_v` backward from each exit edge through the loop
+body (back edges excluded) to the header, then checks `UNSAT(I_h ∧ exit_header_state)`.
+This is sound because `notmay_pre_pruned` in `rules.rs` kills backward propagation at the header
+whenever `reach ∧ state` becomes infeasible, blocking all paths that the invariant rules out.
+`SummaryTables::loop_invariants` stores raw `(CfgNodeId, Formula)` InductiveHints from the pre-pass;
+`verify_precomputed` in `backward.rs` re-checks them against real assertion postconditions before
+converting to `VerifiedLoopInvariant`.
+
+### Planned: backward fixpoint with back edge included
+
+For stronger discharge: run a backward fixpoint inside the loop body **with the back edge
+included**, intersecting with `I_h` at the header at each iteration until convergence.
+The fixed point `B_{h,e}` satisfies `UNSAT(I_h ∧ B_{h,e})` — a stronger condition than the
+current one-step check and generalises to programs where the one-step check is too weak.
+Implementation sketch in `loops.rs`: iterate `state_header ← WP(body_with_back_edge, state_header) ∧ I_h`
+until stable, then check infeasibility.
+
+### Long-term: relational LoopExitSummary
+
+A `LoopExitSummary { header, exit_edge, relation: Formula }` would encode the full relational
+summary `R_{L,e}(x, x')`: starting at the loop header in state `x`, the loop exits through `e`
+reaching state `x'`. Safety rule: `UNSAT(I_h(x) ∧ R_{L,e}(x, x') ∧ Bad_v(x'))`.
+This separates loop reasoning from assertion-site reasoning, enables summary reuse across multiple
+assertion sites in the same loop, and is a prerequisite for compositional loop analysis.
+
+## ACHAR Deferred Improvements
+
+- **Cap tuning** — `MAX_CONJUNCTIONS`, `MAX_ICE_DISJ`, `MAX_PAIRWISE_DISJ` were
+  set for the old unguided enumeration. With CEGIS pre-screening, these caps can
+  be raised (or removed) to let the search run further within the timeout budget.
+
+- **Greedy N-term conjunction synthesis** — instead of fixed pairwise, grow
+  conjunctions atom-by-atom guided by CEGIS witnesses: start with the atom that
+  eliminates the most negative examples, add atoms until inductive or budget
+  exhausted.
+
+- **Implication atoms** — `A => B` forms for per-element array properties
+  (`counter <= k => select(arr, counter) >= 0`). Natural for safety proofs over
+  array loops where the property holds for all processed elements.
 
 - **type-based domain bounds in the adapter** — emit `TransferEffect::Assume`
   range constraints directly in `lower_node_transfer` based on LLVM integer

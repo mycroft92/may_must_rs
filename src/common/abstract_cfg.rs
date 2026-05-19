@@ -693,6 +693,11 @@ impl AbstractCfg {
         Ok(())
     }
 
+    /// Remove an edge from the CFG. Used by BMC to cut back edges after unrolling.
+    pub fn remove_edge(&mut self, id: CfgEdgeId) {
+        self.edges.remove(&id);
+    }
+
     pub fn successors(&self, id: CfgNodeId) -> Vec<CfgNodeId> {
         self.edges
             .values()
