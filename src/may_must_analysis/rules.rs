@@ -416,17 +416,25 @@ impl<'a> RuleEngine<'a> {
     }
 
     /// **Forward MAY rule with callee summaries** — applies forward-may
-    /// summaries from `tables` at a call edge.
+    /// summaries from `tables` at a call edge, gated by a **precondition
+    /// implication check** (subsumption).
     ///
-    /// If the source node is a call site, joins each matching may-summary
-    /// postcondition into `target.reach`, propagating reach information
-    /// derived from the callee's MAY-side summaries (over-approximate).
+    /// Soundness condition: only join the summary's `postcondition` into
+    /// `target.reach` when `caller.reach ⇒ summary.precondition`.  Without
+    /// this check, callers whose reach is outside the summary's pre-range
+    /// would receive a `post` that doesn't actually hold for them.
     ///
-    /// Renamed from `must_post_usesummary` in v0.15.0.
+    /// For legacy summaries with `precondition: True` (the eager-inlined
+    /// `compute_return_summary` shape) the implication is trivially Valid,
+    /// so this rule reduces to the v0.15 behaviour.  For paper-equivalent
+    /// contextual summaries with non-True preconditions, mismatched call
+    /// contexts are silently skipped — sound; the caller's analysis simply
+    /// doesn't learn the post for that summary.
     pub fn forward_may_usesummary(
         &mut self,
         edge_id: CfgEdgeId,
         tables: &SummaryTables,
+        oracle: &Oracle,
     ) -> Result<(), RuleError> {
         if self.is_blocked(edge_id) {
             return Ok(());
@@ -443,10 +451,29 @@ impl<'a> RuleEngine<'a> {
         ) else {
             return Ok(());
         };
+        let caller_reach = self.summary(edge.source)?.reach.clone();
         for summary in tables.forward_may(&callee) {
+            // Cheap shortcut for the legacy True-precondition case.
+            let applies = if matches!(summary.precondition, Formula::True) {
+                true
+            } else {
+                matches!(
+                    oracle.implies(&caller_reach, &summary.precondition)?,
+                    Validity::Valid
+                )
+            };
+            if !applies {
+                log::debug!(
+                    target: "rules",
+                    "[forward_may_usesummary] {:?}→{:?}: callee '{}' summary skipped — \
+                     caller.reach does not imply summary.precondition",
+                    edge.source, edge.target, callee,
+                );
+                continue;
+            }
             log::debug!(
                 target: "rules",
-                "[forward_may_usesummary] {:?}→{:?}: callee '{}' may-summary: reach += {}",
+                "[forward_may_usesummary] {:?}→{:?}: callee '{}' may-summary applies: reach += {}",
                 edge.source,
                 edge.target,
                 callee,
@@ -498,7 +525,7 @@ impl<'a> RuleEngine<'a> {
             for node in order {
                 for edge in self.cfg.outgoing_edges(*node) {
                     self.forward_may_post(edge)?;
-                    self.forward_may_usesummary(edge, tables)?;
+                    self.forward_may_usesummary(edge, tables, oracle)?;
                     // NOTE: `forward_must_post` is NOT called from the main
                     // fixpoint loop because the underlying SP transformer
                     // (`TransferFn::sp`) does not model memory effects
