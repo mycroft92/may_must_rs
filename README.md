@@ -173,13 +173,14 @@ function entry. Infeasible → `Verified`; feasible with a model → `UNSAFE`;
 indeterminate → `UNKNOWN`.
 
 **Loop invariant synthesis** is attempted in order:
-1. Algorithmic pattern matching (counter bounds from back-edge guards).
-2. Entry-safety candidates — mines `counter==init || safety` forms from
-   preheader store facts and the assertion postcondition; accepted inductively
-   with the bidirectional check discharging the assertion (Phase-B pattern).
-3. Constrained Horn Clause (CHC) solving via Z3's SPACER engine.
-4. Houdini weakening — a large template set is pruned to an inductive subset.
-5. LLM-guided CEGIS (optional, when an LLM provider is configured).
+1. Entry-safety candidates — mines `counter==init || safety` forms from
+   concrete preheader store facts and the assertion postcondition; accepted
+   inductively with the bidirectional check discharging the assertion
+   (Phase-B pattern).
+2. ACHAR grammar-based ICE learning — enumerates candidates from a vocabulary
+   of loop variables and select-terms; filters atoms with positive/negative
+   example states from the SMT oracle; generates atoms, pairwise conjunctions,
+   observer-style and ICE-guided disjunctions in priority order.
 
 Each candidate is checked for initiation, inductiveness, and (except for
 entry-safety Phase-B candidates) exit closure. See [LOOPS.md](LOOPS.md) for
@@ -216,17 +217,20 @@ src/common/oracle.rs                   SMT feasibility / implication (Z3 boundar
 src/may_must_analysis/node_summary.rs  per-node (reach, state) summaries
 src/may_must_analysis/rules.rs         local backward propagation rules, RuleEngine
 src/may_must_analysis/loops.rs         loop detection, invariant checking (initiation,
-                                        inductiveness, exit closure), Houdini candidates,
-                                        CHC candidates, algorithmic candidates
-src/may_must_analysis/chc.rs           Constrained Horn Clause encoding and Z3 SPACER
-                                        solver integration for loop invariants
+                                        inductiveness, exit closure), entry-safety
+                                        candidates, forward reach computation
+src/may_must_analysis/achar.rs         ACHAR grammar-based ICE learner — vocabulary
+                                        collection, atom generation, ICE example states,
+                                        positive/negative filtering, candidate priorities
+src/may_must_analysis/chc.rs           Constrained Horn Clause encoding (retained for
+                                        future function-summarization use; not wired into
+                                        the synthesis pipeline)
 src/may_must_analysis/backward.rs      assertion checking, loop invariant synthesis
-                                        (algorithmic → CHC → Houdini → LLM CEGIS)
+                                        (entry-safety → ACHAR)
 src/may_must_analysis/driver.rs        module orchestration, whole-module AA, bottom-up
                                         summary accumulation, observer-invariant synthesis
 src/may_must_analysis/summaries.rs     SummaryTables and MustSummary data structures
 src/may_must_analysis/providers.rs     external/manual summary provider seam
-src/may_must_analysis/llm_provider.rs  LLM-guided CEGIS candidate generation
 src/common/smt/solver.rs               raw Z3 term/formula lowering
 ```
 
@@ -246,11 +250,8 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | Branch-guard lowering | ✅ |
 | Acyclic procedure verification | ✅ |
 | Cyclic procedures with loop invariant synthesis | ✅ |
-| Loop invariants via algorithmic pattern matching | ✅ |
 | Loop invariants via entry-safety candidates (Phase-B discharge) | ✅ |
-| Loop invariants via CHC / Z3 SPACER | ✅ |
-| Loop invariants via Houdini weakening | ✅ |
-| Loop invariants via LLM-guided CEGIS | ✅ (requires LLM provider) |
+| Loop invariants via ACHAR grammar-based ICE learning | ✅ |
 | Interprocedural return-summary inference (acyclic callees) | ✅ |
 | Cyclic callee return-summary inference (observer-invariant) | ✅ |
 | `llvm.memcpy` / `llvm.memset` unrolling | ✅ |

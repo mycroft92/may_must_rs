@@ -102,6 +102,32 @@ then performed by the subsequent `run_backward` bidirectional check.
 This mirrors the observer-invariant pattern used for cyclic callee summaries in
 `driver.rs` (documented in `CLAUDE.md`).
 
+### Soundness constraints on candidate generation
+
+Two invariants are required for entry-safety candidates to remain sound:
+
+**Concrete-integer filter.** Only preheader store facts whose stored value is a
+compile-time integer constant are used to build `counter_eq`. Facts from
+`nondet_int()` calls (or other unresolved pointer arguments) produce
+variable-valued facts such as `(menor_stack, 0) → retval_N`. Using these would
+generate candidates like `select(menor_stack, 0) == retval_N || safety`.
+Such a candidate trivially satisfies initiation — `forward_reach_at_header`
+already encodes `select(menor_stack, 0) == retval_N` as a store-fact equation,
+so the violation `reach_h ∧ ¬candidate` is a contradiction. It also passes
+inductiveness vacuously through the false branch (when `menor` is not updated,
+the invariant is retained unchanged, making `I ⊢ I ∨ …` trivially valid).
+Because the invariant is not genuinely inductive, injecting it into `reach` can
+make `reach ∧ state` infeasible at entry even for unsafe programs — a false
+Verified. (Observed in `array-2`, fixed v0.10.1.)
+
+**Whole-formula negation.** The safety formula is `negate_comparison(violation)`
+or `Formula::not(violation)` applied to the whole exit violation, not to each
+conjunct extracted via `formula_conjuncts`. Per-conjunct negation pulls in
+type-bound assumptions (e.g. `Assume(j >= 0)` injected by unsigned-comparison
+handling) as conjuncts of the backward WP and negates them to spurious safety
+atoms (`j < 0`). These atoms form semantically vacuous disjuncts that help no
+candidate discharge the assertion but inflate the search space.
+
 ### Soundness argument
 
 1. **Initiation** passes: I holds at first entry (proven above).
@@ -139,6 +165,8 @@ never a false `Verified`.
 | Inductiveness via Hoare-style WP for `Assume` | Sound (correct semantics) |
 | Store-fact intersection at join points | Sound (conservative) |
 | Phase-B exit-closure skip for entry-safety candidates | Sound (bidirectional check discharges) |
+| Concrete-integer filter on entry-safety store facts | Sound (prevents tautological candidates from variable-valued facts) |
+| Whole-formula negation in entry-safety safety formula | Sound (prevents spurious type-bound atoms from contaminating candidates) |
 | Latch node uses standard WP in inductiveness path | Conservative in failure mode (spurious rejection only) |
 | `Call { HavocMemory }` transparent in standard WP | Relies on paired `HavocRegions` effect; missing `HavocRegions` → under-constrained backward state → more UNKNOWN, not false Verified |
 

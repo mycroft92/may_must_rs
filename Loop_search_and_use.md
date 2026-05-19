@@ -103,34 +103,33 @@ bidirectional check — the same observer-invariant pattern used in `driver.rs`
 for cyclic callee summaries.  See `LOOPS.md` §Phase-B for the soundness
 argument.
 
-### Phase 3 — CHC (`loops.rs` — `chc_loop_invariant`)
+### Phase 3 — ACHAR ICE learner (`achar.rs` — `grammar_candidates`)
 
-Pattern-matches the back-edge guard for `i < n` or `i < bound`.  If matched,
-delegates to `chc::solve_loop_chc` which returns `0 <= i && i <= n`.  Single
-candidate; full three-way check including exit closure.
+Enumerates candidates from a grammar over the loop's variable vocabulary, guided
+by concrete SMT example states:
 
-### Phase 4 — Houdini (`loops.rs` — `houdini_candidates`)
+**Vocabulary collection** (`collect_vocab`): gathers integer-sorted variables from
+loop body effects (`Assign`, `MemoryStore`), `Select` terms from loop body effects
+and assertion postconditions, and integer constants from the body plus `{0, 1}`.
+LLVM-internal variables (`__vla_expr*`) are filtered out.
 
-Generates a large template set over all integer variables visible in the loop:
+**Atom generation** (`generate_atoms`): all pairwise comparisons (`<=`, `<`, `==`)
+between terms, plus comparisons of each term against each constant.
 
-- `var >= c` and `var <= c` for every (variable, constant) pair.
-  Constants = `{-1, 0, 1}` ∪ literals from `assertion_postconditions` ∪
-  integer literals from the loop body.
-- `var >= lo && var <= hi` for all constant pairs.
-- Pairwise: `v1 <= v2`, `v1 >= v2`, `v1 + 1 <= v2` for every pair of
-  distinct integer variables.
+**ICE example collection**: the oracle is queried for concrete models of the
+forward reach (positive example) and each exit violation (negative examples).
 
-Full three-way check including exit closure.  Candidates are checked in
-parallel via `par_iter`.
+**Filtering**: atoms false on the positive example are dropped.  Safety atoms —
+those false on at least one negative example — are identified.
 
-### Phase 5 — LLM CEGIS (`backward.rs`, `llm_provider.rs`)
+**Candidate priorities**:
+1. Positive-consistent atoms (capped at `MAX_CONJUNCTIONS`).
+2. Pairwise conjunctions of positive-consistent atoms.
+3. Observer-style `counter <= idx || safety` and general `pos || safety`
+   ICE-guided disjunctions (capped at `MAX_ICE_DISJ`).
+4. Pairwise disjunctions of positive-consistent atoms (capped at `MAX_PAIRWISE_DISJ`).
 
-If configured: builds a structured prompt from the loop's CFG, the assertion
-site, and any previous failed attempts, and asks an LLM backend for a
-candidate.  That candidate goes through the **full three-way check**.  The
-failure reason (`InitiationFailed`, `InductivenessFailed`,
-`ExitClosureFailed`) is fed back to the next LLM call as a CEGIS hint.  Up to
-`llm.max_tries` attempts.
+Full three-way check including exit closure.
 
 ---
 
@@ -364,9 +363,7 @@ the obligation are re-checked, because the obligation formula may reference a
 |---|---|---|---|
 | Algorithmic | ✅ | ✅ | ✅ |
 | Entry-safety | ✅ | ✅ | ❌ (skipped; `run_backward` discharges) |
-| CHC | ✅ | ✅ | ✅ |
-| Houdini | ✅ | ✅ | ✅ |
-| LLM CEGIS | ✅ | ✅ | ✅ |
+| ACHAR ICE learner | ✅ | ✅ | ✅ |
 | Precomputed (pre-pass) | ✅ | ✅ | ❌ (no assertion site yet) |
 | Precomputed (per-assertion reuse) | — | — | ✅ (re-checked before reuse) |
 
@@ -380,6 +377,8 @@ the obligation are re-checked, because the obligation formula may reference a
 | Inductiveness via Hoare-style WP for `Assume` | Sound (correct semantics) |
 | Store-fact intersection at join points | Sound (conservative) |
 | Phase-B exit-closure skip for entry-safety | Sound (`run_backward` discharges) |
+| Concrete-integer filter on entry-safety store facts | Sound (prevents tautological candidates from variable-valued facts) |
+| Whole-formula negation in entry-safety safety formula | Sound (prevents spurious type-bound atoms from contaminating candidates) |
 | Latch node uses standard WP in inductiveness path | Conservative in failure only (spurious rejection, never false-Verified) |
 | `HavocMemory` transparent in standard WP | Relies on paired `HavocRegions`; missing `HavocRegions` → more UNKNOWN, never false-Verified |
 

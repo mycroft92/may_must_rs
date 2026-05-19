@@ -84,18 +84,15 @@ without exit closure and the bidirectional check proves the assertion.)
 
 ## Current Backlog
 
-- **Memory-relational invariant templates** — `c/loops/array-1` is now SAFE
-  (v0.9.0) via entry-safety candidates: the generator mines `(j==0) || (array[0]>=menor)`
-  from the preheader store facts and the assertion postcondition, accepts it
-  inductively without exit closure, and the bidirectional check discharges the
-  obligation.  Remaining gap: a *cross-region relational* Houdini pass that
-  generates `select(R1,i) <= select(R2,j)` candidates from the assertion
-  postcondition would extend coverage to cases where the preheader facts are
-  not preserved (e.g. both counter and accumulator are nondeterministic).
-  Expected impact: `c/loops/array-2` (UNSAFE, currently UNKNOWN) — the
-  relational candidate `minor <= array[0]` would correctly fail exit closure
-  (the assertion is `array[0] > minor`, which is unsatisfied when they are
-  equal) → synthesis produces no invariant → BugFound.
+- **Memory-relational invariant templates** — `c/loops/array-1` is SAFE (v0.9.0)
+  via entry-safety candidates.  `c/loops/array-2` correctly returns UNKNOWN (v0.10.1)
+  after fixing a soundness bug where variable-valued preheader store facts produced
+  tautological invariants that falsely verified the program as SAFE.  The remaining
+  gap: a *cross-region relational* candidate generator producing `select(R1,i) <= select(R2,j)`
+  templates from assertion postconditions would let the tool report BugFound for
+  array-2 (the relational candidate `menor <= array[0]` would fail exit closure since
+  `array[0] > menor` is unsatisfied when they are equal) and extend coverage to other
+  memory-relational cases.
 
 - **type-based domain bounds in the adapter** — emit `TransferEffect::Assume`
   range constraints directly in `lower_node_transfer` based on LLVM integer
@@ -119,7 +116,6 @@ without exit closure and the bidirectional check proves the assertion.)
 - broaden cast/instruction coverage beyond the current integer/boolean subset
 - decide whether `assertions::translation` should become a CLI input path or
   remain a library-only component
-- keep the loop-invariant provider / LLM path aligned with the active checker
 - tighten and document the current call-summary contract, especially what kinds
   of return relations are inferred and reused soundly
 
