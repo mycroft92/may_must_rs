@@ -8,5 +8,6 @@ pub mod node_summary;
 pub mod providers;
 pub mod query;
 pub mod rules;
+pub mod scheduler;
 pub mod smash;
 pub mod summaries;

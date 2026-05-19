@@ -31,8 +31,10 @@
 
 #![allow(dead_code)]
 
-use rayon::prelude::*;
-
+// `rayon` was used by the previous per-assertion `par_iter` over
+// `adapted.assertions`.  The query-driven scheduler dispatches sequentially
+// today; parallelism over disjoint procedures will return as an
+// optimisation once the cross-procedure scheduler is in place.
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, SourceLocation};
 use crate::common::adapter::{
     adapt, adapt_with_purity_and_summaries, collect_callee_names, compute_return_summary,
@@ -53,6 +55,7 @@ use crate::may_must_analysis::loops::{
 };
 use crate::may_must_analysis::providers::{CandidateProvider, NoProvider};
 use crate::may_must_analysis::rules::{Judgement, RuleEngine};
+use crate::may_must_analysis::scheduler;
 use crate::may_must_analysis::smash;
 use crate::may_must_analysis::summaries::{MaySummary, NotMaySummary, SummaryTables};
 use std::collections::{BTreeMap, BTreeSet};
@@ -365,43 +368,56 @@ pub fn analyze_with_summaries(
             )
         });
 
-    // Build the SMASH summary database: existing per-procedure tables (from
-    // `analyze_module_with_llm`) plus an empty must-paths store that the
-    // orchestrator populates as BMC finds bugs.
-    let empty_tables = SummaryTables::new();
-    let db_tables = tables.cloned().unwrap_or_else(SummaryTables::new);
-    let _ = &empty_tables; // silence in trivial paths
-    let db = smash::SmashSummaryDB {
-        tables: db_tables,
-        must_paths: std::collections::BTreeMap::new(),
-    };
-
-    let site_results: Vec<smash::SmashRunResult> = adapted
-        .assertions
-        .par_iter()
-        .map(|site| {
-            // Upgrade InductiveHints to VerifiedLoopInvariant for this assertion
-            // site.  If exit closure fails, analyze_with_tables falls through to
-            // per-site synthesis with the real assertion postconditions.
-            let verified = if tables.is_some() {
-                precomputed_hints.as_deref().and_then(|hints| {
-                    verify_precomputed(&adapted.cfg, site, hints, oracle)
-                        .ok()
-                        .flatten()
-                })
-            } else {
-                None
-            };
-            smash::run_smash(
-                &adapted.cfg,
-                &adapted.name,
-                site,
-                oracle,
-                &db,
-                config,
-                verified.as_deref(),
-                &adapted.debug_names,
-            )
+    // Build top-level queries from assertions and drain them through the
+    // query-driven scheduler.  Behaviour identical to the previous
+    // per-assertion par_iter: each query still ultimately calls
+    // `run_smash` via `Scheduler::dispatch_next`.  The reason for this
+    // routing is so subsequent steps (CREATE_*_SUMMARY, contextual call
+    // mediation, recursion) can be added inside the scheduler without
+    // touching the driver again.  See `design_notes/QUERY_REFACTOR.md`.
+    let legacy_tables_for_scheduler: SummaryTables = tables.cloned().unwrap_or_default();
+    let mut sched = scheduler::Scheduler::new();
+    for site in &adapted.assertions {
+        let verified = if tables.is_some() {
+            precomputed_hints.as_deref().and_then(|hints| {
+                verify_precomputed(&adapted.cfg, site, hints, oracle)
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        // For top-level assertion queries, `post = WP(site.transfer, ¬obligation)`
+        // and `pre = True` (no caller constraint).  See QUERY_REFACTOR.md §1.
+        let neg_obligation = Formula::not(site.obligation.clone());
+        let pre_at_assertion = match adapted.cfg.node(site.node) {
+            Ok(node) => node.transfer.wp(&neg_obligation),
+            Err(_) => neg_obligation.clone(),
+        };
+        let query = crate::may_must_analysis::query::Query::new(
+            adapted.name.clone(),
+            Formula::True,
+            pre_at_assertion,
+        );
+        let provenance = scheduler::AssertionProvenance {
+            site: site.clone(),
+            verified_invariants: verified,
+        };
+        sched.enqueue(query, Some(provenance));
+    }
+    let outcomes = sched.drain(
+        &adapted.cfg,
+        &adapted.name,
+        oracle,
+        &legacy_tables_for_scheduler,
+        config,
+        &adapted.debug_names,
+    );
+    let site_results: Vec<smash::SmashRunResult> = outcomes
+        .into_iter()
+        .filter_map(|o| match o {
+            scheduler::DispatchOutcome::Completed(run) => Some(run),
+            scheduler::DispatchOutcome::Unprovenanced => None,
         })
         .collect();
 
