@@ -592,9 +592,12 @@ fn compute_preliminary_backward_states(
 /// Runs the full three-part check on each hint (initiation, inductiveness, exit
 /// closure) against the given `assertion_postconditions`.
 ///
-/// Returns `Ok(Some(verified))` if all invariants pass all three checks;
-/// `Ok(None)` if any fail — the caller should fall through to synthesis.
-/// Only loops that have a matching hint are checked; others are silently skipped.
+/// Returns `Ok(Some(verified))` if **every loop** in the CFG has a matching hint
+/// and every hint passes all three checks.
+/// Returns `Ok(None)` if any loop has no matching hint OR if any hint fails a
+/// check — the caller should fall through to synthesis.
+/// A partial hint set (hints covering only some loops) always returns `Ok(None)`
+/// to prevent unsound use of a partial invariant set in `run_backward`.
 fn precomputed_satisfy_exit_closure(
     cfg: &AbstractCfg,
     assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
@@ -605,39 +608,48 @@ fn precomputed_satisfy_exit_closure(
     sort_innermost_first(&mut loops);
     let mut accepted: Vec<VerifiedLoopInvariant> = Vec::new();
     for loop_info in &loops {
-        if let Some((_, invariant)) = hints.iter().find(|(h, _)| *h == loop_info.header) {
-            let inner: Vec<(CfgNodeId, Formula)> = accepted.iter().map(|v| v.as_pair()).collect();
-            let result = check_loop_invariant_verbose(
-                loop_info,
-                cfg,
-                invariant,
-                oracle,
-                assertion_postconditions,
-                &inner,
-            );
+        let Some((_, invariant)) = hints.iter().find(|(h, _)| *h == loop_info.header) else {
+            // No hint for this loop — partial hint sets are unsafe to use directly.
             log::debug!(
                 target: "loop_invariant",
-                "precomputed exit-closure check for invariant {} => {}",
-                pretty_formula(invariant),
-                match &result {
-                    InvariantCheckResult::Accepted => "accepted".to_string(),
-                    InvariantCheckResult::InitiationFailed { .. } => "rejected: initiation failed".to_string(),
-                    InvariantCheckResult::InductivenessFailed { .. } => "rejected: inductiveness failed".to_string(),
-                    InvariantCheckResult::ExitClosureFailed { exit_edge, .. } => format!("rejected: exit closure failed at {:?}", exit_edge),
-                }
-            );
-            if !result.is_accepted() {
-                log::debug!(
-                    target: "loop_invariant",
-                    "precomputed invariant failed exit closure — will fall through to synthesis"
-                );
-                return Ok(None);
-            }
-            accepted.push(VerifiedLoopInvariant::new(
+                "no precomputed hint for loop at {:?} — falling through to synthesis",
                 loop_info.header,
-                invariant.clone(),
-            ));
+            );
+            return Ok(None);
+        };
+        let inner: Vec<(CfgNodeId, Formula)> = accepted.iter().map(|v| v.as_pair()).collect();
+        let result = check_loop_invariant_verbose(
+            loop_info,
+            cfg,
+            invariant,
+            oracle,
+            assertion_postconditions,
+            &inner,
+        );
+        log::debug!(
+            target: "loop_invariant",
+            "precomputed exit-closure check for invariant {} => {}",
+            pretty_formula(invariant),
+            match &result {
+                InvariantCheckResult::Accepted => "accepted".to_string(),
+                InvariantCheckResult::InitiationFailed { .. } => "rejected: initiation failed".to_string(),
+                InvariantCheckResult::InductivenessFailed { .. } => "rejected: inductiveness failed".to_string(),
+                InvariantCheckResult::ExitClosureFailed { exit_edge, .. } => {
+                    format!("rejected: exit closure failed at {:?}", exit_edge)
+                }
+            }
+        );
+        if !result.is_accepted() {
+            log::debug!(
+                target: "loop_invariant",
+                "precomputed invariant failed exit closure — will fall through to synthesis"
+            );
+            return Ok(None);
         }
+        accepted.push(VerifiedLoopInvariant::new(
+            loop_info.header,
+            invariant.clone(),
+        ));
     }
     Ok(Some(accepted))
 }
