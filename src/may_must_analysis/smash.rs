@@ -290,6 +290,7 @@ fn empty_unknown_result(
         node: site.node,
         reach: Formula::True,
         state: Formula::True,
+        must_reach: Formula::False,
     };
     AssertionResult {
         site_id: site.id,

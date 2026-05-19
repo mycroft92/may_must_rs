@@ -341,10 +341,16 @@ fn run_backward(
     engine.set_state(site.node, pre_at_assertion)?;
     engine.run_to_fixpoint(&order, tables, oracle)?;
 
-    // BugFound from the combined `reach ∧ state` check is only sound on
-    // acyclic CFGs (no loop-invariant widening).  Cyclic CFGs defer bug
-    // finding to BMC (forward MUST) in the SMASH orchestrator — see the
-    // soundness note on `RuleEngine::bugfound`.
+    // SMASH-paper verdict logic.  See `design_notes/SMASH_FORWARD_MUST.md`
+    // for the mapping between paper directions and our implementation.
+    //
+    // - **Verified (NOT-MAY at entry)** — backward over-approximation rules
+    //   out every violation: `reach ∧ state` infeasible at entry.
+    // - **BugFound (forward MUST)** — realized as backward WP on a CFG that
+    //   is acyclic (no loop-invariant widening, so WP is precise modulo SMT).
+    //   For cyclic CFGs this path is unsound and is disabled here; the SMASH
+    //   orchestrator calls `bmc::bmc_check` to unroll loops and re-run the
+    //   sound acyclic version of this same check.
     let cfg_is_acyclic = cfg.detect_back_edges().is_empty();
     let bug = engine.bugfound(cfg.entry(), oracle, cfg_is_acyclic)?;
     let judgement = if let Some(model) = bug {

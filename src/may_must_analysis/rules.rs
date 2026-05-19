@@ -169,6 +169,73 @@ impl<'a> RuleEngine<'a> {
         Ok(())
     }
 
+    /// **Forward MUST rule** — under-approximate concrete reachability
+    /// propagation across `edge`.
+    ///
+    /// Computes the strongest-postcondition of `source.must_reach` through
+    /// the source node's transfer function, the edge guard, and the edge's
+    /// own transfer (PHI assignments).  Then **feasibility-checks** the
+    /// result via the SMT oracle.  Only feasible propagations are joined
+    /// into `target.must_reach`.
+    ///
+    /// This is the SMASH-paper **MUST** direction: the under-approximate
+    /// counterpart to forward MAY.  Every disjunct in `target.must_reach`
+    /// after this rule fires corresponds to a real concrete reachable
+    /// execution.  Combined with the assertion's violation formula, it
+    /// soundly detects BugFound on acyclic CFGs (cyclic CFGs are unrolled
+    /// first via [`crate::may_must_analysis::bmc::bmc_check`]).
+    ///
+    /// Skips blocked edges silently.  Skips when `source.must_reach` is
+    /// already `False` (no concrete path reaches the source).
+    pub fn forward_must_post(
+        &mut self,
+        edge_id: CfgEdgeId,
+        oracle: &Oracle,
+    ) -> Result<(), RuleError> {
+        if self.is_blocked(edge_id) {
+            return Ok(());
+        }
+        let edge = self
+            .cfg
+            .edge(edge_id)
+            .map_err(|_| RuleError::UnknownEdge { edge: edge_id })?
+            .clone();
+
+        let source_must = self.summary(edge.source)?.must_reach.clone();
+        if source_must == Formula::False {
+            return Ok(());
+        }
+
+        // SP through source node's transfer, then edge guard, then edge's effects.
+        let source_post = self
+            .cfg
+            .node(edge.source)
+            .map_err(|_| RuleError::UnknownNode { node: edge.source })?
+            .transfer
+            .sp(&source_must);
+        let guarded = Formula::and(source_post, edge.guard.clone());
+        let through_edge = edge.transfer().sp(&guarded);
+
+        // Feasibility-check the propagated state.  Only join if SAT — the
+        // under-approximation invariant requires every disjunct in
+        // `must_reach` to have at least one model corresponding to a real
+        // execution.
+        if oracle.feasibility(&through_edge)? != Feasibility::Feasible {
+            return Ok(());
+        }
+
+        log::debug!(
+            target: "rules",
+            "[forward_must_post] {:?}→{:?}: must_reach += {}",
+            edge.source,
+            edge.target,
+            fmt_formula(&through_edge),
+        );
+        self.summary_mut(edge.target)?
+            .join_must_reach(&through_edge);
+        Ok(())
+    }
+
     /// **Forward MAY rule** — propagates `reach` across `edge` via SP.
     ///
     /// Computes `source.reach ∧ edge.guard` and joins the result into
@@ -365,13 +432,18 @@ impl<'a> RuleEngine<'a> {
     /// Each iteration:
     /// 1. Forward MAY pass over `order` — applies [`forward_may_post`] and
     ///    [`forward_may_usesummary`] on outgoing edges (SP, over-approximate).
-    /// 2. Backward NOT-MAY pass over `order` in reverse — applies
+    /// 2. Forward MUST pass over `order` — applies [`forward_must_post`] on
+    ///    outgoing edges (SP + per-step SMT feasibility check;
+    ///    under-approximate, "MUST" semantics).
+    /// 3. Backward NOT-MAY pass over `order` in reverse — applies
     ///    [`notmay_pre`], [`notmay_pre_usesummary`], and [`notmay_pre_pruned`]
     ///    on incoming edges (WP, over-approximate).
     ///
-    /// Both passes are MAY-family (over-approximations) in SMASH-paper terms.
-    /// The under-approximate MUST direction (concrete bug paths) is handled by
-    /// [`crate::may_must_analysis::bmc::bmc_check`] outside this fixpoint loop.
+    /// Passes 1 and 3 are MAY-family (over-approximations).  Pass 2 is the
+    /// MUST direction (under-approximate, feasibility-checked) — its result
+    /// at the assertion site combined with the violation formula is the only
+    /// sound BugFound witness for cyclic CFGs once they have been unrolled
+    /// via [`crate::may_must_analysis::bmc::bmc_check`].
     ///
     /// Terminates when no new edges are blocked between two consecutive
     /// iterations, or after `|edges| + 1` iterations as a safety bound.
@@ -396,6 +468,24 @@ impl<'a> RuleEngine<'a> {
                 for edge in self.cfg.outgoing_edges(*node) {
                     self.forward_may_post(edge)?;
                     self.forward_may_usesummary(edge, tables)?;
+                    // NOTE: `forward_must_post` is NOT called from the main
+                    // fixpoint loop because the underlying SP transformer
+                    // (`TransferFn::sp`) does not model memory effects
+                    // (`sp_one` for `MemoryStore`/`Load` is a no-op).  Any
+                    // program that depends on memory operations (almost all
+                    // of them) would produce a spurious `must_reach` that
+                    // ignores stores, leading to false-UNSAFE verdicts via
+                    // `must_bugfound`.
+                    //
+                    // The SMASH-paper forward MUST direction is instead
+                    // realized by running the **backward** analysis on a
+                    // CFG that is either natively acyclic, or has been
+                    // unrolled via `bmc::bmc_check`.  In both cases no
+                    // loop-invariant widening occurs, so WP through the
+                    // node transfers (which DOES model memory via store
+                    // substitution) yields a precise violation precondition,
+                    // and `reach ∧ state` SAT at entry is a sound BugFound
+                    // witness.  See `design_notes/SMASH_FORWARD_MUST.md`.
                 }
             }
             for node in order.iter().rev() {
@@ -467,6 +557,55 @@ impl<'a> RuleEngine<'a> {
         let result = oracle.check_summary(self.summary(entry)?)?;
         Ok(match result.feasibility {
             Feasibility::Feasible => Some(result.model),
+            Feasibility::Infeasible | Feasibility::Unknown => None,
+        })
+    }
+
+    /// **Paper-equivalent BugFound check** — under-approximate forward MUST.
+    ///
+    /// Conjoins `must_reach[assertion_site]` (a sound under-approximation of
+    /// concrete states reachable at the assertion) with the violation
+    /// formula `¬obligation` and asks the SMT oracle for a satisfying model.
+    /// If SAT, returns the model as a real bug witness.
+    ///
+    /// Soundness: every disjunct in `must_reach` was added only after
+    /// [`forward_must_post`] confirmed it feasible.  Therefore any model of
+    /// `must_reach ∧ ¬obligation` corresponds to a real execution that
+    /// reaches the assertion site and violates the obligation.
+    ///
+    /// Caller responsibility: the CFG passed to this engine should be
+    /// **acyclic**.  Cyclic CFGs must be unrolled (via
+    /// [`crate::may_must_analysis::bmc::bmc_check`]) before forward MUST
+    /// produces a meaningful `must_reach`.
+    pub fn must_bugfound(
+        &self,
+        assertion_site: CfgNodeId,
+        violation: &Formula,
+        oracle: &Oracle,
+    ) -> Result<Option<Option<SmtModel>>, RuleError> {
+        let must_reach_pre = &self.summary(assertion_site)?.must_reach;
+        if *must_reach_pre == Formula::False {
+            // No concrete path has reached the assertion site yet.
+            return Ok(None);
+        }
+        // `must_reach[site]` is the pre-state of the assertion site (before
+        // its own transfer fires).  The assertion's obligation is checked
+        // AFTER the site's effects execute, so apply SP through the site's
+        // transfer to get the post-state, then conjoin with the violation.
+        // This mirrors how the backward side seeds `state[site]` with
+        // `WP(site.transfer, ¬obligation)`.
+        let post = self
+            .cfg
+            .node(assertion_site)
+            .map_err(|_| RuleError::UnknownNode {
+                node: assertion_site,
+            })?
+            .transfer
+            .sp(must_reach_pre);
+        let combined = Formula::and(post, violation.clone());
+        let report = oracle.feasibility_with_model(&combined)?;
+        Ok(match report.feasibility {
+            Feasibility::Feasible => Some(report.model),
             Feasibility::Infeasible | Feasibility::Unknown => None,
         })
     }
