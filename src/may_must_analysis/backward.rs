@@ -521,8 +521,13 @@ fn synthesize_loop_invariants(
                 "function {function} loop {}: trying achar generator",
                 index + 1
             );
-            let candidates =
-                achar::grammar_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
+            let candidates = achar::grammar_candidates(
+                &loop_info,
+                cfg,
+                assertion_postconditions,
+                &accepted,
+                oracle,
+            );
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} achar: {} candidates",

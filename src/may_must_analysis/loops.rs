@@ -19,6 +19,24 @@
 //!      pattern) when the caller relies on `run_backward` to discharge the
 //!      obligation instead.
 //!
+//! # Entry-safety candidate soundness constraints
+//!
+//! [`entry_safety_candidates`] generates `counter_init == v || safety` disjunctions
+//! from preheader store facts.  Two invariants maintain soundness:
+//!
+//! - **Concrete-integer filter**: only store facts whose stored value is a
+//!   compile-time integer constant are used.  Facts from `nondet_int()` calls or
+//!   other unresolved pointer arguments produce variable-valued store facts; using
+//!   those would generate candidates that trivially satisfy initiation (the
+//!   forward reach already encodes the same `select == var` equation) and pass
+//!   inductiveness vacuously through the false branch — but are not genuinely
+//!   inductive, leading to unsound verification of unsafe programs.
+//!
+//! - **Whole-formula negation**: the safety formula is the negation of the whole
+//!   exit violation, not individual conjuncts.  Extracting conjuncts and negating
+//!   each produces spurious safety atoms (e.g. `j < 0` from unsigned-comparison
+//!   `Assume(j >= 0)` in the backward WP) that contaminate the candidate space.
+//!
 //! # Nested loops
 //!
 //! Loops are processed innermost-first (see [`sort_innermost_first`]).  Already-
@@ -490,7 +508,7 @@ fn apply_effects_sp(effects: &[TransferEffect], pre: &Formula, facts: &mut Store
 /// partially compensates: it adds the invariant as an additional OR-branch at
 /// the header, so subsequent code can propagate from a state where the invariant
 /// holds.
-fn forward_reach_at_header(
+pub(crate) fn forward_reach_at_header(
     cfg: &AbstractCfg,
     header: CfgNodeId,
     inner: InnerInvariants<'_>,
@@ -829,11 +847,20 @@ pub(crate) fn negate_comparison(formula: &Formula) -> Option<Formula> {
 /// the back-edge guard is not a simple `counter < bound`).
 ///
 /// Two candidate sets are generated:
-/// 1. **Direct**: `init_fact || NOT(violation_at_exit_target)` using the assertion
-///    violation formula directly from the exit-edge target — avoids loop-path conditions
+/// 1. **Direct**: `init_fact || NOT(violation_at_exit_target)` — uses the assertion
+///    violation formula directly from the exit-edge target to avoid loop-path conditions
 ///    that inflate the formula and defeat inductiveness.
-/// 2. **Propagated**: `init_fact || NOT(exit_header)` using the violation condition
-///    backward-propagated to the header — fallback when the direct form is too weak.
+/// 2. **Propagated**: `init_fact || NOT(exit_header)` — uses the violation condition
+///    backward-propagated to the header as a fallback when the direct form is too weak.
+///
+/// Only store facts with concrete integer initial values are used.  Variable-valued
+/// facts (e.g. from `nondet_int()` assignments) would produce candidates that trivially
+/// pass initiation (since the forward reach already encodes the same equation) yet are
+/// not truly inductive — leading to unsound verification.
+///
+/// Safety is computed as the negation of the whole violation formula, not individual
+/// conjuncts.  Per-conjunct negation extracts type-bound assumptions (e.g. `j >= 0`
+/// from unsigned comparisons) and negates them to spurious atoms like `j < 0`.
 ///
 /// These candidates are always checked with the Phase-B pattern (exit closure skipped);
 /// `run_backward` performs the authoritative obligation discharge.
@@ -848,7 +875,31 @@ pub fn entry_safety_candidates(
         return vec![];
     }
 
-    let mut direct_violations = Vec::new();
+    let mut candidates = Vec::new();
+
+    // Helper: emit `counter_eq || safety` for every store fact with a concrete integer value.
+    let push_with_safety = |candidates: &mut Vec<Formula>, safety: Formula| {
+        for ((region, offset), value) in &store_facts {
+            if *offset != 0 {
+                continue;
+            }
+            // Only concrete integer initial values.  Variable-valued facts (e.g. from
+            // nondet_int()) create tautological candidates that trivially satisfy initiation
+            // because forward_reach_at_header already encodes the same equation.
+            if !matches!(value, Term::Int(_)) {
+                continue;
+            }
+            let counter_eq = Formula::eq(
+                Term::select(Memory::var(region.clone()), Term::int(*offset)),
+                value.clone(),
+            );
+            push_nontrivial(candidates, Formula::or(counter_eq, safety.clone()));
+        }
+    };
+
+    // Direct: negate each exit violation as a whole formula.
+    // negate_comparison handles simple comparisons (Lt/Le/Gt/Ge) and Not-wrapped atoms
+    // without introducing double negations; compound violations fall back to Formula::not.
     for exit_edge in &info.exit_edges {
         let Ok(edge) = cfg.edge(*exit_edge) else {
             continue;
@@ -859,68 +910,18 @@ pub fn entry_safety_candidates(
         if *postcondition == Formula::False {
             continue;
         }
-        direct_violations.push(postcondition.clone());
+        let safety =
+            negate_comparison(postcondition).unwrap_or_else(|| Formula::not(postcondition.clone()));
+        push_with_safety(&mut candidates, safety);
     }
 
-    let mut candidates = Vec::new();
-
-    let all_scalar_eqs: Vec<Formula> = store_facts
-        .iter()
-        .filter(|((_, offset), _)| *offset == 0)
-        .map(|((region, offset), value)| {
-            Formula::eq(
-                Term::select(Memory::var(region.clone()), Term::int(*offset)),
-                value.clone(),
-            )
-        })
-        .collect();
-
-    if !direct_violations.is_empty() {
-        let direct_safety = Formula::not(Formula::or_all(direct_violations));
-        if !all_scalar_eqs.is_empty() {
-            push_nontrivial(
-                &mut candidates,
-                Formula::or(
-                    Formula::and_all(all_scalar_eqs.clone()),
-                    direct_safety.clone(),
-                ),
-            );
-        }
-        for ((region, offset), value) in &store_facts {
-            if *offset != 0 {
-                continue;
-            }
-            let counter_eq = Formula::eq(
-                Term::select(Memory::var(region.clone()), Term::int(*offset)),
-                value.clone(),
-            );
-            push_nontrivial(
-                &mut candidates,
-                Formula::or(counter_eq, direct_safety.clone()),
-            );
-        }
-    }
-
+    // Propagated: negate the violation backward-propagated to the header.
     if let Some(exit_violation) =
         exit_violation_at_header(info, cfg, assertion_postconditions, inner)
     {
-        let safety = Formula::not(exit_violation);
-        if !all_scalar_eqs.is_empty() {
-            push_nontrivial(
-                &mut candidates,
-                Formula::or(Formula::and_all(all_scalar_eqs), safety.clone()),
-            );
-        }
-        for ((region, offset), value) in &store_facts {
-            if *offset != 0 {
-                continue;
-            }
-            let counter_eq = Formula::eq(
-                Term::select(Memory::var(region.clone()), Term::int(*offset)),
-                value.clone(),
-            );
-            push_nontrivial(&mut candidates, Formula::or(counter_eq, safety.clone()));
-        }
+        let safety = negate_comparison(&exit_violation)
+            .unwrap_or_else(|| Formula::not(exit_violation.clone()));
+        push_with_safety(&mut candidates, safety);
     }
 
     candidates
