@@ -822,7 +822,7 @@ pub fn compute_return_summary(
         .get(&procedure.cfg.entry())
         .cloned()
         .unwrap_or(Formula::False);
-    let relation = rename_vars_in_formula(&entry_state, |name| {
+    let relation = crate::common::alpha_rename::rename_formula_uniform(&entry_state, |name| {
         if name == retval_obs_name {
             retval_name.clone()
         } else {
@@ -2676,7 +2676,7 @@ fn rename_callee_vars(
     local_prefix: &str,
 ) -> Formula {
     let callee_prefix = format!("{callee_name}$");
-    rename_vars_in_formula(formula, |name| {
+    crate::common::alpha_rename::rename_formula_uniform(formula, |name| {
         if let Some(mapped) = mapping.get(name) {
             return mapped.clone();
         }
@@ -2686,108 +2686,6 @@ fn rename_callee_vars(
             name.to_string()
         }
     })
-}
-
-pub fn rename_vars_in_formula(
-    formula: &Formula,
-    rename: impl Fn(&str) -> String + Copy,
-) -> Formula {
-    match formula {
-        Formula::True => Formula::True,
-        Formula::False => Formula::False,
-        Formula::Var(var) => Formula::Var(Var::new(rename(var.name()), var.sort())),
-        Formula::Not(inner) => Formula::not(rename_vars_in_formula(inner, rename)),
-        Formula::And(items) => Formula::and_many(
-            items
-                .iter()
-                .map(|item| rename_vars_in_formula(item, rename)),
-        ),
-        Formula::Or(items) => Formula::or_many(
-            items
-                .iter()
-                .map(|item| rename_vars_in_formula(item, rename)),
-        ),
-        Formula::Implies(lhs, rhs) => Formula::implies(
-            rename_vars_in_formula(lhs, rename),
-            rename_vars_in_formula(rhs, rename),
-        ),
-        Formula::Eq(lhs, rhs) => Formula::eq(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Formula::MemoryEq(lhs, rhs) => Formula::memory_eq(
-            rename_vars_in_memory(lhs, rename),
-            rename_vars_in_memory(rhs, rename),
-        ),
-        Formula::Lt(lhs, rhs) => Formula::lt(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Formula::Le(lhs, rhs) => Formula::le(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Formula::Gt(lhs, rhs) => Formula::gt(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Formula::Ge(lhs, rhs) => Formula::ge(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-    }
-}
-
-pub fn rename_vars_in_term(term: &Term, rename: impl Fn(&str) -> String + Copy) -> Term {
-    match term {
-        Term::Var(var) => Term::Var(Var::new(rename(var.name()), var.sort())),
-        Term::Int(value) => Term::Int(*value),
-        Term::Real(value) => Term::Real(*value),
-        Term::BoolToInt(value) => Term::bool_to_int(rename_vars_in_formula(value, rename)),
-        Term::Select(memory, index) => Term::select(
-            rename_vars_in_memory(memory, rename),
-            rename_vars_in_term(index, rename),
-        ),
-        Term::Add(lhs, rhs) => Term::add(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Term::Sub(lhs, rhs) => Term::sub(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Term::Mul(lhs, rhs) => Term::mul(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Term::Div(lhs, rhs) => Term::div(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Term::Rem(lhs, rhs) => Term::rem(
-            rename_vars_in_term(lhs, rename),
-            rename_vars_in_term(rhs, rename),
-        ),
-        Term::Neg(inner) => Term::neg(rename_vars_in_term(inner, rename)),
-    }
-}
-
-pub fn rename_vars_in_memory(
-    memory: &crate::common::formula::Memory,
-    rename: impl Fn(&str) -> String + Copy,
-) -> crate::common::formula::Memory {
-    match memory {
-        crate::common::formula::Memory::Var(name) => {
-            crate::common::formula::Memory::var(rename(name))
-        }
-        crate::common::formula::Memory::Store(inner, index, value) => {
-            crate::common::formula::Memory::store(
-                rename_vars_in_memory(inner, rename),
-                rename_vars_in_term(index, rename),
-                rename_vars_in_term(value, rename),
-            )
-        }
-    }
 }
 
 fn substitute_var_name_with_term(formula: &Formula, name: &str, replacement: &Term) -> Formula {

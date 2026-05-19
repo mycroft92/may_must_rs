@@ -1592,10 +1592,8 @@ mod tests {
     #[test]
     fn array_2_is_not_falsely_verified() {
         // array-2: loop fills array[0] with nondet, then asserts array[0] > menor.
-        // The loop invariant (j >= 0) fails exit closure because the counter does
-        // not constrain the array contents.  The analysis must not return Verified
-        // (false safe); it should return Unknown (synthesis cannot find an invariant
-        // strong enough to discharge the array-content assertion).
+        // Invariant synthesis cannot prove this (no relational template), so the
+        // result must be Unknown — never Safe (that would be a false verdict).
         with_bc_graphs("array-2", |graphs| {
             let oracle = Oracle::new();
             let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
@@ -1605,6 +1603,30 @@ mod tests {
                 proc.verdict(),
                 SafetyVerdict::Safe,
                 "array-2 must not be falsely verified"
+            );
+        });
+    }
+
+    #[test]
+    fn array_2_bmc_finds_bug_in_one_iteration() {
+        // array-2 is unsafe: menor == array[0] is reachable after one loop
+        // iteration (array[0] = nondet; if array[0] <= menor: menor = array[0]).
+        // BMC with bound=1 must find a BugFound counterexample.
+        with_bc_graphs("array-2", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let config = InvariantConfig {
+                bmc_bound: Some(1),
+                ..InvariantConfig::default()
+            };
+            let report =
+                analyze_module_with_llm(graphs, &memory_pure, &NoProvider, &oracle, &config)
+                    .unwrap();
+            let proc = procedure(&report, "main");
+            assert_eq!(
+                proc.verdict(),
+                SafetyVerdict::Unsafe,
+                "array-2 must be found UNSAFE by BMC with bound=1"
             );
         });
     }

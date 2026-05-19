@@ -10,11 +10,21 @@
 //!
 //! For a loop with body nodes `{H, B…, L}` and back edge `L→H`:
 //! - Iteration 0 reuses the original nodes.
-//! - Iterations 1..bound−1 are fresh node copies added to the cloned CFG.
+//! - Iterations 1..=bound are fresh node copies (`bound` total extra copies).
 //! - `L_i → H_{i+1}` replaces the back edge at each step; the original back
 //!   edge is removed so the CFG becomes acyclic.
-//! - Exit edges are replicated from every copy so the loop can exit at any
-//!   iteration.
+//! - Exit edges (from the loop header, or wherever the loop tests the condition)
+//!   are present in the original nodes AND in every extra copy.  This means the
+//!   loop can exit after 0, 1, 2, …, or exactly `bound` full iterations.
+//! - The latch of the final copy (iteration `bound`) is a dead end — no further
+//!   iterations are possible beyond the bound.
+//!
+//! **Why `bound` extra copies, not `bound-1`:**
+//! To model "exit after exactly k iterations" we need k full body traversals
+//! followed by a header visit where the exit branch is taken.  That requires
+//! k extra header copies (one per body traversal).  With only `bound-1` copies,
+//! the largest reachable "exit" header is copy `bound-2`, modelling at most
+//! `bound-1` iterations — off by one.
 //!
 //! Nested loops are not supported; `bmc_check` returns `None` for those cases.
 //! Independent (non-nested) loops in the same function are each unrolled with
@@ -22,6 +32,7 @@
 
 use crate::common::abstract_cfg::{AbstractCfg, CfgNodeId};
 use crate::common::adapter::AssertionSite;
+use crate::common::alpha_rename;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{self, AssertionResult};
 use crate::may_must_analysis::loops::{detect_loops, sort_innermost_first, LoopInfo};
@@ -142,7 +153,7 @@ fn unroll_single_loop(
 ) -> Vec<BTreeMap<CfgNodeId, CfgNodeId>> {
     let mut iteration_maps: Vec<BTreeMap<CfgNodeId, CfgNodeId>> = Vec::new();
 
-    if bound <= 1 {
+    if bound == 0 {
         return iteration_maps;
     }
 
@@ -152,19 +163,35 @@ fn unroll_single_loop(
     // Starts at the original latch (iteration 0).
     let mut prev_latch = loop_info.latch;
 
-    for i in 1..bound {
-        // Create fresh copies of every body node.
+    // Add `bound` extra copies (iterations 1..=bound).  Each copy's header has
+    // the original exit edges, so the loop can exit after exactly i iterations.
+    for i in 1..=bound {
+        // Each copy gets a fresh variable suffix so that SSA variables from
+        // different iterations do not interfere in the backward analysis.
+        // Memory region names are NOT renamed — they represent shared mutable
+        // state (the array, j, menor) that must be visible across iterations.
+        let suffix = format!("_bmc{i}");
+
+        // Scalar SSA vars get a fresh suffix per iteration; memory region names
+        // stay unchanged so stores from one iteration are visible to the next.
+        let var_r = |name: &str| format!("{name}{suffix}");
+        let reg_r = |name: &str| name.to_string();
+
+        // Create fresh copies of every body node with renamed transfer fns.
         let mut node_map: BTreeMap<CfgNodeId, CfgNodeId> = BTreeMap::new();
         for &orig_id in &body_nodes {
             let (label, transfer) = {
                 let n = cfg.node(orig_id).expect("body node exists in cfg");
-                (format!("{}_bmc{i}", n.label), n.transfer.clone())
+                (
+                    format!("{}_bmc{i}", n.label),
+                    alpha_rename::rename_transfer_fn(&n.transfer, var_r, reg_r),
+                )
             };
             let new_id = cfg.add_node(label, transfer);
             node_map.insert(orig_id, new_id);
         }
 
-        // Replicate intra-body edges (everything except the back edge).
+        // Replicate intra-body edges with renamed guards and effects.
         let intra: Vec<_> = cfg
             .edges()
             .values()
@@ -179,20 +206,33 @@ fn unroll_single_loop(
         for edge in intra {
             let src = node_map[&edge.source];
             let tgt = node_map[&edge.target];
-            cfg.add_edge(src, tgt, edge.guard, edge.effects)
+            let guard = alpha_rename::rename_formula(&edge.guard, var_r, reg_r);
+            let effects = edge
+                .effects
+                .iter()
+                .map(|e| alpha_rename::rename_effect(e, var_r, reg_r))
+                .collect();
+            cfg.add_edge(src, tgt, guard, effects)
                 .expect("newly added nodes must be valid");
         }
 
         // Connect the previous iteration's latch to this iteration's header.
+        // The back-edge guard/effects carry the loop-condition test; rename them.
         let (back_guard, back_effects) = {
             let be = cfg.edge(loop_info.back_edge).expect("back edge exists");
-            (be.guard.clone(), be.effects.clone())
+            let guard = alpha_rename::rename_formula(&be.guard, var_r, reg_r);
+            let effects = be
+                .effects
+                .iter()
+                .map(|e| alpha_rename::rename_effect(e, var_r, reg_r))
+                .collect();
+            (guard, effects)
         };
         let new_header = node_map[&loop_info.header];
         cfg.add_edge(prev_latch, new_header, back_guard, back_effects)
             .expect("prev_latch and new_header must be valid");
 
-        // Replicate exit edges: each iteration can exit to the same post-loop target.
+        // Replicate exit edges with renamed guards and effects.
         let exits: Vec<_> = loop_info
             .exit_edges
             .iter()
@@ -201,13 +241,14 @@ fn unroll_single_loop(
 
         for exit_edge in exits {
             if let Some(&new_src) = node_map.get(&exit_edge.source) {
-                cfg.add_edge(
-                    new_src,
-                    exit_edge.target,
-                    exit_edge.guard,
-                    exit_edge.effects,
-                )
-                .expect("new_src and exit target must be valid");
+                let guard = alpha_rename::rename_formula(&exit_edge.guard, var_r, reg_r);
+                let effects = exit_edge
+                    .effects
+                    .iter()
+                    .map(|e| alpha_rename::rename_effect(e, var_r, reg_r))
+                    .collect();
+                cfg.add_edge(new_src, exit_edge.target, guard, effects)
+                    .expect("new_src and exit target must be valid");
             }
         }
 
@@ -251,7 +292,34 @@ mod tests {
     }
 
     #[test]
-    fn unroll_bound_2_adds_one_copy() {
+    fn unroll_bound_1_adds_one_copy() {
+        let (cfg, header, _post_loop) = make_single_loop_cfg();
+        let original_node_count = cfg.nodes().len();
+
+        let loops = detect_loops(&cfg);
+        assert_eq!(loops.len(), 1);
+        let loop_info = &loops[0];
+        assert_eq!(loop_info.header, header);
+
+        let mut bmc_cfg = cfg.clone();
+        let maps = unroll_single_loop(&mut bmc_cfg, loop_info, 1);
+        bmc_cfg.remove_edge(loop_info.back_edge);
+
+        // bound=1 adds 1 extra copy so "exit after 1 iteration" is reachable.
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            bmc_cfg.nodes().len(),
+            original_node_count + loop_info.body.len()
+        );
+
+        assert!(
+            bmc_cfg.topological_order().is_some(),
+            "unrolled CFG must be acyclic"
+        );
+    }
+
+    #[test]
+    fn unroll_bound_2_adds_two_copies() {
         let (cfg, header, _post_loop) = make_single_loop_cfg();
         let original_node_count = cfg.nodes().len();
 
@@ -264,31 +332,16 @@ mod tests {
         let maps = unroll_single_loop(&mut bmc_cfg, loop_info, 2);
         bmc_cfg.remove_edge(loop_info.back_edge);
 
-        // One extra copy of all body nodes (3 body nodes: header, body, latch).
-        assert_eq!(maps.len(), 1);
+        // bound=2 adds 2 extra copies (exit after 1 or 2 iterations reachable).
+        assert_eq!(maps.len(), 2);
         assert_eq!(
             bmc_cfg.nodes().len(),
-            original_node_count + loop_info.body.len()
+            original_node_count + 2 * loop_info.body.len()
         );
 
-        // Resulting CFG should be acyclic.
         assert!(
             bmc_cfg.topological_order().is_some(),
             "unrolled CFG must be acyclic"
         );
-    }
-
-    #[test]
-    fn unroll_bound_1_is_noop() {
-        let (cfg, header, _) = make_single_loop_cfg();
-        let loops = detect_loops(&cfg);
-        let loop_info = &loops[0];
-        let _ = header;
-
-        let mut bmc_cfg = cfg.clone();
-        let maps = unroll_single_loop(&mut bmc_cfg, loop_info, 1);
-        assert!(maps.is_empty());
-        // Node count unchanged (no copies added, back edge not yet removed).
-        assert_eq!(bmc_cfg.nodes().len(), cfg.nodes().len());
     }
 }

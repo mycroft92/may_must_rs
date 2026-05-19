@@ -28,6 +28,7 @@ src/llvm_utils/llvm_wrap.rs        LLVM C API wrapper boundary
 src/llvm_utils/program_graph.rs    raw instruction graph generation
 src/common/formula.rs              terms, predicates, SMT model types
 src/common/abstract_cfg.rs         abstract CFG, transfer effects, WP helpers
+src/common/alpha_rename.rs         two-closure alpha-renaming for formulas/terms/memory/effects
 src/common/alias_analysis.rs       field-sensitive Andersen alias analysis
 src/common/adapter.rs              FunctionGraph -> AdaptedProcedure lowering
 src/common/oracle.rs               SMT feasibility / implication boundary
