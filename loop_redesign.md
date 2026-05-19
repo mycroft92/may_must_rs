@@ -2,6 +2,8 @@
 
 Notes from design discussion, 2026-05-17.
 
+> **Status (2026-05-19):** The observer-disjunction approach and Phase-B exit-closure skip described below were reverted or removed as unsound (see LOOPS.md). The current implementation uses the three-phase synthesis pipeline (algorithmic → entry-safety → ACHAR ICE) with all three invariant checks required for every candidate. Memory-relational invariants (cross-region templates) remain an open item; array-2 is now covered by BMC (`--bmc-bound 1`) rather than invariant synthesis. The CHC/PDR and greedy N-term conjunction ideas in §Proposed New Synthesis Step are still unimplemented.
+
 ---
 
 ## Problem

@@ -55,30 +55,14 @@ For each loop (innermost-first) the following phases are tried in sequence
 until one produces an accepted candidate.  All candidates are checked by
 `check_loop_invariant_verbose` (see §4).
 
-### Phase 1 — Algorithmic (`loops.rs` — `algorithmic_candidates`)
+Default mode runs Phase 1 then Phase 2.  `--inv-observer` runs the observer
+phase only (diagnostic).  `--inv-grammar` runs Phase 2 only.
 
-No solver calls at this stage; O(CFG size).  Mines candidates from:
+### Phase 1 — Entry-safety (`loops.rs` — `entry_safety_candidates`)
 
-- The **back-edge guard** and its negation (e.g. `i < n` → also `¬(i < n)`).
-- **Header→body entry edge guards**.
-- **Exit edge guard negations** (loop termination conditions).
-- **Counter increment patterns** — `i = i + c` → generates `i >= 0`.
-- **Integer literal assignments** — `i = 0` → generates `i >= 0`.
-- **Predicate assignments** — if `b` is assigned predicate `p`, generates `p`,
-  `¬p`, all five comparison variants (`<`, `<=`, `>`, `>=`, `==`) of the same
-  operands, and `b ⇒ p`.
-
-Constants and variables with unique non-recursive definitions in the body are
-substituted via `normalize_formula_with_defs`.  Tautologies (`True`, `False`,
-`a ⇒ a`) and duplicates are dropped by `push_nontrivial`.
-
-These candidates are checked with the **full three-way check** — exit closure
-is included.
-
-### Phase 2 — Entry-safety (`loops.rs` — `entry_safety_candidates`)
-
-Only attempted when Phase 1 fails **and** `assertion_postconditions` is
-non-empty (i.e. a specific assertion site is being checked).
+Only attempted when `assertion_postconditions` is non-empty (i.e. a specific
+assertion site is being checked).  Skipped in the pre-pass and in
+`--inv-grammar` mode.
 
 Generates candidates of the form `counter == init_value || safety_condition`:
 
@@ -95,15 +79,16 @@ Generates candidates of the form `counter == init_value || safety_condition`:
 4. Also generates the backward-propagated variant (`exit_violation_at_header`)
    as a fallback.
 
-**Exit closure is intentionally skipped for this phase**: `first_accepted_candidate`
-is called with `&BTreeMap::new()` as the postconditions map.  Only initiation
-and inductiveness are checked here.  The authoritative discharge of the
-assertion obligation is performed by the subsequent `run_backward`
-bidirectional check — the same observer-invariant pattern used in `driver.rs`
-for cyclic callee summaries.  See `LOOPS.md` §Phase-B for the soundness
-argument.
+All three checks (initiation, inductiveness, exit closure) are required.
+`first_accepted_candidate` is called with the real `assertion_postconditions`
+map.  Exit closure is not skipped — a candidate is only accepted as a
+`VerifiedLoopInvariant` when it passes all three checks.
 
-### Phase 3 — ACHAR ICE learner (`achar.rs` — `grammar_candidates`)
+*(Historical note: v0.9.0–v0.10.x skipped exit closure for this phase
+("Phase-B"). This was found unsound and removed in v0.11.0. See `LOOPS.md`
+§Entry-Safety Candidates for the explanation.)*
+
+### Phase 2 — ACHAR ICE learner (`achar.rs` — `grammar_candidates`)
 
 Enumerates candidates from a grammar over the loop's variable vocabulary, guided
 by concrete SMT example states:
@@ -361,8 +346,7 @@ the obligation are re-checked, because the obligation formula may reference a
 
 | Phase | Initiation | Inductiveness | Exit closure |
 |---|---|---|---|
-| Algorithmic | ✅ | ✅ | ✅ |
-| Entry-safety | ✅ | ✅ | ❌ (skipped; `run_backward` discharges) |
+| Entry-safety | ✅ | ✅ | ✅ |
 | ACHAR ICE learner | ✅ | ✅ | ✅ |
 | Precomputed (pre-pass) | ✅ | ✅ | ❌ (no assertion site yet) |
 | Precomputed (per-assertion reuse) | — | — | ✅ (re-checked before reuse) |
@@ -376,7 +360,7 @@ the obligation are re-checked, because the obligation formula may reference a
 | Initiation via forward SP over-approximation | Sound |
 | Inductiveness via Hoare-style WP for `Assume` | Sound (correct semantics) |
 | Store-fact intersection at join points | Sound (conservative) |
-| Phase-B exit-closure skip for entry-safety | Sound (`run_backward` discharges) |
+| All three checks required for every `VerifiedLoopInvariant` | Sound (type-level enforcement; no bypass path) |
 | Concrete-integer filter on entry-safety store facts | Sound (prevents tautological candidates from variable-valued facts) |
 | Whole-formula negation in entry-safety safety formula | Sound (prevents spurious type-bound atoms from contaminating candidates) |
 | Latch node uses standard WP in inductiveness path | Conservative in failure only (spurious rejection, never false-Verified) |

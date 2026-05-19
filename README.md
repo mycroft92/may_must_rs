@@ -174,17 +174,20 @@ indeterminate → `UNKNOWN`.
 
 **Loop invariant synthesis** is attempted in order:
 1. Entry-safety candidates — mines `counter==init || safety` forms from
-   concrete preheader store facts and the assertion postcondition; accepted
-   inductively with the bidirectional check discharging the assertion
-   (Phase-B pattern).
+   concrete preheader store facts and the assertion postcondition.
 2. ACHAR grammar-based ICE learning — enumerates candidates from a vocabulary
    of loop variables and select-terms; filters atoms with positive/negative
    example states from the SMT oracle; generates atoms, pairwise conjunctions,
    observer-style and ICE-guided disjunctions in priority order.
 
-Each candidate is checked for initiation, inductiveness, and (except for
-entry-safety Phase-B candidates) exit closure. See [LOOPS.md](LOOPS.md) for
-the full soundness analysis of each check.
+Every candidate must pass all three checks — initiation, inductiveness, and
+exit closure against the real assertion postconditions — before reaching the
+backward analysis. The `VerifiedLoopInvariant` type enforces this at compile
+time. See [LOOPS.md](LOOPS.md) for the full soundness analysis.
+
+**Bounded model checking** (`--bmc-bound N`) unrolls each loop up to N
+iterations and runs the backward analysis on the acyclic result. A `BugFound`
+result is a real counterexample; absence of a bug within the bound is UNKNOWN.
 
 **Interprocedural reasoning** uses summaries in both directions:
 - `ReturnSummary`: relates return values to inputs, inferred by backward WP.
@@ -204,6 +207,8 @@ src/common/llvm_utils/program_graph.rs raw instruction-level FunctionGraph build
 src/common/source.rs                   SourceLocation type (file, line, column)
 src/common/formula.rs                  terms, predicates, memory arrays, SMT model types
 src/common/abstract_cfg.rs             abstract CFG, TransferEffect variants, WP/SP
+src/common/alpha_rename.rs             two-closure alpha-renaming (var_rename / region_rename)
+                                        used by adapter (call-summary application) and BMC
 src/common/alias_analysis.rs           field-sensitive flow-insensitive Andersen alias
                                         analysis; run once per module before lowering
 src/common/adapter.rs                  FunctionGraph → AdaptedProcedure lowering
@@ -227,6 +232,8 @@ src/may_must_analysis/chc.rs           Constrained Horn Clause encoding (retaine
                                         the synthesis pipeline)
 src/may_must_analysis/backward.rs      assertion checking, loop invariant synthesis
                                         (entry-safety → ACHAR)
+src/may_must_analysis/bmc.rs           bounded model checking via loop unrolling;
+                                        bug-finding only (BugFound is real; absence ≠ safe)
 src/may_must_analysis/driver.rs        module orchestration, whole-module AA, bottom-up
                                         summary accumulation, observer-invariant synthesis
 src/may_must_analysis/summaries.rs     SummaryTables and MustSummary data structures
@@ -250,8 +257,9 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 | Branch-guard lowering | ✅ |
 | Acyclic procedure verification | ✅ |
 | Cyclic procedures with loop invariant synthesis | ✅ |
-| Loop invariants via entry-safety candidates (Phase-B discharge) | ✅ |
+| Loop invariants via entry-safety candidates (full exit-closure check) | ✅ |
 | Loop invariants via ACHAR grammar-based ICE learning | ✅ |
+| Bounded model checking for bug finding (`--bmc-bound N`) | ✅ |
 | Interprocedural return-summary inference (acyclic callees) | ✅ |
 | Cyclic callee return-summary inference (observer-invariant) | ✅ |
 | `llvm.memcpy` / `llvm.memset` unrolling | ✅ |

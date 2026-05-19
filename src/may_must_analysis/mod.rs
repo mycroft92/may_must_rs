@@ -1,5 +1,6 @@
 pub mod achar;
 pub mod backward;
+pub mod bmc;
 pub mod chc;
 pub mod driver;
 pub mod loops;

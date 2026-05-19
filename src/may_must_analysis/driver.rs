@@ -24,10 +24,10 @@
 //! (e.g. a maximum or sum), [`infer_cyclic_observer_summary`] synthesises an
 //! invariant by examining which array indices the function accesses, then
 //! verifying a candidate relation `retval >= array[i]` via the full
-//! bidirectional check.  The invariant synthesis step
-//! ([`observer_summary_invariants`]) intentionally skips the exit-closure check
-//! because the authoritative proof is delegated to the subsequent
-//! `analyze_with_tables` call.
+//! bidirectional check.  [`observer_summary_invariants`] runs initiation,
+//! inductiveness, and exit-closure checks against the real assertion
+//! postconditions, returning [`VerifiedLoopInvariant`] values.  These are
+//! passed directly to [`analyze_with_tables`] which completes the proof.
 
 #![allow(dead_code)]
 
@@ -44,12 +44,13 @@ use crate::common::formula::{Formula, Memory, Term, Var};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{
-    analyze, analyze_with_tables, discover_loop_invariants, render_result, AssertionResult,
-    BackwardError, InvariantConfig,
+    analyze, analyze_with_tables, discover_loop_invariants, render_result, verify_precomputed,
+    AssertionResult, BackwardError, InvariantConfig,
 };
+use crate::may_must_analysis::bmc;
 use crate::may_must_analysis::loops::{
     check_loop_invariant_verbose, detect_loops, normalize_candidate, sort_innermost_first,
-    InvariantCheckResult, LoopInfo,
+    InvariantCheckResult, LoopInfo, VerifiedLoopInvariant,
 };
 use crate::may_must_analysis::providers::{CandidateProvider, NoProvider};
 use crate::may_must_analysis::rules::{Judgement, RuleEngine};
@@ -348,7 +349,8 @@ pub fn analyze_with_summaries(
     } else {
         adapt_with_purity_and_summaries(graph, memory_pure, summaries, &alias)?
     };
-    let precomputed_owned = tables
+    // Discover InductiveHints once per function (no exit closure, no assertion site yet).
+    let precomputed_hints: Option<Vec<(CfgNodeId, Formula)>> = tables
         .and_then(|tables| {
             let invariants = tables.get_loop_invariants(&adapted.name);
             (!invariants.is_empty()).then(|| invariants.to_vec())
@@ -362,13 +364,20 @@ pub fn analyze_with_summaries(
                 &adapted.debug_names,
             )
         });
-    let precomputed = precomputed_owned.as_deref();
 
     let site_results: Vec<_> = adapted
         .assertions
         .par_iter()
         .map(|site| {
             let result = if let Some(tables) = tables {
+                // Upgrade InductiveHints to VerifiedLoopInvariant for this assertion site.
+                // If exit closure fails for the hints, analyze_with_tables falls through
+                // to per-site synthesis with the real assertion postconditions.
+                let verified = precomputed_hints.as_deref().and_then(|hints| {
+                    verify_precomputed(&adapted.cfg, site, hints, oracle)
+                        .ok()
+                        .flatten()
+                });
                 analyze_with_tables(
                     &adapted.cfg,
                     &adapted.name,
@@ -376,7 +385,7 @@ pub fn analyze_with_summaries(
                     oracle,
                     tables,
                     config,
-                    precomputed,
+                    verified.as_deref(),
                     &adapted.debug_names,
                 )
             } else {
@@ -385,15 +394,49 @@ pub fn analyze_with_summaries(
             (site, result)
         })
         .collect();
+    let bmc_bound = config.and_then(|c| c.bmc_bound);
     let mut assertions = Vec::new();
     let mut failures = Vec::new();
     for (site, result) in site_results {
         match result {
-            Ok(result) => assertions.push(result),
-            Err(BackwardError::CyclicCfgUnsupported) => failures.push(format!(
-                "assertion #{} ({}): CFG has a cycle and no loop invariant was accepted",
-                site.id, site.location
-            )),
+            Ok(result) => {
+                log::info!(
+                    target: "engine_verdict",
+                    "function {} assertion #{} ({}): {:?} [engine=invariant-analysis]",
+                    adapted.name,
+                    site.id,
+                    site.location,
+                    result.judgement
+                );
+                assertions.push(result);
+            }
+            Err(BackwardError::CyclicCfgUnsupported) => {
+                // Invariant synthesis failed. Try BMC as a bug-finding fallback.
+                if let Some(bound) = bmc_bound {
+                    if let Some(bmc_result) = bmc::bmc_check(&adapted.cfg, site, oracle, bound) {
+                        log::info!(
+                            target: "engine_verdict",
+                            "function {} assertion #{} ({}): {:?} [engine=bmc bound={}]",
+                            adapted.name,
+                            site.id,
+                            site.location,
+                            bmc_result.judgement,
+                            bound,
+                        );
+                        assertions.push(bmc_result);
+                        continue;
+                    }
+                    log::info!(
+                        target: "engine_verdict",
+                        "function {} assertion #{} ({}): UNKNOWN [engine=bmc bound={} exhausted]",
+                        adapted.name, site.id, site.location, bound
+                    );
+                }
+                failures.push(format!(
+                    "assertion #{} ({}): CFG has a cycle and no loop invariant was accepted",
+                    site.id, site.location
+                ));
+            }
             Err(error) => failures.push(format!(
                 "assertion #{} ({}): {}",
                 site.id, site.location, error
@@ -842,31 +885,25 @@ fn const_int_value(term: &Term) -> Option<i64> {
 /// counter <= observed_index  OR  accumulator >= observed_value
 /// ```
 ///
-/// The invariant is checked for initiation and inductiveness via
-/// [`check_loop_invariant_verbose`] with `assertion_postconditions` set to
-/// `&BTreeMap::new()` — the exit-closure check is **intentionally skipped**
-/// here.  The rationale: this invariant only needs to be inductive; the actual
-/// obligation (`retval >= array[observed_index]`) is verified by the
-/// [`analyze_with_tables`] call in [`infer_cyclic_observer_summary`], which is
-/// the authoritative discharge step.
+/// The invariant is checked for all three conditions — initiation, inductiveness,
+/// and **exit closure** — via [`check_loop_invariant_verbose`] with real
+/// `assertion_postconditions` derived from the assertion site.  The result is a
+/// [`VerifiedLoopInvariant`] suitable for direct use in [`run_backward`].
 ///
-/// # Design note
-///
-/// Exit closure is skipped here because the final proof is delegated to
-/// [`analyze_with_tables`] with the full assertion context.  This avoids
-/// building a separate exit-closure check that may differ from the authoritative
-/// verification in [`analyze_with_tables`].
+/// The [`analyze_with_tables`] call in [`infer_cyclic_observer_summary`] then
+/// runs the full bidirectional check using these pre-verified invariants.
 fn observer_summary_invariants(
     cfg: &AbstractCfg,
     site: &AssertionSite,
     oracle: &Oracle,
     observed_index: i64,
-) -> Option<Vec<(CfgNodeId, Formula)>> {
+) -> Option<Vec<VerifiedLoopInvariant>> {
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
     let assertion_postconditions = preliminary_backward_states(cfg, site, &excluded).ok()?;
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
-    let mut accepted = Vec::new();
+    let mut accepted: Vec<VerifiedLoopInvariant> = Vec::new();
+    let mut inner: Vec<(CfgNodeId, Formula)> = Vec::new();
 
     for loop_info in loops {
         let header_state = assertion_postconditions.get(&loop_info.header)?;
@@ -877,24 +914,23 @@ fn observer_summary_invariants(
             Formula::le(counter, Term::int(observed_index)),
             Formula::ge(accumulator, observed),
         );
-        // Skip exit closure check: the invariant only needs to be inductive here.
-        // The actual obligation is verified by the analyze_with_tables call in
-        // infer_cyclic_observer_summary, which is the authoritative check.
         let result = check_loop_invariant_verbose(
             &loop_info,
             cfg,
             &candidate,
             oracle,
-            &BTreeMap::new(),
-            &accepted,
+            &assertion_postconditions,
+            &inner,
         );
         if result != InvariantCheckResult::Accepted {
             return None;
         }
-        accepted.push((
+        let normalized = normalize_candidate(cfg, loop_info.header, &candidate);
+        accepted.push(VerifiedLoopInvariant::new(
             loop_info.header,
-            normalize_candidate(cfg, loop_info.header, &candidate),
+            normalized.clone(),
         ));
+        inner.push((loop_info.header, normalized));
     }
     Some(accepted)
 }
@@ -1578,12 +1614,53 @@ mod tests {
     }
 
     #[test]
+    fn array_1_verified() {
+        // array-1: loop iterates `for (j=0; j<SIZE; j++)` with SIZE=1, writing
+        // array[j]=nondet and tightening `menor = min(menor, array[j])`.  After
+        // the loop, `array[0] >= menor` holds because `menor` is the running min.
+        // ACHAR finds the invariant `((j==0)||(array[0]>=menor)) && (SIZE==1)`
+        // via the `counter-assert-disj+imm` tier (Tier 2b): the conjoined
+        // immutable preheader fact `SIZE==1` rules out the spurious SIZE=0
+        // exit-closure case.
+        with_bc_graphs("array-1", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let proc = procedure(&report, "main");
+            assert_eq!(
+                proc.verdict(),
+                SafetyVerdict::Safe,
+                "array-1 must be Verified: array[0]>=menor is always safe"
+            );
+        });
+    }
+
+    #[test]
+    fn array_2_not_verified() {
+        // array-2 is identical to array-1 except the assertion is strict:
+        // `array[0] > menor` (vs. `>=`).  The body forces `menor <= array[0]`
+        // (non-strict), so when `menor_orig <= array[0]`, the body sets
+        // `menor = array[0]` and the assertion FAILS.  With the default
+        // BMC fallback (`bmc_bound = Some(2)`) array-2 is reported UNSAFE
+        // automatically when invariant synthesis fails.
+        with_bc_graphs("array-2", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let proc = procedure(&report, "main");
+            assert_eq!(
+                proc.verdict(),
+                SafetyVerdict::Unsafe,
+                "array-2 must be UNSAFE via BMC fallback when invariant analysis fails"
+            );
+        });
+    }
+
+    #[test]
     fn array_2_is_not_falsely_verified() {
         // array-2: loop fills array[0] with nondet, then asserts array[0] > menor.
-        // The loop invariant (j >= 0) fails exit closure because the counter does
-        // not constrain the array contents.  The analysis must not return Verified
-        // (false safe); it should return Unknown (synthesis cannot find an invariant
-        // strong enough to discharge the array-content assertion).
+        // Invariant synthesis cannot prove this (no relational template), so the
+        // result must be Unknown — never Safe (that would be a false verdict).
         with_bc_graphs("array-2", |graphs| {
             let oracle = Oracle::new();
             let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
@@ -1593,6 +1670,30 @@ mod tests {
                 proc.verdict(),
                 SafetyVerdict::Safe,
                 "array-2 must not be falsely verified"
+            );
+        });
+    }
+
+    #[test]
+    fn array_2_bmc_finds_bug_in_one_iteration() {
+        // array-2 is unsafe: menor == array[0] is reachable after one loop
+        // iteration (array[0] = nondet; if array[0] <= menor: menor = array[0]).
+        // BMC with bound=1 must find a BugFound counterexample.
+        with_bc_graphs("array-2", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
+            let config = InvariantConfig {
+                bmc_bound: Some(1),
+                ..InvariantConfig::default()
+            };
+            let report =
+                analyze_module_with_llm(graphs, &memory_pure, &NoProvider, &oracle, &config)
+                    .unwrap();
+            let proc = procedure(&report, "main");
+            assert_eq!(
+                proc.verdict(),
+                SafetyVerdict::Unsafe,
+                "array-2 must be found UNSAFE by BMC with bound=1"
             );
         });
     }

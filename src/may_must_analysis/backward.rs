@@ -46,6 +46,7 @@ use crate::may_must_analysis::achar;
 use crate::may_must_analysis::loops::{
     check_loop_invariant_verbose, detect_loops, entry_safety_candidates, normalize_candidate,
     observer_disjunction_candidates, sort_innermost_first, InvariantCheckResult,
+    VerifiedLoopInvariant,
 };
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::rules::{Judgement, RuleEngine, RuleError};
@@ -140,6 +141,12 @@ pub struct InvariantConfig {
     /// Skip analysis of functions with more than this many instructions,
     /// returning UNKNOWN immediately. 0 means unlimited.
     pub max_function_size: usize,
+    /// Time budget for the ACHAR CEGIS phase per loop. Default: 10 seconds.
+    pub achar_timeout: std::time::Duration,
+    /// When Some(k), run BMC with bound k as a fallback after invariant
+    /// synthesis fails (CyclicCfgUnsupported). BMC can find bugs that require
+    /// reasoning through k loop iterations but cannot prove safety.
+    pub bmc_bound: Option<usize>,
 }
 
 impl Default for InvariantConfig {
@@ -147,6 +154,13 @@ impl Default for InvariantConfig {
         Self {
             mode: SynthesisMode::Default,
             max_function_size: 500,
+            achar_timeout: std::time::Duration::from_secs(10),
+            // Default to a small BMC bound so that programs where invariant
+            // synthesis cannot prove safety still have a chance to report a
+            // concrete BugFound (e.g. `tests/array-2.c`, where one unrolled
+            // iteration exhibits the violation).  The CLI's `--bmc-bound`
+            // overrides this if a larger budget is desired.
+            bmc_bound: Some(2),
         }
     }
 }
@@ -177,21 +191,24 @@ pub fn analyze(
 ///
 /// # Cyclic path
 ///
-/// 1. Back edges are detected and excluded from the topological order.
-/// 2. If `precomputed` invariants are supplied and non-empty, exit closure is
-///    checked first; if it passes they are used directly.
-/// 3. Otherwise [`synthesize_loop_invariants`] is called with the active
-///    candidate generators (entry-safety, ACHAR).
-/// 4. Accepted invariants are injected into `reach` at loop headers before the
+/// 1. If `precomputed` [`VerifiedLoopInvariant`]s are supplied, they are used
+///    directly — they have already passed initiation, inductiveness, and exit
+///    closure.  No re-check is performed.
+/// 2. Otherwise [`synthesize_loop_invariants`] is called with the active
+///    candidate generators (entry-safety, ACHAR), which produces
+///    [`VerifiedLoopInvariant`]s that pass all three checks including exit
+///    closure.
+/// 3. Accepted invariants are injected into `reach` at loop headers before the
 ///    final [`run_backward`] call.
 ///
 /// # Parameters
 ///
-/// * `tables` — interprocedural must/not-may summaries and cached loop
-///   invariants produced by a prior module-level pass.
+/// * `tables` — interprocedural must/not-may summaries from a prior pass.
 /// * `config` — controls which synthesis generators are enabled.
-/// * `precomputed` — invariants computed ahead of time by the driver's
-///   [`discover_loop_invariants`] pass; avoids redundant synthesis work.
+/// * `precomputed` — already-verified loop invariants produced by
+///   [`verify_precomputed`] (from the pre-pass) or by the observer synthesis in
+///   `driver.rs`.  Hints (`(CfgNodeId, Formula)` pairs) must be upgraded via
+///   [`verify_precomputed`] before being passed here.
 pub fn analyze_with_tables(
     cfg: &AbstractCfg,
     function: &str,
@@ -199,7 +216,7 @@ pub fn analyze_with_tables(
     oracle: &Oracle,
     tables: &SummaryTables,
     config: Option<&InvariantConfig>,
-    precomputed: Option<&[(CfgNodeId, Formula)]>,
+    precomputed: Option<&[VerifiedLoopInvariant]>,
     debug_names: &HashMap<String, String>,
 ) -> Result<AssertionResult, BackwardError> {
     if cfg.topological_order().is_some() {
@@ -216,47 +233,23 @@ pub fn analyze_with_tables(
 
     let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
 
-    // Compute assertion-specific backward states once; shared by exit-closure
-    // checking and synthesis so neither call repeats the backward pass.
-    let assertion_postconditions = compute_preliminary_backward_states(cfg, site, &excluded)?;
-
-    if let Some(precomputed) = precomputed {
-        if !precomputed.is_empty() {
-            // config=None signals the observer pattern: invariants skip exit closure and
-            // are verified by run_backward directly.  In the regular (config=Some) path,
-            // check exit closure first to see whether the precomputed invariant is strong
-            // enough to discharge this specific assertion.
-            let exit_closure_ok = config.is_none()
-                || precomputed_satisfy_exit_closure(
-                    cfg,
-                    &assertion_postconditions,
-                    precomputed,
-                    oracle,
-                )?;
-            if exit_closure_ok {
-                return run_backward(
-                    cfg,
-                    site,
-                    oracle,
-                    &excluded,
-                    precomputed,
-                    tables,
-                    debug_names,
-                );
-            }
-            // Exit closure failed: the precomputed invariant does not discharge this
-            // assertion.  Fall through to synthesis to find a stronger invariant.
-            // Using run_backward here with an invariant that failed exit closure is
-            // unsound — the backward state from the exit condition can collapse to
-            // False at the entry via loop-initialization substitution, giving a
-            // spurious Verified even when the assertion is violable.
-            log::debug!(
-                target: "loop_invariant",
-                "function {function}: precomputed invariant failed exit closure — falling through to synthesis"
+    // Pre-verified invariants: use directly, no exit closure re-check needed.
+    if let Some(invariants) = precomputed {
+        if !invariants.is_empty() {
+            return run_backward(
+                cfg,
+                site,
+                oracle,
+                &excluded,
+                invariants,
+                tables,
+                debug_names,
             );
         }
     }
 
+    // No precomputed invariants: synthesize with full exit closure.
+    let assertion_postconditions = compute_preliminary_backward_states(cfg, site, &excluded)?;
     let invariants = synthesize_loop_invariants(
         cfg,
         function,
@@ -279,6 +272,25 @@ pub fn analyze_with_tables(
     )
 }
 
+/// Upgrade InductiveHint invariants to [`VerifiedLoopInvariant`] for a specific assertion.
+///
+/// Runs the full three-part check (initiation, inductiveness, exit closure) on
+/// each hint against the given assertion site.  Returns `Ok(Some(verified))` if
+/// all pass, `Ok(None)` if any fail (caller should fall through to synthesis).
+///
+/// This is the only sound path from InductiveHints to invariants suitable for
+/// [`analyze_with_tables`].  Never pass raw hints directly to `run_backward`.
+pub fn verify_precomputed(
+    cfg: &AbstractCfg,
+    site: &AssertionSite,
+    hints: &[(CfgNodeId, Formula)],
+    oracle: &Oracle,
+) -> Result<Option<Vec<VerifiedLoopInvariant>>, BackwardError> {
+    let excluded = cfg.detect_back_edges().into_iter().collect::<BTreeSet<_>>();
+    let assertion_postconditions = compute_preliminary_backward_states(cfg, site, &excluded)?;
+    precomputed_satisfy_exit_closure(cfg, &assertion_postconditions, hints, oracle)
+}
+
 /// Core bidirectional analysis pass.
 ///
 /// Implements the combined may/must check:
@@ -296,7 +308,7 @@ fn run_backward(
     site: &AssertionSite,
     oracle: &Oracle,
     excluded_edges: &BTreeSet<crate::common::abstract_cfg::CfgEdgeId>,
-    loop_invariants: &[(CfgNodeId, Formula)],
+    loop_invariants: &[VerifiedLoopInvariant],
     tables: &SummaryTables,
     debug_names: &HashMap<String, String>,
 ) -> Result<AssertionResult, BackwardError> {
@@ -349,19 +361,20 @@ fn run_backward(
     })
 }
 
-/// Pre-pass that caches loop invariants before full per-assertion analysis.
+/// Pre-pass that discovers **InductiveHint** invariants before assertion analysis.
 ///
-/// Calls [`synthesize_loop_invariants`] with empty `assertion_postconditions`
-/// (scope = `True`), so exit closure is skipped — no assertion site is
-/// available yet.  The resulting invariants are cached in [`SummaryTables`]
-/// and reused across multiple assertion checks in the same function.
+/// Calls [`synthesize_loop_invariants`] with empty `assertion_postconditions`,
+/// so exit closure is not checked — no assertion site is available yet.
+/// Returns raw `(CfgNodeId, Formula)` pairs (InductiveHints), NOT
+/// [`VerifiedLoopInvariant`]s.
 ///
-/// Returns `None` if any loop cannot be handled (i.e. synthesis fails for it).
+/// Callers must upgrade hints to [`VerifiedLoopInvariant`] via
+/// [`verify_precomputed`] before passing them to [`analyze_with_tables`].  If
+/// exit closure fails for a given assertion site, synthesis is re-run
+/// automatically with the real postconditions.
 ///
-/// # Purpose
-///
-/// This is called once per function before all assertion checks (in `driver.rs`)
-/// to avoid repeatedly synthesising invariants for each assertion.
+/// Returns `None` if synthesis fails for any loop (the function may still be
+/// verifiable via per-site synthesis in [`analyze_with_tables`]).
 pub fn discover_loop_invariants(
     cfg: &AbstractCfg,
     function: &str,
@@ -369,20 +382,27 @@ pub fn discover_loop_invariants(
     config: Option<&InvariantConfig>,
     debug_names: &HashMap<String, String>,
 ) -> Option<Vec<(CfgNodeId, Formula)>> {
-    synthesize_loop_invariants(cfg, function, &BTreeMap::new(), oracle, config, debug_names).ok()
+    synthesize_loop_invariants(cfg, function, &BTreeMap::new(), oracle, config, debug_names)
+        .ok()
+        .map(|v| v.into_iter().map(|inv| inv.as_pair()).collect())
 }
 
 /// Invariant synthesis pipeline for a cyclic CFG.
 ///
 /// Accepts `assertion_postconditions` (WP of `NOT obligation` propagated
-/// backward with back edges blocked).  Pass `&BTreeMap::new()` from
-/// [`discover_loop_invariants`] (the pre-pass with no assertion site); pass
-/// the computed postconditions from [`analyze_with_tables`].
+/// backward with back edges blocked).
 ///
-/// For each detected loop (innermost-first) the function tries the enabled
-/// candidate strategies in order.  When `assertion_postconditions` is empty,
-/// exit closure is effectively skipped (no assertion site to check against),
-/// making this safe to call from the pre-pass.
+/// - When called with `&BTreeMap::new()` (from [`discover_loop_invariants`]):
+///   exit closure is skipped and the result is an **InductiveHint** — suitable
+///   for interprocedural summary caching but not for direct verdicts.
+///
+/// - When called with real postconditions (from [`analyze_with_tables`]):
+///   all three checks (initiation, inductiveness, exit closure) are required and
+///   the result is a **VerifiedLoopInvariant** — safe to pass to `run_backward`.
+///
+/// Tiers that explicitly use `&empty_pc` (Phase-B disjunctions in ACHAR tiers 3
+/// and 7) are disabled when `assertion_postconditions` is non-empty, preventing
+/// inductive-but-not-exit-closed candidates from slipping through.
 ///
 /// Returns [`Err(BackwardError::CyclicCfgUnsupported)`] if no invariant is
 /// found for any loop, or `Ok(vec![])` if the CFG has no loops.
@@ -393,11 +413,11 @@ fn synthesize_loop_invariants(
     oracle: &Oracle,
     config: Option<&InvariantConfig>,
     debug_names: &HashMap<String, String>,
-) -> Result<Vec<(CfgNodeId, Formula)>, BackwardError> {
+) -> Result<Vec<VerifiedLoopInvariant>, BackwardError> {
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
     let mode = config.map(|c| &c.mode).unwrap_or(&SynthesisMode::Default);
-    let mut accepted = Vec::<(CfgNodeId, Formula)>::new();
+    let mut accepted = Vec::<VerifiedLoopInvariant>::new();
 
     for (index, loop_info) in loops.into_iter().enumerate() {
         let loop_loc = crate::may_must_analysis::loops::fmt_loop_loc(&loop_info);
@@ -413,9 +433,14 @@ fn synthesize_loop_invariants(
         );
         let mut accepted_candidate = None;
 
-        // Entry-safety phase: `init_fact || safety` candidates.
+        // inner invariants as (header, formula) pairs, needed by check_loop_invariant_verbose
+        let inner: Vec<(CfgNodeId, Formula)> = accepted.iter().map(|v| v.as_pair()).collect();
+
+        // Entry-safety phase: `counter_init || safety` candidates.
         // Runs in Default mode (phase 1 of the default pipeline).
-        // Phase-B: exit closure skipped; run_backward discharges the obligation.
+        // Exit closure is required: run_backward is not a sound substitute because
+        // it blocks back edges and only injects invariants into reach at headers,
+        // so it cannot reason about state after one or more iterations.
         if accepted_candidate.is_none()
             && !assertion_postconditions.is_empty()
             && *mode == SynthesisMode::Default
@@ -426,7 +451,7 @@ fn synthesize_loop_invariants(
                 index + 1
             );
             let candidates =
-                entry_safety_candidates(&loop_info, cfg, assertion_postconditions, &accepted);
+                entry_safety_candidates(&loop_info, cfg, assertion_postconditions, &inner);
             log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {} entry-safety: {} candidates",
@@ -445,8 +470,8 @@ fn synthesize_loop_invariants(
                 cfg,
                 &candidates,
                 oracle,
-                &BTreeMap::new(),
-                &accepted,
+                assertion_postconditions,
+                &inner,
                 debug_names,
             );
         }
@@ -479,79 +504,41 @@ fn synthesize_loop_invariants(
                 accepted_candidate = first_accepted_candidate(
                     function,
                     index + 1,
-                    "observer (phase-A)",
+                    "observer",
                     &loop_info,
                     cfg,
                     &candidates,
                     oracle,
                     assertion_postconditions,
-                    &accepted,
+                    &inner,
                     debug_names,
                 );
-                if accepted_candidate.is_none() {
-                    log::debug!(
-                        target: "loop_invariant",
-                        "function {function} loop {} observer phase-A failed, trying phase-B",
-                        index + 1
-                    );
-                    accepted_candidate = first_accepted_candidate(
-                        function,
-                        index + 1,
-                        "observer (phase-B)",
-                        &loop_info,
-                        cfg,
-                        &candidates,
-                        oracle,
-                        &BTreeMap::new(),
-                        &accepted,
-                        debug_names,
-                    );
-                }
             }
         }
 
-        // ACHAR phase: grammar-guided enumeration over the loop vocabulary,
-        // including observer-style disjunction candidates.
+        // ACHAR phase: grammar-guided ICE CEGIS loop over the loop vocabulary.
         // Runs in Default (phase 2) and GrammarOnly modes.
         let run_achar = accepted_candidate.is_none()
             && matches!(mode, SynthesisMode::Default | SynthesisMode::GrammarOnly);
         if run_achar {
             log::debug!(
                 target: "loop_invariant",
-                "function {function} loop {}: trying achar generator",
+                "function {function} loop {}: trying achar cegis",
                 index + 1
             );
-            let candidates = achar::grammar_candidates(
+            let achar_timeout = config
+                .map(|c| c.achar_timeout)
+                .unwrap_or(std::time::Duration::from_secs(10));
+            accepted_candidate = achar::synthesize_with_cegis(
                 &loop_info,
                 cfg,
                 assertion_postconditions,
-                &accepted,
+                &inner,
                 oracle,
+                function,
+                index + 1,
+                achar_timeout,
             );
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} achar: {} candidates",
-                index + 1, candidates.len()
-            );
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} achar candidates: {}",
-                index + 1, format_candidates(&candidates, debug_names)
-            );
-            if !candidates.is_empty() {
-                accepted_candidate = first_accepted_candidate(
-                    function,
-                    index + 1,
-                    "achar",
-                    &loop_info,
-                    cfg,
-                    &candidates,
-                    oracle,
-                    assertion_postconditions,
-                    &accepted,
-                    debug_names,
-                );
-            }
         }
 
         if accepted_candidate.is_none() {
@@ -564,7 +551,7 @@ fn synthesize_loop_invariants(
         }
 
         let candidate = accepted_candidate.expect("checked above");
-        accepted.push((loop_info.header, candidate));
+        accepted.push(VerifiedLoopInvariant::new(loop_info.header, candidate));
     }
 
     Ok(accepted)
@@ -605,71 +592,82 @@ fn compute_preliminary_backward_states(
         .collect())
 }
 
-/// Check that every precomputed loop invariant satisfies exit closure for this assertion.
+/// Check that InductiveHint invariants satisfy exit closure for a specific assertion.
 ///
-/// `discover_loop_invariants` skips exit closure (it has no assertion site). Before
-/// reusing those invariants in [`run_backward`], we must verify that each invariant
-/// satisfies all three checks — initiation, inductiveness, and exit closure — for
-/// the specific assertion site being checked.
+/// Runs the full three-part check on each hint (initiation, inductiveness, exit
+/// closure) against the given `assertion_postconditions`.
 ///
-/// Exit closure is always checked for every loop that has a precomputed invariant.
-/// The earlier optimisation that skipped the check when the loop appeared not to
-/// write any variable mentioned in the obligation was removed because it produced
-/// false-Verified results: when the obligation is on a loaded scalar, its source
-/// region name does not appear in the obligation formula, so the syntactic check
-/// incorrectly declared the loop irrelevant (see `debug/array-2-false-safe.md`).
-///
-/// Returns `Ok(true)` if every invariant passes all three checks (including exit
-/// closure), `Ok(false)` if any fails. Callers should fall through to
-/// [`synthesize_loop_invariants`] when this returns `false`.
+/// Returns `Ok(Some(verified))` if **every loop** in the CFG has a matching hint
+/// and every hint passes all three checks.
+/// Returns `Ok(None)` if any loop has no matching hint OR if any hint fails a
+/// check — the caller should fall through to synthesis.
+/// A partial hint set (hints covering only some loops) always returns `Ok(None)`
+/// to prevent unsound use of a partial invariant set in `run_backward`.
 fn precomputed_satisfy_exit_closure(
     cfg: &AbstractCfg,
     assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    precomputed: &[(CfgNodeId, Formula)],
+    hints: &[(CfgNodeId, Formula)],
     oracle: &Oracle,
-) -> Result<bool, BackwardError> {
+) -> Result<Option<Vec<VerifiedLoopInvariant>>, BackwardError> {
     let mut loops = detect_loops(cfg);
     sort_innermost_first(&mut loops);
-    let mut accepted_inner: Vec<(CfgNodeId, Formula)> = Vec::new();
+    let mut accepted: Vec<VerifiedLoopInvariant> = Vec::new();
     for loop_info in &loops {
-        if let Some((_, invariant)) = precomputed.iter().find(|(h, _)| *h == loop_info.header) {
-            let result = check_loop_invariant_verbose(
-                loop_info,
-                cfg,
-                invariant,
-                oracle,
-                &assertion_postconditions,
-                &accepted_inner,
-            );
+        let Some((_, invariant)) = hints.iter().find(|(h, _)| *h == loop_info.header) else {
+            // No hint for this loop — partial hint sets are unsafe to use directly.
             log::debug!(
                 target: "loop_invariant",
-                "precomputed exit-closure check for invariant {} => {}",
-                pretty_formula(invariant),
-                match &result {
-                    InvariantCheckResult::Accepted => "accepted".to_string(),
-                    InvariantCheckResult::InitiationFailed => "rejected: initiation failed".to_string(),
-                    InvariantCheckResult::InductivenessFailed => "rejected: inductiveness failed".to_string(),
-                    InvariantCheckResult::ExitClosureFailed { exit_edge } => format!("rejected: exit closure failed at {:?}", exit_edge),
-                }
+                "no precomputed hint for loop at {:?} — falling through to synthesis",
+                loop_info.header,
             );
-            if result != InvariantCheckResult::Accepted {
-                return Ok(false);
+            return Ok(None);
+        };
+        let inner: Vec<(CfgNodeId, Formula)> = accepted.iter().map(|v| v.as_pair()).collect();
+        let result = check_loop_invariant_verbose(
+            loop_info,
+            cfg,
+            invariant,
+            oracle,
+            assertion_postconditions,
+            &inner,
+        );
+        log::debug!(
+            target: "loop_invariant",
+            "precomputed exit-closure check for invariant {} => {}",
+            pretty_formula(invariant),
+            match &result {
+                InvariantCheckResult::Accepted => "accepted".to_string(),
+                InvariantCheckResult::InitiationFailed { .. } => "rejected: initiation failed".to_string(),
+                InvariantCheckResult::InductivenessFailed { .. } => "rejected: inductiveness failed".to_string(),
+                InvariantCheckResult::ExitClosureFailed { exit_edge, .. } => {
+                    format!("rejected: exit closure failed at {:?}", exit_edge)
+                }
             }
-            accepted_inner.push((loop_info.header, invariant.clone()));
+        );
+        if !result.is_accepted() {
+            log::debug!(
+                target: "loop_invariant",
+                "precomputed invariant failed exit closure — will fall through to synthesis"
+            );
+            return Ok(None);
         }
+        accepted.push(VerifiedLoopInvariant::new(
+            loop_info.header,
+            invariant.clone(),
+        ));
     }
-    Ok(true)
+    Ok(Some(accepted))
 }
 
-fn conjunct_loop_invariants(invariants: &[(CfgNodeId, Formula)]) -> BTreeMap<CfgNodeId, Formula> {
+fn conjunct_loop_invariants(invariants: &[VerifiedLoopInvariant]) -> BTreeMap<CfgNodeId, Formula> {
     let mut combined = BTreeMap::new();
-    for (header, invariant) in invariants {
+    for inv in invariants {
         combined
-            .entry(*header)
+            .entry(inv.header)
             .and_modify(|current: &mut Formula| {
-                *current = Formula::and(current.clone(), invariant.clone());
+                *current = Formula::and(current.clone(), inv.formula.clone());
             })
-            .or_insert_with(|| invariant.clone());
+            .or_insert_with(|| inv.formula.clone());
     }
     combined
 }
@@ -710,7 +708,7 @@ fn first_accepted_candidate(
             pretty_formula_with_names(&normalized, debug_names),
             render_invariant_result(&result)
         );
-        if result == InvariantCheckResult::Accepted {
+        if result.is_accepted() {
             log::info!(
                 target: "loop_invariant",
                 "function {function} loop {}: {} accepted invariant: {}",
@@ -731,7 +729,7 @@ fn first_accepted_candidate(
 ///   integers, e.g. `(a <= b) || (b <= a)` (total order) or
 ///   `(a < b) || (a >= b)` (complement). These pass all invariant checks
 ///   trivially but encode no information about program state.
-fn is_tautology(formula: &Formula) -> bool {
+pub(crate) fn is_tautology(formula: &Formula) -> bool {
     match formula {
         Formula::Le(a, b) | Formula::Ge(a, b) | Formula::Eq(a, b) => {
             format!("{a:?}") == format!("{b:?}")
@@ -781,9 +779,11 @@ fn atoms_cover_all_integers(f1: &Formula, f2: &Formula) -> bool {
 fn render_invariant_result(result: &InvariantCheckResult) -> String {
     match result {
         InvariantCheckResult::Accepted => "accepted".to_string(),
-        InvariantCheckResult::InitiationFailed => "rejected: initiation failed".to_string(),
-        InvariantCheckResult::InductivenessFailed => "rejected: inductiveness failed".to_string(),
-        InvariantCheckResult::ExitClosureFailed { exit_edge } => {
+        InvariantCheckResult::InitiationFailed { .. } => "rejected: initiation failed".to_string(),
+        InvariantCheckResult::InductivenessFailed { .. } => {
+            "rejected: inductiveness failed".to_string()
+        }
+        InvariantCheckResult::ExitClosureFailed { exit_edge, .. } => {
             format!("rejected: exit closure failed at edge {:?}", exit_edge)
         }
     }

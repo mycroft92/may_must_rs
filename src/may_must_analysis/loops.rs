@@ -14,10 +14,52 @@
 //!    three-part soundness check for a candidate formula:
 //!    - **Initiation**: the invariant holds on entry to the loop.
 //!    - **Inductiveness**: the invariant is preserved by one loop iteration.
-//!    - **Exit closure** (optional): for each exit edge, the invariant implies
-//!      the assertion postcondition.  Pass `&BTreeMap::new()` to skip (Phase-B
-//!      pattern) when the caller relies on `run_backward` to discharge the
-//!      obligation instead.
+//!    - **Exit closure**: for each exit edge, `invariant ∧ exit_violation` is
+//!      infeasible — the invariant cannot co-exist with a violation at any exit.
+//!      Passing `&BTreeMap::new()` skips this check; callers must **only** do
+//!      this in the pre-pass (no assertion site) or for interprocedural summaries
+//!      where a subsequent `analyze_with_tables` performs the authoritative check.
+//!      **Never** skip exit closure and rely on `run_backward` to substitute for
+//!      it: `run_backward` blocks back edges and cannot reason about loop-carried
+//!      state, so an inductive-but-not-exit-closed invariant can produce a false
+//!      `Verified` on an unsafe program (the array-2 soundness bug, fixed v0.11.0).
+//!
+//! # Invariant strength: VerifiedLoopInvariant vs InductiveHint
+//!
+//! Two distinct concepts are enforced at the type level:
+//!
+//! - **[`VerifiedLoopInvariant`]** — all three checks passed: initiation,
+//!   inductiveness, AND exit closure.  The invariant is sufficient to discharge
+//!   the specific assertion at the loop exits.  This is the only kind that may
+//!   be passed to `run_backward` as a verdict-bearing invariant.
+//!
+//! - **InductiveHint** (`(CfgNodeId, Formula)` pair) — only initiation and
+//!   inductiveness passed; exit closure was not checked.  Produced by the
+//!   pre-pass ([`discover_loop_invariants`] with `&BTreeMap::new()`).  May be
+//!   cached in `SummaryTables` and upgraded to [`VerifiedLoopInvariant`] via
+//!   [`verify_precomputed`] before being used to produce a `Verified` verdict.
+//!
+//! The soundness-critical rule: **hints must never reach `run_backward` directly**.
+//! Upgrade via [`verify_precomputed`] first, or let synthesis return
+//! [`VerifiedLoopInvariant`] directly.
+//!
+//! [`discover_loop_invariants`]: crate::may_must_analysis::backward::discover_loop_invariants
+//! [`verify_precomputed`]: crate::may_must_analysis::backward::verify_precomputed
+//!
+//! # Exit closure: current implementation and future direction
+//!
+//! The current exit closure check in [`check_loop_invariant_verbose`] is a
+//! **one-step** backward analysis: it propagates the bad condition backward
+//! from the exit edge through the loop body (back edge excluded) and checks
+//! `I_h ∧ exit_header` infeasible.  Combined with inductiveness, this is sound:
+//! any state satisfying I_h at the header passes through the loop body unchanged
+//! (by inductiveness), so one-step closure implies multi-step closure.
+//!
+//! A stronger alternative (planned, see `TODO.md`) is a **backward fixpoint**
+//! inside the loop body with the back edge included, seeded with the bad
+//! condition and intersected with I_h at each iteration until convergence.
+//! This would compute `B_{h,e} = I_h ∧ PreBad_{L,e}` directly and discharge
+//! with `UNSAT(I_h ∧ B_{h,e})`, which is more general but also more expensive.
 //!
 //! # Entry-safety candidate soundness constraints
 //!
@@ -50,7 +92,7 @@ use crate::common::abstract_cfg::{
     AbstractCfg, AssignValue, CallMemoryEffect, CfgEdgeId, CfgNodeId, SourceLocation,
     TransferEffect,
 };
-use crate::common::formula::{Formula, Memory, Sort, Term, Var};
+use crate::common::formula::{Formula, Memory, SmtModel, Sort, Term, Var};
 use crate::common::oracle::{Oracle, Validity};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -97,27 +139,95 @@ pub struct LoopInfo {
 
 pub type InnerInvariants<'a> = &'a [(CfgNodeId, Formula)];
 
+/// A loop invariant that has passed all three soundness checks: initiation,
+/// inductiveness, and exit closure.
+///
+/// This is the only invariant type that may be passed to `run_backward` as a
+/// verdict-bearing invariant.  Callers obtain it from
+/// [`synthesize_loop_invariants`] or [`verify_precomputed`] — never construct
+/// directly outside the analysis pipeline.
+///
+/// [`synthesize_loop_invariants`]: crate::may_must_analysis::backward::synthesize_loop_invariants
+/// [`verify_precomputed`]: crate::may_must_analysis::backward::verify_precomputed
+#[derive(Clone, Debug)]
+pub struct VerifiedLoopInvariant {
+    pub header: CfgNodeId,
+    pub formula: Formula,
+}
+
+impl VerifiedLoopInvariant {
+    pub fn new(header: CfgNodeId, formula: Formula) -> Self {
+        Self { header, formula }
+    }
+
+    /// Convert to the `(header, formula)` pair format used by `InnerInvariants`.
+    pub fn as_pair(&self) -> (CfgNodeId, Formula) {
+        (self.header, self.formula.clone())
+    }
+}
+
 /// Detailed outcome of [`check_loop_invariant_verbose`].
 ///
-/// Only `Accepted` means all three soundness conditions passed.  The failure
-/// variants identify *which* condition was the first to fail, enabling
-/// targeted logging and CEGIS feedback.
+/// `Accepted` means all checks *that were requested* passed.  Whether that is
+/// a full **VerifiedLoopInvariant** (all three checks, suitable for verdict use)
+/// or an **InductiveHint** (initiation + inductiveness only, pre-pass context)
+/// depends on whether `assertion_postconditions` was non-empty.  See the module
+/// documentation for when each kind is safe to use with `run_backward`.
 ///
-/// # Soundness checks
+/// The failure variants identify *which* condition was the first to fail,
+/// enabling targeted logging and CEGIS feedback.
 ///
-/// - **Initiation**: the candidate holds on entry (reach at header is empty).
-/// - **Inductiveness**: the candidate is preserved by one iteration (holds after).
-/// - **Exit closure**: the candidate implies the assertion postcondition at exits.
+/// Each failure variant carries an optional `witness` model — a concrete program
+/// state that demonstrates *why* the check failed.  The ACHAR CEGIS loop uses
+/// these witnesses to prune remaining candidates cheaply without further SMT calls.
+///
+/// - **InitiationFailed witness**: a reachable initial state where the candidate is false.
+///   Use as a new positive ICE example (states where the invariant *must* hold).
+/// - **InductivenessFailed witness**: a pre-state where the candidate holds but the
+///   loop body takes execution outside it.  Use as an ICE implication example.
+/// - **ExitClosureFailed witness**: a state where the candidate holds but a violation
+///   is still reachable through the exit.  Use as a new negative ICE example.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvariantCheckResult {
-    /// Initiation, inductiveness, and exit closure all passed.
+    /// All requested soundness checks passed.
+    ///
+    /// Callers interpret this as either:
+    /// - **VerifiedLoopInvariant** when `assertion_postconditions` was non-empty
+    ///   (all three checks: initiation + inductiveness + exit closure), or
+    /// - **InductiveHint** when `assertion_postconditions` was empty
+    ///   (only initiation + inductiveness).
+    ///
+    /// The type system enforces this distinction at the call site: synthesis
+    /// wraps `Accepted` into a [`VerifiedLoopInvariant`]; the pre-pass leaves
+    /// hints as raw `(CfgNodeId, Formula)` pairs until [`verify_precomputed`]
+    /// upgrades them.
+    ///
+    /// [`verify_precomputed`]: crate::may_must_analysis::backward::verify_precomputed
     Accepted,
     /// The candidate does not hold on entry to the loop.
-    InitiationFailed,
+    InitiationFailed { witness: Option<SmtModel> },
     /// The candidate is not preserved by one iteration of the loop body.
-    InductivenessFailed,
+    InductivenessFailed { witness: Option<SmtModel> },
     /// The candidate does not imply the required postcondition at this exit.
-    ExitClosureFailed { exit_edge: CfgEdgeId },
+    ExitClosureFailed {
+        exit_edge: CfgEdgeId,
+        witness: Option<SmtModel>,
+    },
+}
+
+impl InvariantCheckResult {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+
+    pub fn witness(&self) -> Option<&SmtModel> {
+        match self {
+            Self::Accepted => None,
+            Self::InitiationFailed { witness }
+            | Self::InductivenessFailed { witness }
+            | Self::ExitClosureFailed { witness, .. } => witness.as_ref(),
+        }
+    }
 }
 
 pub fn normalize_candidate(cfg: &AbstractCfg, header: CfgNodeId, candidate: &Formula) -> Formula {
@@ -226,10 +336,22 @@ pub fn sort_innermost_first(loops: &mut [LoopInfo]) {
 /// ## 3. Exit closure
 ///
 /// For each loop exit edge whose successor has a non-trivial entry in
-/// `assertion_postconditions`, checks that `candidate` implies the
-/// postcondition at the exit.  Pass `&BTreeMap::new()` to skip this check
-/// (e.g., when generating invariants for interprocedural summaries where the
-/// authoritative check is done by a subsequent `analyze_with_tables` call).
+/// `assertion_postconditions`, checks that `candidate AND exit_header` is
+/// infeasible — the invariant cannot simultaneously hold and allow a violation
+/// to reach the assertion through the exit.
+///
+/// Pass `&BTreeMap::new()` to skip this check.  **Callers must only do this
+/// when no assertion site is active** (pre-pass `discover_loop_invariants` or
+/// interprocedural summary inference) and the caller guarantees a subsequent
+/// `analyze_with_tables` will perform the authoritative discharge.  Skipping
+/// exit closure in assertion-verification context is unsound.
+///
+/// The result when `assertion_postconditions` is empty:
+/// - `Accepted` means only initiation + inductiveness → **InductiveHint**.
+///
+/// The result when `assertion_postconditions` is non-empty:
+/// - `Accepted` means all three checks → **VerifiedLoopInvariant**, sufficient
+///   to pass to `run_backward` as a verdict-bearing invariant.
 ///
 /// Inner loop invariants (`inner`) are injected at their respective headers
 /// during the backward-state propagations so that nested loop bodies are
@@ -253,14 +375,19 @@ pub fn check_loop_invariant_verbose(
     // functional memory expressions across the SMT boundary.
     let reach_h = forward_reach_at_header(cfg, info.header, inner);
     let initiation_violation = Formula::and(reach_h, Formula::not(candidate.clone()));
-    match oracle.feasibility(&initiation_violation) {
-        Ok(crate::common::oracle::Feasibility::Feasible) => {
-            return InvariantCheckResult::InitiationFailed;
-        }
-        Ok(crate::common::oracle::Feasibility::Unknown) | Err(_) => {
-            return InvariantCheckResult::InitiationFailed;
-        }
-        Ok(crate::common::oracle::Feasibility::Infeasible) => {}
+    match oracle.feasibility_with_model(&initiation_violation) {
+        Ok(report) => match report.feasibility {
+            crate::common::oracle::Feasibility::Feasible => {
+                return InvariantCheckResult::InitiationFailed {
+                    witness: report.model,
+                };
+            }
+            crate::common::oracle::Feasibility::Unknown => {
+                return InvariantCheckResult::InitiationFailed { witness: None };
+            }
+            crate::common::oracle::Feasibility::Infeasible => {}
+        },
+        Err(_) => return InvariantCheckResult::InitiationFailed { witness: None },
     }
 
     // Inductiveness and exit-closure checks restrict propagation to the loop
@@ -269,7 +396,7 @@ pub fn check_loop_invariant_verbose(
 
     let Some(back_edge_requirement) = edge_source_requirement(cfg, info.back_edge, &candidate)
     else {
-        return InvariantCheckResult::InductivenessFailed;
+        return InvariantCheckResult::InductivenessFailed { witness: None };
     };
     let Some(inductive_states) = backward_states(
         cfg,
@@ -280,16 +407,20 @@ pub fn check_loop_invariant_verbose(
         inner,
         true,
     ) else {
-        return InvariantCheckResult::InductivenessFailed;
+        return InvariantCheckResult::InductivenessFailed { witness: None };
     };
     let inductive_header = inductive_states
         .get(&info.header)
         .cloned()
         .unwrap_or(Formula::False);
-    match oracle.implies(&candidate, &inductive_header) {
-        Ok(Validity::Valid) => {}
-        Ok(Validity::Invalid) => return InvariantCheckResult::InductivenessFailed,
-        Ok(Validity::Unknown) | Err(_) => return InvariantCheckResult::InductivenessFailed,
+    match oracle.implies_with_model(&candidate, &inductive_header) {
+        Ok((Validity::Valid, _)) => {}
+        Ok((Validity::Invalid, model)) => {
+            return InvariantCheckResult::InductivenessFailed { witness: model }
+        }
+        Ok((Validity::Unknown, _)) | Err(_) => {
+            return InvariantCheckResult::InductivenessFailed { witness: None }
+        }
     }
 
     for exit_edge in &info.exit_edges {
@@ -305,6 +436,7 @@ pub fn check_loop_invariant_verbose(
         let Some(exit_requirement) = edge_source_requirement(cfg, *exit_edge, postcondition) else {
             return InvariantCheckResult::ExitClosureFailed {
                 exit_edge: *exit_edge,
+                witness: None,
             };
         };
         let Some(exit_states) = backward_states(
@@ -318,6 +450,7 @@ pub fn check_loop_invariant_verbose(
         ) else {
             return InvariantCheckResult::ExitClosureFailed {
                 exit_edge: *exit_edge,
+                witness: None,
             };
         };
         let exit_header = exit_states
@@ -335,13 +468,21 @@ pub fn check_loop_invariant_verbose(
         // at the exit. "I AND exit_header infeasible" means "if I holds, no violation
         // can reach the assertion through this exit" — the correct safety criterion.
         let combined = Formula::and(candidate.clone(), exit_header.clone());
-        match oracle.feasibility(&combined) {
-            Ok(crate::common::oracle::Feasibility::Infeasible) => {}
-            Ok(crate::common::oracle::Feasibility::Feasible)
-            | Ok(crate::common::oracle::Feasibility::Unknown)
-            | Err(_) => {
+        match oracle.feasibility_with_model(&combined) {
+            Ok(report) => match report.feasibility {
+                crate::common::oracle::Feasibility::Infeasible => {}
+                crate::common::oracle::Feasibility::Feasible
+                | crate::common::oracle::Feasibility::Unknown => {
+                    return InvariantCheckResult::ExitClosureFailed {
+                        exit_edge: *exit_edge,
+                        witness: report.model,
+                    };
+                }
+            },
+            Err(_) => {
                 return InvariantCheckResult::ExitClosureFailed {
                     exit_edge: *exit_edge,
+                    witness: None,
                 };
             }
         }
@@ -370,7 +511,7 @@ fn push_nontrivial(candidates: &mut Vec<Formula>, formula: Formula) {
 
 /// Concrete store facts accumulated during the forward SP pass.
 /// Maps `(region_name, constant_offset)` to the value last stored there.
-type StoreFacts = BTreeMap<(String, i64), Term>;
+pub(crate) type StoreFacts = BTreeMap<(String, i64), Term>;
 
 /// Intersect two `StoreFacts` maps, keeping only entries that agree on value.
 fn intersect_store_facts(a: StoreFacts, b: StoreFacts) -> StoreFacts {
@@ -862,8 +1003,8 @@ pub(crate) fn negate_comparison(formula: &Formula) -> Option<Formula> {
 /// conjuncts.  Per-conjunct negation extracts type-bound assumptions (e.g. `j >= 0`
 /// from unsigned comparisons) and negates them to spurious atoms like `j < 0`.
 ///
-/// These candidates are always checked with the Phase-B pattern (exit closure skipped);
-/// `run_backward` performs the authoritative obligation discharge.
+/// These candidates are checked via the full three-part check including exit closure.
+/// Only candidates that pass exit closure become [`VerifiedLoopInvariant`] values.
 pub fn entry_safety_candidates(
     info: &LoopInfo,
     cfg: &AbstractCfg,
@@ -979,7 +1120,7 @@ fn exit_violation_at_header(
 /// Runs the same forward SP pass as [`forward_reach_at_header`] but returns
 /// the accumulated concrete store facts at the header rather than the formula.
 /// Used by [`entry_safety_candidates`] to construct `counter == init` guards.
-fn preheader_store_facts_at_header(
+pub(crate) fn preheader_store_facts_at_header(
     cfg: &AbstractCfg,
     header: CfgNodeId,
     inner: InnerInvariants<'_>,
