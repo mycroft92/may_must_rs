@@ -60,8 +60,8 @@ modules. Instead:
 `rules.rs`
 
 - propagation rules used by the current checker
-- forward reach propagation (`must_post`)
-- backward state propagation (`notmay_pre`)
+- forward reach propagation (`forward_may_post`; SP over-approximation, MAY family)
+- backward state propagation (`notmay_pre`; WP over-approximation, NOT-MAY family)
 - final verified / bug-found queries
 
 `backward.rs`

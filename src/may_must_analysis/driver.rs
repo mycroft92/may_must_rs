@@ -47,14 +47,14 @@ use crate::may_must_analysis::backward::{
     analyze_with_tables, discover_loop_invariants, render_result, verify_precomputed,
     AssertionResult, BackwardError, InvariantConfig,
 };
-use crate::may_must_analysis::smash;
 use crate::may_must_analysis::loops::{
     check_loop_invariant_verbose, detect_loops, normalize_candidate, sort_innermost_first,
     InvariantCheckResult, LoopInfo, VerifiedLoopInvariant,
 };
 use crate::may_must_analysis::providers::{CandidateProvider, NoProvider};
 use crate::may_must_analysis::rules::{Judgement, RuleEngine};
-use crate::may_must_analysis::summaries::{MustSummary, NotMaySummary, SummaryTables};
+use crate::may_must_analysis::smash;
+use crate::may_must_analysis::summaries::{MaySummary, NotMaySummary, SummaryTables};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -244,9 +244,9 @@ pub fn analyze_module_with_llm(
     let recursive = recursive_functions(graphs);
     let mut summary_tables = SummaryTables::new();
     for summary in summaries.summaries().values() {
-        summary_tables.add_must(
+        summary_tables.add_forward_may(
             summary.function.clone(),
-            MustSummary {
+            MaySummary {
                 precondition: crate::common::formula::Formula::True,
                 postcondition: summary.relation.clone(),
             },

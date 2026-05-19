@@ -169,11 +169,16 @@ impl<'a> RuleEngine<'a> {
         Ok(())
     }
 
-    /// **Forward rule** — propagates `reach` across `edge`.
+    /// **Forward MAY rule** — propagates `reach` across `edge` via SP.
     ///
     /// Computes `source.reach ∧ edge.guard` and joins the result into
-    /// `target.reach`.  Skips blocked edges silently.
-    pub fn must_post(&mut self, edge_id: CfgEdgeId) -> Result<(), RuleError> {
+    /// `target.reach`.  The join is a disjunction, so this is an
+    /// over-approximation (SMASH-paper "MAY" semantics), not an
+    /// under-approximation.
+    ///
+    /// Renamed from `must_post` in v0.15.0 to reflect honest semantics.  Skips
+    /// blocked edges silently.
+    pub fn forward_may_post(&mut self, edge_id: CfgEdgeId) -> Result<(), RuleError> {
         if self.is_blocked(edge_id) {
             return Ok(());
         }
@@ -186,7 +191,7 @@ impl<'a> RuleEngine<'a> {
         let propagated = Formula::and(source_reach, edge.guard);
         log::debug!(
             target: "rules",
-            "[must_post] {:?}→{:?}: reach += {}",
+            "[forward_may_post] {:?}→{:?}: reach += {}",
             edge.source,
             edge.target,
             fmt_formula(&propagated),
@@ -312,13 +317,15 @@ impl<'a> RuleEngine<'a> {
         Ok(())
     }
 
-    /// **Forward rule with callee summaries** — applies must summaries from
-    /// `tables` at a call edge.
+    /// **Forward MAY rule with callee summaries** — applies forward-may
+    /// summaries from `tables` at a call edge.
     ///
-    /// If the source node is a call site, joins each matching must-summary
-    /// postcondition into `target.reach`, propagating reachability information
-    /// derived from the callee's proven postconditions.
-    pub fn must_post_usesummary(
+    /// If the source node is a call site, joins each matching may-summary
+    /// postcondition into `target.reach`, propagating reach information
+    /// derived from the callee's MAY-side summaries (over-approximate).
+    ///
+    /// Renamed from `must_post_usesummary` in v0.15.0.
+    pub fn forward_may_usesummary(
         &mut self,
         edge_id: CfgEdgeId,
         tables: &SummaryTables,
@@ -338,10 +345,10 @@ impl<'a> RuleEngine<'a> {
         ) else {
             return Ok(());
         };
-        for summary in tables.must(&callee) {
+        for summary in tables.forward_may(&callee) {
             log::debug!(
                 target: "rules",
-                "[must_post_usesummary] {:?}→{:?}: callee '{}' must-summary: reach += {}",
+                "[forward_may_usesummary] {:?}→{:?}: callee '{}' may-summary: reach += {}",
                 edge.source,
                 edge.target,
                 callee,
@@ -356,19 +363,23 @@ impl<'a> RuleEngine<'a> {
     /// Runs interleaved forward and backward passes to a fixpoint.
     ///
     /// Each iteration:
-    /// 1. Forward pass over `order` — applies [`must_post`] and
-    ///    [`must_post_usesummary`] on outgoing edges.
-    /// 2. Backward pass over `order` in reverse — applies [`notmay_pre`],
-    ///    [`notmay_pre_usesummary`], and [`notmay_pre_pruned`] on incoming
-    ///    edges.
+    /// 1. Forward MAY pass over `order` — applies [`forward_may_post`] and
+    ///    [`forward_may_usesummary`] on outgoing edges (SP, over-approximate).
+    /// 2. Backward NOT-MAY pass over `order` in reverse — applies
+    ///    [`notmay_pre`], [`notmay_pre_usesummary`], and [`notmay_pre_pruned`]
+    ///    on incoming edges (WP, over-approximate).
+    ///
+    /// Both passes are MAY-family (over-approximations) in SMASH-paper terms.
+    /// The under-approximate MUST direction (concrete bug paths) is handled by
+    /// [`crate::may_must_analysis::bmc::bmc_check`] outside this fixpoint loop.
     ///
     /// Terminates when no new edges are blocked between two consecutive
     /// iterations, or after `|edges| + 1` iterations as a safety bound.
     /// `tables` provides interprocedural summaries; `oracle` is used for
     /// feasibility queries during pruning.
     ///
-    /// [`must_post`]: RuleEngine::must_post
-    /// [`must_post_usesummary`]: RuleEngine::must_post_usesummary
+    /// [`forward_may_post`]: RuleEngine::forward_may_post
+    /// [`forward_may_usesummary`]: RuleEngine::forward_may_usesummary
     /// [`notmay_pre`]: RuleEngine::notmay_pre
     /// [`notmay_pre_usesummary`]: RuleEngine::notmay_pre_usesummary
     /// [`notmay_pre_pruned`]: RuleEngine::notmay_pre_pruned
@@ -383,8 +394,8 @@ impl<'a> RuleEngine<'a> {
             let blocked_before = self.blocked_count();
             for node in order {
                 for edge in self.cfg.outgoing_edges(*node) {
-                    self.must_post(edge)?;
-                    self.must_post_usesummary(edge, tables)?;
+                    self.forward_may_post(edge)?;
+                    self.forward_may_usesummary(edge, tables)?;
                 }
             }
             for node in order.iter().rev() {
@@ -496,11 +507,11 @@ mod tests {
     }
 
     #[test]
-    fn must_post_propagates_guarded_reachability() {
+    fn forward_may_post_propagates_guarded_reachability() {
         let (cfg, _, n1, edge) = tiny_cfg();
         let mut engine = RuleEngine::new(&cfg);
         engine.init();
-        engine.must_post(edge).unwrap();
+        engine.forward_may_post(edge).unwrap();
         assert_eq!(
             engine.summary(n1).unwrap().reach,
             Formula::or(

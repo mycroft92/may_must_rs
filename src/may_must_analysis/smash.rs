@@ -199,7 +199,10 @@ pub fn run_smash(
         Ok(result) => {
             // Verified or BugFound from may → decisive, return.  Unknown
             // from may → fall through to must.
-            if matches!(result.judgement, Judgement::Verified | Judgement::BugFound { .. }) {
+            if matches!(
+                result.judgement,
+                Judgement::Verified | Judgement::BugFound { .. }
+            ) {
                 log::info!(
                     target: "engine_verdict",
                     "function {procedure_name} assertion #{} ({}): {:?} [engine=may/invariant-analysis]",

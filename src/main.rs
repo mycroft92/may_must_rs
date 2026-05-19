@@ -217,9 +217,9 @@ fn print_module_report(report: &ModuleReport, graphs: &[FunctionGraph], show_sum
         for summary in &report.computed_summaries {
             print_summary(summary);
         }
-        println!("[must summaries]");
+        println!("[forward-may summaries]");
         for name in report.summaries.all_procedure_names() {
-            for summary in report.summaries.must(&name) {
+            for summary in report.summaries.forward_may(&name) {
                 println!(
                     "  {name}: {} => {}",
                     summary.precondition, summary.postcondition

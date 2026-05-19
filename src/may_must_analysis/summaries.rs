@@ -1,14 +1,23 @@
-//! Interprocedural summary tables for the bidirectional may/must analysis.
+//! Interprocedural summary tables for the bidirectional may / not-may analysis.
 //!
-//! After analysing a callee, its results are distilled into two kinds of
-//! summary that can be reused when analysing callers:
+//! # Naming and SMASH paper alignment (v0.15.0+)
 //!
-//! - [`NotMaySummary`] — captures a proven *safety* result: given that the
-//!   callee's precondition holds, the violation postcondition also holds (i.e.
-//!   the assertion cannot be violated through this call under those conditions).
-//! - [`MustSummary`] — captures a *reachability* result: given that the
-//!   callee's precondition holds, the postcondition is guaranteed to hold at
-//!   the return site, allowing the forward reach component to grow.
+//! Both summary kinds in this module are **over-approximations**.  Per the
+//! *Compositional May-Must Program Analysis* paper, over-approximations are
+//! the **MAY family**:
+//!
+//! - [`NotMaySummary`] — captures a proven *safety* result over an
+//!   over-approximate violation precondition.  Used to discharge backward
+//!   not-may propagation at a callee call site.
+//! - [`MaySummary`] (formerly `MustSummary`) — captures a *forward reach*
+//!   result derived from SP propagation.  The callee, starting with caller
+//!   states satisfying `precondition`, *may* leave the caller's `reach`
+//!   component containing the cells described by `postcondition`.
+//!
+//! The historical name `MustSummary` was misleading — the post-state widening
+//! it performs (`join_reach`, a disjunction) is over-approximate, not
+//! under-approximate.  A true MUST summary (concrete bug witness) lives in
+//! [`crate::may_must_analysis::smash::MustPathSummary`].
 //!
 //! [`SummaryTables`] is the central store that maps procedure names to their
 //! accumulated summaries.  It is populated incrementally by the driver and
@@ -45,20 +54,38 @@ pub struct NotMaySummary {
     pub postcondition: Formula,
 }
 
-/// A reachability summary derived from the forward (must) analysis of a callee.
+/// A *forward MAY* summary — an over-approximation of the callee's forward
+/// reach contribution at the return site.
 ///
-/// Semantics: if `precondition` holds at the call site, then `postcondition`
-/// is guaranteed to hold at the return site.  This widens the caller's
-/// `reach` component across the call boundary.
+/// Despite its historical name (`MustSummary`), the consumer
+/// ([`crate::may_must_analysis::rules::RuleEngine::forward_may_usesummary`])
+/// performs a `join_reach` (a disjunction), which widens the caller's
+/// `reach` — over-approximation, not under-approximation.  In SMASH-paper
+/// terminology this is a **MAY** summary, not a MUST summary.
+///
+/// Semantics: if `precondition` holds at the call site, then it is *possible*
+/// for `postcondition` to hold at the return site — i.e. `postcondition` is a
+/// constraint we may safely add to the caller's `reach` after the call.
 ///
 /// Both fields are formulas over the symbolic call-site / return-site state.
+///
+/// True under-approximate MUST summaries (concrete bug witnesses) are
+/// represented separately by [`crate::may_must_analysis::smash::MustPathSummary`].
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct MustSummary {
-    /// The call-site condition under which this reachability result holds.
+pub struct MaySummary {
+    /// The call-site condition under which this reach contribution is added.
     pub precondition: Formula,
-    /// The state that is guaranteed to hold at the return site.
+    /// The reach-side constraint that may be conjoined into the caller's
+    /// `reach` at the return site.
     pub postcondition: Formula,
 }
+
+/// Deprecated alias retained so external callers do not break during the
+/// rename.  Prefer [`MaySummary`].
+#[deprecated(
+    note = "use MaySummary; this name was misleading (it's over-approximate, hence MAY in the SMASH paper sense, not MUST)"
+)]
+pub type MustSummary = MaySummary;
 
 /// Global summary store shared across all procedures in a module.
 ///
@@ -69,10 +96,14 @@ pub struct MustSummary {
 /// [`driver.rs`]: crate::may_must_analysis::driver
 #[derive(Clone, Debug, Default)]
 pub struct SummaryTables {
-    /// Not-may (safety) summaries, keyed by procedure name.
+    /// Not-may (safety) summaries, keyed by procedure name.  Used to discharge
+    /// backward not-may propagation at callee call sites.
     pub notmay: BTreeMap<ProcedureName, Vec<NotMaySummary>>,
-    /// Must (reachability) summaries, keyed by procedure name.
-    pub must: BTreeMap<ProcedureName, Vec<MustSummary>>,
+    /// Forward-may (reach) summaries, keyed by procedure name.  Used to widen
+    /// the caller's `reach` over-approximation at the return site of a call.
+    /// Renamed from `must` in v0.15.0 to align with SMASH-paper semantics —
+    /// these are over-approximations, hence MAY, not MUST.
+    pub forward_may: BTreeMap<ProcedureName, Vec<MaySummary>>,
     /// Loop invariants, keyed by procedure name.  Each entry is a list of
     /// `(header_node, invariant_formula)` pairs.
     pub loop_invariants: BTreeMap<ProcedureName, Vec<(CfgNodeId, Formula)>>,
@@ -91,10 +122,10 @@ impl SummaryTables {
         self.notmay.entry(name.into()).or_default();
     }
 
-    /// Ensures a must entry exists for `name`, initialising it to an empty
-    /// list if absent.
-    pub fn init_must(&mut self, name: impl Into<String>) {
-        self.must.entry(name.into()).or_default();
+    /// Ensures a forward-may entry exists for `name`, initialising it to an
+    /// empty list if absent.
+    pub fn init_forward_may(&mut self, name: impl Into<String>) {
+        self.forward_may.entry(name.into()).or_default();
     }
 
     /// Returns all not-may summaries for `name`, or an empty slice if none
@@ -103,9 +134,13 @@ impl SummaryTables {
         self.notmay.get(name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// Returns all must summaries for `name`, or an empty slice if none exist.
-    pub fn must(&self, name: &str) -> &[MustSummary] {
-        self.must.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+    /// Returns all forward-may summaries for `name`, or an empty slice if none
+    /// exist.
+    pub fn forward_may(&self, name: &str) -> &[MaySummary] {
+        self.forward_may
+            .get(name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Inserts a not-may summary for `name`.
@@ -122,12 +157,12 @@ impl SummaryTables {
         }
     }
 
-    /// Inserts a must summary for `name`.
+    /// Inserts a forward-may summary for `name`.
     ///
     /// Returns `true` if the summary was new, `false` if an identical summary
     /// was already present (deduplication by structural equality).
-    pub fn add_must(&mut self, name: impl Into<String>, summary: MustSummary) -> bool {
-        let entries = self.must.entry(name.into()).or_default();
+    pub fn add_forward_may(&mut self, name: impl Into<String>, summary: MaySummary) -> bool {
+        let entries = self.forward_may.entry(name.into()).or_default();
         if entries.contains(&summary) {
             false
         } else {
@@ -163,7 +198,7 @@ impl SummaryTables {
         let mut names = self
             .notmay
             .keys()
-            .chain(self.must.keys())
+            .chain(self.forward_may.keys())
             .chain(self.loop_invariants.keys())
             .cloned()
             .collect::<Vec<_>>();
@@ -190,21 +225,21 @@ mod tests {
     }
 
     #[test]
-    fn must_deduplicates() {
+    fn forward_may_deduplicates() {
         let mut tables = SummaryTables::new();
-        let summary = MustSummary {
+        let summary = MaySummary {
             precondition: Formula::True,
             postcondition: Formula::False,
         };
-        assert!(tables.add_must("f", summary.clone()));
-        assert!(!tables.add_must("f", summary));
+        assert!(tables.add_forward_may("f", summary.clone()));
+        assert!(!tables.add_forward_may("f", summary));
     }
 
     #[test]
     fn missing_tables_return_empty_slices() {
         let tables = SummaryTables::new();
         assert!(tables.notmay("missing").is_empty());
-        assert!(tables.must("missing").is_empty());
+        assert!(tables.forward_may("missing").is_empty());
     }
 
     #[test]
