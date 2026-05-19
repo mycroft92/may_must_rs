@@ -405,6 +405,13 @@ pub fn analyze_with_summaries(
         };
         sched.enqueue(query, Some(provenance));
     }
+    // Build the procedure interface so the scheduler can run
+    // CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY after each query completes
+    // and populate `sched.table` (ContextualSummaryTable).
+    let interface = crate::may_must_analysis::query::ProcedureInterface::new(
+        adapted.name.clone(),
+        adapted.formal_parameters.iter().cloned(),
+    );
     let outcomes = sched.drain(
         &adapted.cfg,
         &adapted.name,
@@ -412,6 +419,7 @@ pub fn analyze_with_summaries(
         &legacy_tables_for_scheduler,
         config,
         &adapted.debug_names,
+        Some(&interface),
     );
     let site_results: Vec<smash::SmashRunResult> = outcomes
         .into_iter()

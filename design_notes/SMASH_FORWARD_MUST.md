@@ -135,17 +135,42 @@ So implementing forward MUST as `backward-on-acyclic-CFG` is not a
 shortcut — it is the **only memory-aware sound BugFound path** available
 without rewriting the SP transformer.
 
+## How DART relates (the paper's forward MUST realisation)
+
+The SMASH paper drives its forward MUST direction via **DART**
+(Godefroid, Klarlund, Sen, PLDI 2005) — *concolic* execution, not BMC.
+DART runs the program with a concrete input, records the symbolic path
+constraint along the way, negates one constraint to obtain a new
+concrete input, repeats.  Loop depth is **whatever the concrete
+execution naturally takes** — not a preset `k`.  Each completed path
+contributes one `MustSummary` to the table:
+
+- `precondition` = conjunction of branch constraints along the path.
+- `postcondition` = final symbolic state at the procedure exit (or
+  violation site, in which case the path proves a real bug).
+
+**Key precondition for DART in our codebase: memory-aware SP.**  DART
+propagates symbolic state forward via SP at each instruction.  Today
+`sp_one` for `MemoryStore` / `Load` is a no-op, so a DART-style engine
+would mis-evaluate any memory-using program.  This is why the strict
+path is:
+
+1. **First**: make SP memory-aware (mirroring how `wp_one` already does
+   store substitution).  Tracked in TODO under "Memory-aware forward SP".
+2. **Then**: implement DART-style path enumeration + per-path
+   `MustSummary` creation as the forward MUST direction.
+3. **Then**: wire it into the scheduler alongside backward NOT-MAY.
+
+BMC was the stopgap that side-stepped (1) by working on an acyclic
+unrolled CFG where backward WP could play the forward-MUST role.  With
+BMC cut, programs whose safety we cannot prove become UNKNOWN until DART
+arrives.
+
 ## Out of scope / future work
 
 - **Backward NOT-MUST.**  Refines interprocedural bug preconditions; not
   required for soundness or for the current SV-COMP coverage targets.
 - **Fixpoint alternation between may and must directions over a shared
-  summary DB.**  The current `run_smash` calls each direction once.  The
-  paper's full algorithm iterates with cross-feed; this is a precision
-  enhancement, not a soundness one.
-- **Memory-aware SP.**  Would enable a true forward MUST rule running
-  alongside backward NOT-MAY in the same fixpoint loop.  Significant work
-  in `sp_one`; tracked as a future direction.
-- **Cross-procedure MUST summaries** (`smash::MustPathSummary` consumed by
-  callers).  Skeleton present but unused; needs the alternation fixpoint
-  to be useful.
+  summary DB.**  The paper's full algorithm iterates with cross-feed.
+- **Memory-aware SP.**  See above.  Largest single dependency for the
+  rest of the forward-MUST direction.

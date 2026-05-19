@@ -562,6 +562,83 @@ pub fn project_to_interface(formula: &Formula, interface: &ProcedureInterface) -
     Some(projected)
 }
 
+// ── CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY ────────────────────────────
+
+/// Build a [`NotMaySummary`] from a Verified query result.
+///
+/// Implements the paper's `CREATE_NOTMAYSUMMARY` step: project the query's
+/// pre and post to the procedure interface, then return the projected
+/// `(pre, post)` pair.  Subsumption / merge happens at the caller
+/// ([`ContextualSummaryTable::merge_notmay`]).
+///
+/// Returns `None` if either projection fails (a non-interface local
+/// survives substitution).  When `None`, the scheduler does not emit a
+/// summary for this query — sound, just less informative for future
+/// queries.
+///
+/// # Soundness
+///
+/// The Verified verdict guarantees `q.pre ⇒ ¬reachable(proc, q.post)`.
+/// Projection of `q.pre` (substitution-only, never widening; see
+/// [`project_to_interface`] docs) preserves semantic equivalence over the
+/// interface variables.  Same for `q.post`.  The resulting summary
+/// `NotMaySummary { precondition: π(q.pre), postcondition: π(q.post) }`
+/// is sound by construction: callers that match its precondition can
+/// soundly conclude its postcondition is unreachable through the call.
+pub fn create_notmay_summary(
+    query: &Query,
+    interface: &ProcedureInterface,
+) -> Option<NotMaySummary> {
+    let pre = project_to_interface(&query.pre, interface)?;
+    let post = project_to_interface(&query.post, interface)?;
+    log::debug!(
+        target: "summaries",
+        "[CREATE_NOTMAYSUMMARY] {}: pre={:?} post={:?}",
+        interface.procedure, pre, post,
+    );
+    Some(NotMaySummary {
+        precondition: pre,
+        postcondition: post,
+    })
+}
+
+/// Build a [`ContextualMustSummary`] from a BugFound query result.
+///
+/// Implements the paper's `CREATE_MUSTSUMMARY`.  `concrete_entry` is the
+/// concrete pre-state witnessed at the procedure entry (typically the
+/// `entry_summary.state` field of the resulting `AssertionResult` after
+/// a forward-MUST execution); `concrete_post` is the witnessed state at
+/// the violation site.
+///
+/// Returns `None` if either projection fails.  Discarding a must
+/// summary is sound — the witness still exists in the caller's space
+/// via the original BugFound model.
+///
+/// # Soundness
+///
+/// Forward MUST proved a concrete execution from `concrete_entry` to
+/// `concrete_post`.  Projection preserves equivalence over interface
+/// variables.  The projected `MustSummary { pre, post }` says: "there
+/// exists at least one execution from a state in `pre` to a state in
+/// `post`", which is exactly the paper's MUST semantics.
+pub fn create_must_summary(
+    concrete_entry: &Formula,
+    concrete_post: &Formula,
+    interface: &ProcedureInterface,
+) -> Option<ContextualMustSummary> {
+    let pre = project_to_interface(concrete_entry, interface)?;
+    let post = project_to_interface(concrete_post, interface)?;
+    log::debug!(
+        target: "summaries",
+        "[CREATE_MUSTSUMMARY] {}: pre={:?} post={:?}",
+        interface.procedure, pre, post,
+    );
+    Some(ContextualMustSummary {
+        precondition: pre,
+        postcondition: post,
+    })
+}
+
 /// Walk `formula` collecting `Eq(Var(local), expr)` equalities where
 /// `local` is a non-interface scalar.  Used by `project_to_interface` to
 /// build the substitution map.

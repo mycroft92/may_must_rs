@@ -32,7 +32,11 @@ use crate::common::adapter::AssertionSite;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::InvariantConfig;
 use crate::may_must_analysis::loops::VerifiedLoopInvariant;
-use crate::may_must_analysis::query::{ContextualSummaryTable, Query, QueryId};
+use crate::may_must_analysis::query::{
+    create_must_summary, create_notmay_summary, ContextualSummaryTable, ProcedureInterface, Query,
+    QueryId,
+};
+use crate::may_must_analysis::rules::Judgement;
 use crate::may_must_analysis::smash::{self, SmashRunResult, SmashSummaryDB};
 use crate::may_must_analysis::summaries::{ProcedureName, SummaryTables};
 
@@ -131,6 +135,10 @@ impl Scheduler {
     /// and the supplied interprocedural [`SummaryTables`] (legacy must/notmay
     /// summaries — to be migrated to the contextual table in step 5).
     ///
+    /// When `interface` is supplied, completed queries also trigger
+    /// `CREATE_NOTMAYSUMMARY` / `CREATE_MUSTSUMMARY` and merge the result
+    /// into `self.table`.
+    ///
     /// Returns `None` when the queue is empty.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_next(
@@ -141,6 +149,7 @@ impl Scheduler {
         legacy_tables: &SummaryTables,
         config: Option<&InvariantConfig>,
         debug_names: &HashMap<String, String>,
+        interface: Option<&ProcedureInterface>,
     ) -> Option<DispatchOutcome> {
         let id = self.pending.pop_front()?;
         let entry = self.in_progress.remove(&id)?;
@@ -184,6 +193,15 @@ impl Scheduler {
                     "[dispatch] {:?}: completed via run_smash (engine={:?})",
                     id, run.engine,
                 );
+
+                // CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY from the query
+                // result and merge into `self.table`.  Skipped if no
+                // interface descriptor was supplied (we cannot project
+                // safely without knowing the formal parameter names).
+                if let Some(iface) = interface {
+                    self.create_and_merge_summary(&entry.query, &run.assertion, iface, oracle);
+                }
+
                 DispatchOutcome::Completed(run)
             }
             None => {
@@ -203,6 +221,87 @@ impl Scheduler {
         Some(outcome)
     }
 
+    /// Build a contextual summary (NotMay or Must) from a completed query
+    /// and merge it into [`self.table`].  Quietly returns if projection
+    /// fails (a local couldn't be eliminated) or if the verdict was
+    /// Unknown — no summary is added in those cases.
+    ///
+    /// # Alpha-renaming caveat
+    ///
+    /// The query's `pre` / `post` and the assertion's `entry_summary` /
+    /// `assertion_summary` formulas are in the **callee's** procedure
+    /// frame (callee SSA names, callee `__ext_N` regions).  Callers that
+    /// look up these summaries must alpha-rename actuals→formals before
+    /// the subsumption check (see `design_notes/QUERY_REFACTOR.md` §5
+    /// "Projection (caller variables ↔ callee variables)").  That
+    /// renaming happens at the call site, not here.
+    fn create_and_merge_summary(
+        &mut self,
+        query: &Query,
+        assertion: &crate::may_must_analysis::backward::AssertionResult,
+        interface: &ProcedureInterface,
+        oracle: &Oracle,
+    ) {
+        match &assertion.judgement {
+            Judgement::Verified => {
+                if let Some(summary) = create_notmay_summary(query, interface) {
+                    match self
+                        .table
+                        .merge_notmay(interface.procedure.clone(), summary, oracle)
+                    {
+                        Ok(true) => log::debug!(
+                            target: "summaries",
+                            "[merge_notmay] {}: new summary added", interface.procedure,
+                        ),
+                        Ok(false) => log::debug!(
+                            target: "summaries",
+                            "[merge_notmay] {}: subsumed by existing", interface.procedure,
+                        ),
+                        Err(e) => log::warn!(
+                            target: "summaries",
+                            "[merge_notmay] {}: oracle error {e:?}", interface.procedure,
+                        ),
+                    }
+                }
+            }
+            Judgement::BugFound { .. } => {
+                // For BugFound today (acyclic CFGs only — BMC is cut),
+                // `entry_summary.state` is the precise WP precondition
+                // that proved SAT at the entry, and `assertion_summary
+                // .state` is the violation precondition at the assertion
+                // site.  Use these as the concrete-witness pre/post for
+                // the MUST summary.  Once forward-MUST is fully wired,
+                // we'll use the under-approximate `must_reach` instead.
+                let pre = &assertion.entry_summary.state;
+                let post = &assertion.assertion_summary.state;
+                if let Some(summary) = create_must_summary(pre, post, interface) {
+                    match self
+                        .table
+                        .merge_must(interface.procedure.clone(), summary, oracle)
+                    {
+                        Ok(true) => log::debug!(
+                            target: "summaries",
+                            "[merge_must] {}: new summary added", interface.procedure,
+                        ),
+                        Ok(false) => log::debug!(
+                            target: "summaries",
+                            "[merge_must] {}: subsumed by existing", interface.procedure,
+                        ),
+                        Err(e) => log::warn!(
+                            target: "summaries",
+                            "[merge_must] {}: oracle error {e:?}", interface.procedure,
+                        ),
+                    }
+                }
+            }
+            Judgement::Unknown => {
+                // No summary — Unknown means the analysis couldn't
+                // prove either direction.  Future iterations of the
+                // worklist may discharge it via a different context.
+            }
+        }
+    }
+
     /// Drains all pending queries against the given procedure context.
     /// Convenience wrapper around repeated `dispatch_next`.  Returns the
     /// outcomes in dispatch order (also stable: the order queries were
@@ -216,11 +315,18 @@ impl Scheduler {
         legacy_tables: &SummaryTables,
         config: Option<&InvariantConfig>,
         debug_names: &HashMap<String, String>,
+        interface: Option<&ProcedureInterface>,
     ) -> Vec<DispatchOutcome> {
         let mut out = Vec::new();
-        while let Some(o) =
-            self.dispatch_next(cfg, procedure, oracle, legacy_tables, config, debug_names)
-        {
+        while let Some(o) = self.dispatch_next(
+            cfg,
+            procedure,
+            oracle,
+            legacy_tables,
+            config,
+            debug_names,
+            interface,
+        ) {
             out.push(o);
         }
         out
