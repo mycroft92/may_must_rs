@@ -7,4 +7,5 @@ pub mod loops;
 pub mod node_summary;
 pub mod providers;
 pub mod rules;
+pub mod smash;
 pub mod summaries;

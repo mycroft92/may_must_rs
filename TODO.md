@@ -1,5 +1,86 @@
 # TODO
 
+## TOP PRIORITY — SMASH-style Bidirectional Orchestrator
+
+Today the analysis is bidirectional only in spirit: both `forward reach` (may)
+and `backward state` (not-may) are overapproximations combined into one safety
+check.  There is **no true forward-must direction**.  BMC fills the must role
+as a fallback, but it doesn't share summaries with the may side, doesn't
+propagate must-paths across procedure boundaries, and doesn't refine the
+candidate generator in ACHAR.
+
+The original SMASH paper (*Compositional May-Must Analysis*) runs the two
+directions as **peers** per procedure, sharing a summary database.  This is
+why our analysis under-classifies bugs and misses verdicts on programs where
+the two directions need to cross-feed.  Concretely, with the current design:
+
+- `array-2`-style bugs require BMC fallback; the must-path discovered is
+  thrown away after the verdict and never informs the caller or sibling
+  procedures.
+- Cyclic inter-procedural calls only carry may-summaries; a must-path through
+  a callee that breaks the caller is invisible to the caller's invariant search.
+- ACHAR's candidate generator gets no signal from BMC about which branches
+  are concretely feasible vs. infeasible — the two engines run in isolation.
+
+### Design: SMASH layer on top of existing passes
+
+Keep `run_backward` (may) and `bmc_check` (must) as-is.  Add a *new top layer*
+that orchestrates them with a shared `SmashSummaryDB`:
+
+```
+analyze_with_smash(procedure, db):
+    loop:
+        may  = try_may_direction(procedure, db)    // existing run_backward
+        must = try_must_direction(procedure, db)   // existing bmc_check, now writes db
+        if may.verdict == Verified  → return Verified
+        if must.verdict == BugFound → return BugFound
+        if db unchanged this iteration → return Unknown
+        // Otherwise: new summaries → re-run both directions with refined info
+```
+
+`SmashSummaryDB` extends today's `SummaryTables` (which carries
+`VerifiedLoopInvariant` + must/not-may per node) with **must-path summaries**:
+
+```rust
+struct MustPathSummary {
+    procedure: String,
+    entry_state: Formula,       // concrete pre-state from SMT model
+    exit_state: Formula,        // concrete post-state at procedure exit
+    violation: Option<AssertionId>,  // if this path proves a violation
+}
+```
+
+BMC writes to `must_paths` when it finds a bug; the may-side reads
+`must_paths` to:
+- Surface caller-visible bugs when a callee's must-path is reachable.
+- Prune ACHAR candidates that contradict a known concrete must-path.
+- Skip exit-closure for invariants already known to be violated.
+
+### Why this fixes the underlying issue
+
+Many of our UNKNOWN verdicts (and the historical "tests are off" feel) trace
+to this missing peer-relationship.  The two directions today are tuned to
+*either prove safety* (the combined may check) *or find a single bug* (BMC
+fallback, in isolation).  They don't talk.  The SMASH layer makes them talk.
+
+### Implementation steps (in order)
+
+1. **`SmashSummaryDB` type** — wraps `SummaryTables` + adds `must_paths`.
+2. **Orchestrator skeleton** — `analyze_with_smash(procedure, db)` running
+   both directions to fixpoint over DB updates.
+3. **BMC instrumentation** — `bmc_check` writes `MustPathSummary` entries
+   into the DB when it returns BugFound.
+4. **ACHAR consultation** — `synthesize_with_cegis` reads `must_paths` to
+   prune candidates that any must-path violates.
+5. **Driver wiring** — `analyze_procedure` calls `analyze_with_smash` instead
+   of the current `analyze_with_tables` / `bmc_check` dichotomy.
+6. **Inter-procedural cross-feed** — must-paths from callees become candidate
+   bug-witnesses at caller call-sites (queued like return summaries).
+
+Steps 1–5 are the immediate scope and should unlock the array-2-class
+verdicts cleanly without the BMC-fallback hack.  Step 6 is the full
+inter-procedural composition and can land as a separate milestone.
+
 ## Strategic Direction
 
 Broaden SV-COMP coverage (more categories, bitvector theory, richer instruction

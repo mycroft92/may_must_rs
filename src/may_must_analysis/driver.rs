@@ -44,10 +44,10 @@ use crate::common::formula::{Formula, Memory, Term, Var};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{
-    analyze, analyze_with_tables, discover_loop_invariants, render_result, verify_precomputed,
+    analyze_with_tables, discover_loop_invariants, render_result, verify_precomputed,
     AssertionResult, BackwardError, InvariantConfig,
 };
-use crate::may_must_analysis::bmc;
+use crate::may_must_analysis::smash;
 use crate::may_must_analysis::loops::{
     check_loop_invariant_verbose, detect_loops, normalize_candidate, sort_innermost_first,
     InvariantCheckResult, LoopInfo, VerifiedLoopInvariant,
@@ -365,83 +365,54 @@ pub fn analyze_with_summaries(
             )
         });
 
-    let site_results: Vec<_> = adapted
+    // Build the SMASH summary database: existing per-procedure tables (from
+    // `analyze_module_with_llm`) plus an empty must-paths store that the
+    // orchestrator populates as BMC finds bugs.
+    let empty_tables = SummaryTables::new();
+    let db_tables = tables.cloned().unwrap_or_else(SummaryTables::new);
+    let _ = &empty_tables; // silence in trivial paths
+    let db = smash::SmashSummaryDB {
+        tables: db_tables,
+        must_paths: std::collections::BTreeMap::new(),
+    };
+
+    let site_results: Vec<smash::SmashRunResult> = adapted
         .assertions
         .par_iter()
         .map(|site| {
-            let result = if let Some(tables) = tables {
-                // Upgrade InductiveHints to VerifiedLoopInvariant for this assertion site.
-                // If exit closure fails for the hints, analyze_with_tables falls through
-                // to per-site synthesis with the real assertion postconditions.
-                let verified = precomputed_hints.as_deref().and_then(|hints| {
+            // Upgrade InductiveHints to VerifiedLoopInvariant for this assertion
+            // site.  If exit closure fails, analyze_with_tables falls through to
+            // per-site synthesis with the real assertion postconditions.
+            let verified = if tables.is_some() {
+                precomputed_hints.as_deref().and_then(|hints| {
                     verify_precomputed(&adapted.cfg, site, hints, oracle)
                         .ok()
                         .flatten()
-                });
-                analyze_with_tables(
-                    &adapted.cfg,
-                    &adapted.name,
-                    site,
-                    oracle,
-                    tables,
-                    config,
-                    verified.as_deref(),
-                    &adapted.debug_names,
-                )
+                })
             } else {
-                analyze(&adapted.cfg, site, oracle)
+                None
             };
-            (site, result)
+            smash::run_smash(
+                &adapted.cfg,
+                &adapted.name,
+                site,
+                oracle,
+                &db,
+                config,
+                verified.as_deref(),
+                &adapted.debug_names,
+            )
         })
         .collect();
-    let bmc_bound = config.and_then(|c| c.bmc_bound);
+
     let mut assertions = Vec::new();
-    let mut failures = Vec::new();
-    for (site, result) in site_results {
-        match result {
-            Ok(result) => {
-                log::info!(
-                    target: "engine_verdict",
-                    "function {} assertion #{} ({}): {:?} [engine=invariant-analysis]",
-                    adapted.name,
-                    site.id,
-                    site.location,
-                    result.judgement
-                );
-                assertions.push(result);
-            }
-            Err(BackwardError::CyclicCfgUnsupported) => {
-                // Invariant synthesis failed. Try BMC as a bug-finding fallback.
-                if let Some(bound) = bmc_bound {
-                    if let Some(bmc_result) = bmc::bmc_check(&adapted.cfg, site, oracle, bound) {
-                        log::info!(
-                            target: "engine_verdict",
-                            "function {} assertion #{} ({}): {:?} [engine=bmc bound={}]",
-                            adapted.name,
-                            site.id,
-                            site.location,
-                            bmc_result.judgement,
-                            bound,
-                        );
-                        assertions.push(bmc_result);
-                        continue;
-                    }
-                    log::info!(
-                        target: "engine_verdict",
-                        "function {} assertion #{} ({}): UNKNOWN [engine=bmc bound={} exhausted]",
-                        adapted.name, site.id, site.location, bound
-                    );
-                }
-                failures.push(format!(
-                    "assertion #{} ({}): CFG has a cycle and no loop invariant was accepted",
-                    site.id, site.location
-                ));
-            }
-            Err(error) => failures.push(format!(
-                "assertion #{} ({}): {}",
-                site.id, site.location, error
-            )),
-        }
+    let failures: Vec<String> = Vec::new();
+    for run in site_results {
+        // Newly discovered must-paths could be merged back into `db` for
+        // cross-assertion / cross-procedure cross-feed once that step lands;
+        // for now we keep this layer additive and just collect the verdicts.
+        let _ = &run.new_must_paths;
+        assertions.push(run.assertion);
     }
 
     Ok(ProcedureReport {
