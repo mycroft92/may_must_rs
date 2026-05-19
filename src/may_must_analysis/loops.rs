@@ -50,7 +50,7 @@ use crate::common::abstract_cfg::{
     AbstractCfg, AssignValue, CallMemoryEffect, CfgEdgeId, CfgNodeId, SourceLocation,
     TransferEffect,
 };
-use crate::common::formula::{Formula, Memory, Sort, Term, Var};
+use crate::common::formula::{Formula, Memory, SmtModel, Sort, Term, Var};
 use crate::common::oracle::{Oracle, Validity};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -103,6 +103,17 @@ pub type InnerInvariants<'a> = &'a [(CfgNodeId, Formula)];
 /// variants identify *which* condition was the first to fail, enabling
 /// targeted logging and CEGIS feedback.
 ///
+/// Each failure variant carries an optional `witness` model — a concrete program
+/// state that demonstrates *why* the check failed.  The ACHAR CEGIS loop uses
+/// these witnesses to prune remaining candidates cheaply without further SMT calls.
+///
+/// - **InitiationFailed witness**: a reachable initial state where the candidate is false.
+///   Use as a new positive ICE example (states where the invariant *must* hold).
+/// - **InductivenessFailed witness**: a pre-state where the candidate holds but the
+///   loop body takes execution outside it.  Use as an ICE implication example.
+/// - **ExitClosureFailed witness**: a state where the candidate holds but a violation
+///   is still reachable through the exit.  Use as a new negative ICE example.
+///
 /// # Soundness checks
 ///
 /// - **Initiation**: the candidate holds on entry (reach at header is empty).
@@ -113,11 +124,29 @@ pub enum InvariantCheckResult {
     /// Initiation, inductiveness, and exit closure all passed.
     Accepted,
     /// The candidate does not hold on entry to the loop.
-    InitiationFailed,
+    InitiationFailed { witness: Option<SmtModel> },
     /// The candidate is not preserved by one iteration of the loop body.
-    InductivenessFailed,
+    InductivenessFailed { witness: Option<SmtModel> },
     /// The candidate does not imply the required postcondition at this exit.
-    ExitClosureFailed { exit_edge: CfgEdgeId },
+    ExitClosureFailed {
+        exit_edge: CfgEdgeId,
+        witness: Option<SmtModel>,
+    },
+}
+
+impl InvariantCheckResult {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+
+    pub fn witness(&self) -> Option<&SmtModel> {
+        match self {
+            Self::Accepted => None,
+            Self::InitiationFailed { witness }
+            | Self::InductivenessFailed { witness }
+            | Self::ExitClosureFailed { witness, .. } => witness.as_ref(),
+        }
+    }
 }
 
 pub fn normalize_candidate(cfg: &AbstractCfg, header: CfgNodeId, candidate: &Formula) -> Formula {
@@ -253,14 +282,19 @@ pub fn check_loop_invariant_verbose(
     // functional memory expressions across the SMT boundary.
     let reach_h = forward_reach_at_header(cfg, info.header, inner);
     let initiation_violation = Formula::and(reach_h, Formula::not(candidate.clone()));
-    match oracle.feasibility(&initiation_violation) {
-        Ok(crate::common::oracle::Feasibility::Feasible) => {
-            return InvariantCheckResult::InitiationFailed;
-        }
-        Ok(crate::common::oracle::Feasibility::Unknown) | Err(_) => {
-            return InvariantCheckResult::InitiationFailed;
-        }
-        Ok(crate::common::oracle::Feasibility::Infeasible) => {}
+    match oracle.feasibility_with_model(&initiation_violation) {
+        Ok(report) => match report.feasibility {
+            crate::common::oracle::Feasibility::Feasible => {
+                return InvariantCheckResult::InitiationFailed {
+                    witness: report.model,
+                };
+            }
+            crate::common::oracle::Feasibility::Unknown => {
+                return InvariantCheckResult::InitiationFailed { witness: None };
+            }
+            crate::common::oracle::Feasibility::Infeasible => {}
+        },
+        Err(_) => return InvariantCheckResult::InitiationFailed { witness: None },
     }
 
     // Inductiveness and exit-closure checks restrict propagation to the loop
@@ -269,7 +303,7 @@ pub fn check_loop_invariant_verbose(
 
     let Some(back_edge_requirement) = edge_source_requirement(cfg, info.back_edge, &candidate)
     else {
-        return InvariantCheckResult::InductivenessFailed;
+        return InvariantCheckResult::InductivenessFailed { witness: None };
     };
     let Some(inductive_states) = backward_states(
         cfg,
@@ -280,16 +314,20 @@ pub fn check_loop_invariant_verbose(
         inner,
         true,
     ) else {
-        return InvariantCheckResult::InductivenessFailed;
+        return InvariantCheckResult::InductivenessFailed { witness: None };
     };
     let inductive_header = inductive_states
         .get(&info.header)
         .cloned()
         .unwrap_or(Formula::False);
-    match oracle.implies(&candidate, &inductive_header) {
-        Ok(Validity::Valid) => {}
-        Ok(Validity::Invalid) => return InvariantCheckResult::InductivenessFailed,
-        Ok(Validity::Unknown) | Err(_) => return InvariantCheckResult::InductivenessFailed,
+    match oracle.implies_with_model(&candidate, &inductive_header) {
+        Ok((Validity::Valid, _)) => {}
+        Ok((Validity::Invalid, model)) => {
+            return InvariantCheckResult::InductivenessFailed { witness: model }
+        }
+        Ok((Validity::Unknown, _)) | Err(_) => {
+            return InvariantCheckResult::InductivenessFailed { witness: None }
+        }
     }
 
     for exit_edge in &info.exit_edges {
@@ -305,6 +343,7 @@ pub fn check_loop_invariant_verbose(
         let Some(exit_requirement) = edge_source_requirement(cfg, *exit_edge, postcondition) else {
             return InvariantCheckResult::ExitClosureFailed {
                 exit_edge: *exit_edge,
+                witness: None,
             };
         };
         let Some(exit_states) = backward_states(
@@ -318,6 +357,7 @@ pub fn check_loop_invariant_verbose(
         ) else {
             return InvariantCheckResult::ExitClosureFailed {
                 exit_edge: *exit_edge,
+                witness: None,
             };
         };
         let exit_header = exit_states
@@ -335,13 +375,21 @@ pub fn check_loop_invariant_verbose(
         // at the exit. "I AND exit_header infeasible" means "if I holds, no violation
         // can reach the assertion through this exit" — the correct safety criterion.
         let combined = Formula::and(candidate.clone(), exit_header.clone());
-        match oracle.feasibility(&combined) {
-            Ok(crate::common::oracle::Feasibility::Infeasible) => {}
-            Ok(crate::common::oracle::Feasibility::Feasible)
-            | Ok(crate::common::oracle::Feasibility::Unknown)
-            | Err(_) => {
+        match oracle.feasibility_with_model(&combined) {
+            Ok(report) => match report.feasibility {
+                crate::common::oracle::Feasibility::Infeasible => {}
+                crate::common::oracle::Feasibility::Feasible
+                | crate::common::oracle::Feasibility::Unknown => {
+                    return InvariantCheckResult::ExitClosureFailed {
+                        exit_edge: *exit_edge,
+                        witness: report.model,
+                    };
+                }
+            },
+            Err(_) => {
                 return InvariantCheckResult::ExitClosureFailed {
                     exit_edge: *exit_edge,
+                    witness: None,
                 };
             }
         }

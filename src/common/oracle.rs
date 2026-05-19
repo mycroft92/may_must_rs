@@ -162,13 +162,28 @@ impl Oracle {
         assumptions: &Formula,
         conclusion: &Formula,
     ) -> Result<Validity, OracleError> {
+        let (validity, _) = self.implies_with_model(assumptions, conclusion)?;
+        Ok(validity)
+    }
+
+    /// Like [`Oracle::implies`] but also returns a counterexample model when the
+    /// implication does not hold.
+    ///
+    /// The model witnesses a state where `assumptions` holds but `conclusion` does
+    /// not — useful as an ICE implication example for loop invariant synthesis.
+    pub fn implies_with_model(
+        &self,
+        assumptions: &Formula,
+        conclusion: &Formula,
+    ) -> Result<(Validity, Option<SmtModel>), OracleError> {
         let counterexample = Formula::and(assumptions.clone(), Formula::not(conclusion.clone()));
-        let result = match self.feasibility(&counterexample)? {
+        let report = self.feasibility_with_model(&counterexample)?;
+        let validity = match report.feasibility {
             Feasibility::Infeasible => Validity::Valid,
             Feasibility::Feasible => Validity::Invalid,
             Feasibility::Unknown => Validity::Unknown,
         };
-        Ok(result)
+        Ok((validity, report.model))
     }
 }
 

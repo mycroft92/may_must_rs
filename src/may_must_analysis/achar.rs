@@ -1,4 +1,5 @@
-//! Grammar-based loop invariant synthesis with ICE (Inductive CounterExample) learning.
+//! Grammar-based loop invariant synthesis with ICE (Inductive CounterExample) learning
+//! and CEGIS feedback loop.
 //!
 //! Implements the ACHAR approach (Lahiri & Roy, ISSTA '22): enumerate candidates
 //! from a grammar over the loop's variable vocabulary; use an SMT oracle as the
@@ -9,9 +10,13 @@
 //!
 //! Three kinds of examples guide the search:
 //! - **Positive examples** — states where the invariant *must* hold (initial state
-//!   at the loop header, from the forward reach).
+//!   at the loop header, from the forward reach, plus states from initiation failure
+//!   witnesses collected during the CEGIS loop).
 //! - **Negative examples** — states where the invariant *must not* hold (violation
-//!   states at loop exits, from assertion postconditions).
+//!   states at loop exits, from assertion postconditions, plus exit-closure failure
+//!   witnesses collected during the CEGIS loop).
+//! - **Implication counterexamples** — pre-states where the candidate held but the
+//!   body broke inductiveness; absorbed as must-hold states.
 //!
 //! An atom is *positive-consistent* if it is not false on any positive example.
 //! An atom is a *safety atom* if it is false on at least one negative example
@@ -23,21 +28,34 @@
 //! 3. Observer-style and ICE-guided disjunctions: `pos_atom || safety_atom`.
 //! 4. General pairwise disjunctions of positive-consistent atoms.
 //!
+//! # CEGIS feedback loop
+//!
+//! [`synthesize_with_cegis`] drives the check loop internally.  After each rejected
+//! candidate, the [`InvariantCheckResult`] witness model (a concrete SMT state) is
+//! absorbed into [`IceFeedback`].  Subsequent candidates are pre-screened against
+//! accumulated states with cheap local evaluation via [`eval_atom`], skipping SMT
+//! calls for candidates that are already inconsistent with observed examples.
+//!
+//! - `InitiationFailed` witness → must-hold state (candidate was false at loop entry).
+//!   Future candidates must evaluate to `true` here or they also fail initiation.
+//! - `InductivenessFailed` witness → must-hold state (pre-state where candidate held
+//!   but body broke it).
+//! - `ExitClosureFailed` witness → must-not-hold state (candidate was true here but
+//!   violation still reachable).  Future candidates that evaluate to `true` here are
+//!   likely to also fail exit closure.
+//!
 //! # Vocabulary filtering
 //!
 //! LLVM-internal variables (`__vla_expr*` VLA size tracking) are excluded from
 //! the term vocabulary.  They never participate in assertion conditions and only
 //! inflate the atom space.
-//!
-//! This module is intentionally independent of the entry-safety synthesis pass
-//! in `loops.rs`.
 
 use crate::common::abstract_cfg::{AbstractCfg, AssignValue, CfgNodeId, TransferEffect};
 use crate::common::formula::{Formula, Memory, ModelValue, SmtModel, Sort, Term, Var};
 use crate::common::oracle::{Feasibility, Oracle};
 use crate::may_must_analysis::loops::{
-    extract_back_edge_counter, formula_conjuncts, forward_reach_at_header, negate_comparison,
-    InnerInvariants, LoopInfo,
+    check_loop_invariant_verbose, extract_back_edge_counter, formula_conjuncts,
+    forward_reach_at_header, negate_comparison, InnerInvariants, InvariantCheckResult, LoopInfo,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -574,71 +592,133 @@ fn violation_negation_atoms(
     atoms
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── CEGIS synthesis ───────────────────────────────────────────────────────────
 
-/// Generate loop invariant candidates using ICE-guided grammar enumeration.
+/// Accumulated ICE counterexample states from rejected candidates.
 ///
-/// Candidates are generated in priority order:
-/// 1. Positive-consistent atoms: atoms not false at the initial loop state.
-/// 2. Pairwise conjunctions of positive-consistent atoms.
-/// 3. ICE-guided disjunctions: `pos_atom || safety_atom` where safety atoms
-///    are false on at least one violation state.
-/// 4. General pairwise disjunctions of positive-consistent atoms.
+/// Each failure of `check_loop_invariant_verbose` optionally provides a witness
+/// model.  Collected witnesses are used to pre-screen subsequent candidates
+/// with cheap local evaluation, avoiding redundant SMT calls.
+struct IceFeedback {
+    /// States where the invariant must hold (initial reachable states from
+    /// `InitiationFailed` witnesses; pre-states from `InductivenessFailed` witnesses).
+    /// A candidate that evaluates to `false` on any of these is pre-screened out.
+    must_hold: Vec<IceState>,
+    /// States where the invariant must not hold (from `ExitClosureFailed` witnesses).
+    /// A candidate that evaluates to `true` on any of these is pre-screened out.
+    must_not_hold: Vec<IceState>,
+}
+
+impl IceFeedback {
+    fn new(initial_positive: Option<IceState>, initial_negatives: Vec<IceState>) -> Self {
+        IceFeedback {
+            must_hold: initial_positive.into_iter().collect(),
+            must_not_hold: initial_negatives,
+        }
+    }
+
+    /// Ingest a failure witness into the feedback state.
+    fn absorb(&mut self, result: &InvariantCheckResult) {
+        match result {
+            InvariantCheckResult::InitiationFailed {
+                witness: Some(model),
+            } => {
+                // Witness is a reachable initial state where the candidate was false.
+                // Future candidates must evaluate to true here to pass initiation.
+                self.must_hold.push(IceState::from_model(model));
+            }
+            InvariantCheckResult::InductivenessFailed {
+                witness: Some(model),
+            } => {
+                // Witness is a pre-state where candidate held but was not preserved.
+                // Future candidates must also handle these states (treat as must-hold).
+                self.must_hold.push(IceState::from_model(model));
+            }
+            InvariantCheckResult::ExitClosureFailed {
+                witness: Some(model),
+                ..
+            } => {
+                // Witness satisfies `I ∧ exit_header`: the candidate was true here but
+                // a violation was still reachable.  A good invariant should be false on
+                // such states (or prevent the violation via exit closure).
+                self.must_not_hold.push(IceState::from_model(model));
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns true if the candidate is already inconsistent with accumulated states,
+    /// making an SMT call unnecessary.
+    ///
+    /// Only atoms (simple comparisons) can be evaluated concretely; compound formulas
+    /// (conjunctions, disjunctions) are not pre-screened.
+    fn screens_out(&self, candidate: &Formula) -> bool {
+        // For must_hold states: if candidate is false, it will fail initiation/inductiveness.
+        for state in &self.must_hold {
+            if eval_atom(candidate, state) == Some(false) {
+                return true;
+            }
+        }
+        // For must_not_hold states: if candidate is true, exit closure is likely to fail.
+        for state in &self.must_not_hold {
+            if eval_atom(candidate, state) == Some(true) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Try ACHAR candidates with ICE feedback loop.
 ///
-/// The `oracle` is used to collect concrete example states from the forward
-/// reach (positive) and exit violations (negative).  If example collection
-/// fails (formula infeasible or solver returns no model), all atoms are kept
-/// and the generator falls back to unguided enumeration.
-pub fn grammar_candidates(
+/// Unlike [`grammar_candidates`] which returns all candidates for external iteration,
+/// this function drives the check loop internally: after each rejected candidate it
+/// extracts the counterexample witness and uses it to pre-screen remaining candidates
+/// with cheap local evaluation.
+///
+/// Returns the first accepted (normalized) invariant, or `None` if synthesis fails.
+pub fn synthesize_with_cegis(
     info: &LoopInfo,
     cfg: &AbstractCfg,
     assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
     inner: InnerInvariants<'_>,
     oracle: &Oracle,
-) -> Vec<Formula> {
+    function: &str,
+    loop_index: usize,
+) -> Option<Formula> {
+    use crate::may_must_analysis::loops::normalize_candidate;
+
     let vocab = collect_vocab(info, cfg, assertion_postconditions);
     if vocab.terms.is_empty() {
-        return vec![];
+        return None;
     }
     let atoms = generate_atoms(&vocab);
 
-    // Collect ICE examples to guide filtering.
-    let positive = collect_positive_example(info, cfg, inner, oracle);
-    let negatives = collect_negative_examples(info, cfg, assertion_postconditions, oracle);
+    let initial_positive = collect_positive_example(info, cfg, inner, oracle);
+    let initial_negatives = collect_negative_examples(info, cfg, assertion_postconditions, oracle);
 
     log::debug!(
         target: "loop_invariant",
-        "achar: {} atoms; positive_example={} negative_examples={}",
+        "achar cegis: function {function} loop {loop_index}: {} atoms; \
+         positive_example={} negative_examples={}",
         atoms.len(),
-        positive.is_some(),
-        negatives.len()
+        initial_positive.is_some(),
+        initial_negatives.len()
     );
 
-    // Filter atoms by positive example.
-    let pos_consistent: Vec<&Formula> = if let Some(ref pos) = positive {
+    let pos_consistent: Vec<&Formula> = if let Some(ref pos) = initial_positive {
         filter_positive_consistent(&atoms, pos)
     } else {
         atoms.iter().collect()
     };
 
-    log::debug!(
-        target: "loop_invariant",
-        "achar: {} positive-consistent atoms (of {})",
-        pos_consistent.len(), atoms.len()
-    );
-
-    // Find safety atoms using negative examples.
-    let ice_safety: Vec<&Formula> = if !negatives.is_empty() {
-        find_safety_atoms(&atoms, &negatives)
+    let ice_safety: Vec<&Formula> = if !initial_negatives.is_empty() {
+        find_safety_atoms(&atoms, &initial_negatives)
     } else {
         vec![]
     };
-
-    // Also generate safety atoms from precise violation negation (no oracle needed).
     let negation_atoms = violation_negation_atoms(info, cfg, assertion_postconditions);
     let negation_refs: Vec<&Formula> = negation_atoms.iter().collect();
-
-    // Merge safety sources (ICE + precise negation), dedup.
     let mut all_safety: Vec<&Formula> = ice_safety;
     for atom in &negation_refs {
         if !all_safety
@@ -649,13 +729,10 @@ pub fn grammar_candidates(
         }
     }
 
-    log::debug!(
-        target: "loop_invariant",
-        "achar: {} safety atoms", all_safety.len()
-    );
-
-    // Build candidate list in priority order.
-    let mut candidates: Vec<Formula> = pos_consistent.iter().map(|a| (*a).clone()).collect();
+    // Build candidate list in the same priority order as grammar_candidates, but tagged
+    // with whether they are atoms (can be pre-screened cheaply) or compound formulas.
+    let mut candidates: Vec<Formula> = Vec::new();
+    candidates.extend(pos_consistent.iter().map(|a| (*a).clone()));
     append_pairwise_conjunctions(&mut candidates, &pos_consistent);
     append_ice_disjunctions(
         &mut candidates,
@@ -667,5 +744,68 @@ pub fn grammar_candidates(
     );
     append_pairwise_disjunctions(&mut candidates, &pos_consistent);
 
-    candidates
+    log::debug!(
+        target: "loop_invariant",
+        "achar cegis: function {function} loop {loop_index}: {} candidates",
+        candidates.len()
+    );
+
+    let atom_count = pos_consistent.len();
+    let mut feedback = IceFeedback::new(initial_positive, initial_negatives);
+    let mut screened_out = 0usize;
+
+    for (idx, candidate) in candidates.iter().enumerate() {
+        // Only atoms (first `atom_count` candidates) can be pre-screened locally.
+        let is_atom = idx < atom_count;
+        if is_atom && feedback.screens_out(candidate) {
+            screened_out += 1;
+            continue;
+        }
+
+        let normalized = normalize_candidate(cfg, info.header, candidate);
+        if crate::may_must_analysis::backward::is_tautology(&normalized) {
+            continue;
+        }
+
+        let result = check_loop_invariant_verbose(
+            info,
+            cfg,
+            candidate,
+            oracle,
+            assertion_postconditions,
+            inner,
+        );
+
+        log::debug!(
+            target: "loop_invariant",
+            "achar cegis: function {function} loop {loop_index} candidate {} => {}",
+            crate::may_must_analysis::backward::pretty_formula(&normalized),
+            match &result {
+                InvariantCheckResult::Accepted => "accepted",
+                InvariantCheckResult::InitiationFailed { .. } => "initiation failed",
+                InvariantCheckResult::InductivenessFailed { .. } => "inductiveness failed",
+                InvariantCheckResult::ExitClosureFailed { .. } => "exit closure failed",
+            }
+        );
+
+        if result.is_accepted() {
+            log::info!(
+                target: "loop_invariant",
+                "achar cegis: function {function} loop {loop_index}: \
+                 accepted invariant: {} (screened_out={screened_out})",
+                crate::may_must_analysis::backward::pretty_formula(&normalized)
+            );
+            return Some(normalized);
+        }
+
+        feedback.absorb(&result);
+    }
+
+    log::debug!(
+        target: "loop_invariant",
+        "achar cegis: function {function} loop {loop_index}: \
+         no invariant found (screened_out={screened_out}/{})",
+        candidates.len()
+    );
+    None
 }

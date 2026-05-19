@@ -510,48 +510,25 @@ fn synthesize_loop_invariants(
             }
         }
 
-        // ACHAR phase: grammar-guided enumeration over the loop vocabulary,
-        // including observer-style disjunction candidates.
+        // ACHAR phase: grammar-guided ICE CEGIS loop over the loop vocabulary.
         // Runs in Default (phase 2) and GrammarOnly modes.
         let run_achar = accepted_candidate.is_none()
             && matches!(mode, SynthesisMode::Default | SynthesisMode::GrammarOnly);
         if run_achar {
             log::debug!(
                 target: "loop_invariant",
-                "function {function} loop {}: trying achar generator",
+                "function {function} loop {}: trying achar cegis",
                 index + 1
             );
-            let candidates = achar::grammar_candidates(
+            accepted_candidate = achar::synthesize_with_cegis(
                 &loop_info,
                 cfg,
                 assertion_postconditions,
                 &accepted,
                 oracle,
+                function,
+                index + 1,
             );
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} achar: {} candidates",
-                index + 1, candidates.len()
-            );
-            log::debug!(
-                target: "loop_invariant",
-                "function {function} loop {} achar candidates: {}",
-                index + 1, format_candidates(&candidates, debug_names)
-            );
-            if !candidates.is_empty() {
-                accepted_candidate = first_accepted_candidate(
-                    function,
-                    index + 1,
-                    "achar",
-                    &loop_info,
-                    cfg,
-                    &candidates,
-                    oracle,
-                    assertion_postconditions,
-                    &accepted,
-                    debug_names,
-                );
-            }
         }
 
         if accepted_candidate.is_none() {
@@ -647,12 +624,12 @@ fn precomputed_satisfy_exit_closure(
                 pretty_formula(invariant),
                 match &result {
                     InvariantCheckResult::Accepted => "accepted".to_string(),
-                    InvariantCheckResult::InitiationFailed => "rejected: initiation failed".to_string(),
-                    InvariantCheckResult::InductivenessFailed => "rejected: inductiveness failed".to_string(),
-                    InvariantCheckResult::ExitClosureFailed { exit_edge } => format!("rejected: exit closure failed at {:?}", exit_edge),
+                    InvariantCheckResult::InitiationFailed { .. } => "rejected: initiation failed".to_string(),
+                    InvariantCheckResult::InductivenessFailed { .. } => "rejected: inductiveness failed".to_string(),
+                    InvariantCheckResult::ExitClosureFailed { exit_edge, .. } => format!("rejected: exit closure failed at {:?}", exit_edge),
                 }
             );
-            if result != InvariantCheckResult::Accepted {
+            if !result.is_accepted() {
                 return Ok(false);
             }
             accepted_inner.push((loop_info.header, invariant.clone()));
@@ -710,7 +687,7 @@ fn first_accepted_candidate(
             pretty_formula_with_names(&normalized, debug_names),
             render_invariant_result(&result)
         );
-        if result == InvariantCheckResult::Accepted {
+        if result.is_accepted() {
             log::info!(
                 target: "loop_invariant",
                 "function {function} loop {}: {} accepted invariant: {}",
@@ -731,7 +708,7 @@ fn first_accepted_candidate(
 ///   integers, e.g. `(a <= b) || (b <= a)` (total order) or
 ///   `(a < b) || (a >= b)` (complement). These pass all invariant checks
 ///   trivially but encode no information about program state.
-fn is_tautology(formula: &Formula) -> bool {
+pub(crate) fn is_tautology(formula: &Formula) -> bool {
     match formula {
         Formula::Le(a, b) | Formula::Ge(a, b) | Formula::Eq(a, b) => {
             format!("{a:?}") == format!("{b:?}")
@@ -781,9 +758,11 @@ fn atoms_cover_all_integers(f1: &Formula, f2: &Formula) -> bool {
 fn render_invariant_result(result: &InvariantCheckResult) -> String {
     match result {
         InvariantCheckResult::Accepted => "accepted".to_string(),
-        InvariantCheckResult::InitiationFailed => "rejected: initiation failed".to_string(),
-        InvariantCheckResult::InductivenessFailed => "rejected: inductiveness failed".to_string(),
-        InvariantCheckResult::ExitClosureFailed { exit_edge } => {
+        InvariantCheckResult::InitiationFailed { .. } => "rejected: initiation failed".to_string(),
+        InvariantCheckResult::InductivenessFailed { .. } => {
+            "rejected: inductiveness failed".to_string()
+        }
+        InvariantCheckResult::ExitClosureFailed { exit_edge, .. } => {
             format!("rejected: exit closure failed at edge {:?}", exit_edge)
         }
     }
