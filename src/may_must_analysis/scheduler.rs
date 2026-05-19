@@ -1,23 +1,23 @@
-//! Demand-driven query worklist scheduler (step 3 of the query refactor).
+//! Demand-driven query worklist scheduler.
 //!
 //! Per `design_notes/QUERY_REFACTOR.md`, this module owns the work queue
 //! that drives intra-procedural analysis from top-level assertion queries
 //! plus (eventually) call-spawned sub-queries.
 //!
-//! # Current scope (step 3)
+//! # Scope (steps 3, 5, 6A)
 //!
-//! - `Scheduler` holds the queue, in-progress map, and contextual summary
-//!   table.
-//! - `enqueue(query)` adds a query; `dispatch_next(...)` pops one and runs
-//!   the existing intra-procedural analysis (`run_smash` internals).
+//! - `Scheduler` is **per-module**: it owns a [`ProcedureContext`] for
+//!   every procedure in the module and a shared
+//!   [`ContextualSummaryTable`] that all dispatches read from and write
+//!   into.  Step 6A: a single `Scheduler` for the whole module so that
+//!   summaries created by one procedure's analysis become available to
+//!   the others without an extra plumbing step.
+//! - `enqueue(query)` adds a query; `dispatch_next()` pops one and runs
+//!   the existing intra-procedural analysis (`run_smash` internals)
+//!   against the CFG owned by the registered procedure context.
 //! - Calls are still inlined eagerly via the legacy `ReturnSummary` path
-//!   (no sub-query spawning yet — that's step 4).
-//! - No subsumption-aware caching yet (step 7).
-//!
-//! The intent is that *every* assertion verdict the codebase produces now
-//! flows through `Scheduler::analyze_procedure`, so subsequent steps can
-//! replace internals (call mediation, summary creation, recursion) without
-//! touching the driver again.
+//!   (no sub-query spawning yet — that's step 6B/6C).
+//! - No subsumption-aware caching of *queries* yet (step 7).
 
 #![allow(dead_code)]
 // `smash::SmashSummaryDB` is deprecated scaffolding still used by the
@@ -82,19 +82,45 @@ pub enum DispatchOutcome {
     Unprovenanced,
 }
 
-/// Demand-driven query scheduler for one procedure.
+/// Per-procedure data the scheduler needs to dispatch queries against
+/// a specific procedure's body.
 ///
-/// Owns the pending queue, in-progress map, and the contextual summary
-/// table that will grow in subsequent steps.  Multiple `Scheduler`
-/// instances may run concurrently for disjoint procedures; cross-procedure
-/// sharing (step 4+) will introduce a shared DB above this level.
+/// Owned by [`Scheduler`] (cloned at registration time).  Cloning is
+/// acceptable because the CFG is shared by reference inside; the only
+/// owned heavy field is the assertion list, which is bounded by source
+/// size.
+#[derive(Clone, Debug)]
+pub struct ProcedureContext {
+    pub cfg: AbstractCfg,
+    pub assertions: Vec<AssertionSite>,
+    pub debug_names: HashMap<String, String>,
+    pub interface: ProcedureInterface,
+}
+
+/// Demand-driven query scheduler for one module.
+///
+/// Owns:
+/// - The pending queue + in-progress map shared across all queries
+///   (top-level + sub-queries) in the module.
+/// - One [`ProcedureContext`] per procedure (registered via
+///   [`register_procedure`]).
+/// - The shared [`ContextualSummaryTable`] populated by every query's
+///   completion path (see `create_and_merge_summary`).
+///
+/// Step 6A change: previously a `Scheduler` was per-procedure and the
+/// driver built one per `AdaptedProcedure`.  Now a single `Scheduler`
+/// covers the whole module so contextual summaries created by leaf
+/// procedures are available when caller procedures are analysed,
+/// without a separate plumbing step.
 pub struct Scheduler {
     pending: VecDeque<QueryId>,
     in_progress: BTreeMap<QueryId, PendingEntry>,
     completed: BTreeMap<QueryId, DispatchOutcome>,
-    /// Contextual summaries discovered so far.  Populated in step 5
-    /// (CREATE_*_SUMMARY).  Today this is empty.
+    /// Contextual summaries discovered so far.  Populated by
+    /// CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY after each query
+    /// completes; shared across procedures in the same module.
     pub table: ContextualSummaryTable,
+    procedures: BTreeMap<ProcedureName, ProcedureContext>,
     next_id: usize,
 }
 
@@ -105,8 +131,30 @@ impl Scheduler {
             in_progress: BTreeMap::new(),
             completed: BTreeMap::new(),
             table: ContextualSummaryTable::new(),
+            procedures: BTreeMap::new(),
             next_id: 0,
         }
+    }
+
+    /// Registers a procedure with the scheduler.  Must be called before
+    /// any query for that procedure is dispatched.  Multiple
+    /// registrations for the same procedure name overwrite the
+    /// previous entry — useful if the caller wants to refresh the CFG
+    /// (we don't today, but the path is open).
+    pub fn register_procedure(&mut self, ctx: ProcedureContext) {
+        log::debug!(
+            target: "scheduler",
+            "[register_procedure] {} (assertions={}, formals={})",
+            ctx.interface.procedure,
+            ctx.assertions.len(),
+            ctx.interface.formals.len(),
+        );
+        self.procedures.insert(ctx.interface.procedure.clone(), ctx);
+    }
+
+    /// Returns the registered context for `procedure`, if any.
+    pub fn procedure(&self, procedure: &str) -> Option<&ProcedureContext> {
+        self.procedures.get(procedure)
     }
 
     /// Adds a query to the pending queue.  Returns the assigned
@@ -135,21 +183,16 @@ impl Scheduler {
     /// and the supplied interprocedural [`SummaryTables`] (legacy must/notmay
     /// summaries — to be migrated to the contextual table in step 5).
     ///
-    /// When `interface` is supplied, completed queries also trigger
-    /// `CREATE_NOTMAYSUMMARY` / `CREATE_MUSTSUMMARY` and merge the result
-    /// into `self.table`.
-    ///
-    /// Returns `None` when the queue is empty.
-    #[allow(clippy::too_many_arguments)]
+    /// Dispatches the next pending query.  Looks up the procedure's
+    /// [`ProcedureContext`] from the registered set (the query's
+    /// `procedure` field is the key).  Returns `None` when the queue is
+    /// empty; emits a warning and returns `Unprovenanced` if the query
+    /// references an un-registered procedure.
     pub fn dispatch_next(
         &mut self,
-        cfg: &AbstractCfg,
-        procedure: &ProcedureName,
         oracle: &Oracle,
         legacy_tables: &SummaryTables,
         config: Option<&InvariantConfig>,
-        debug_names: &HashMap<String, String>,
-        interface: Option<&ProcedureInterface>,
     ) -> Option<DispatchOutcome> {
         let id = self.pending.pop_front()?;
         let entry = self.in_progress.remove(&id)?;
@@ -159,17 +202,24 @@ impl Scheduler {
             id, entry.query.procedure, entry.query.pre, entry.query.post,
         );
 
-        if entry.query.procedure != *procedure {
-            // Step 3 only dispatches single-procedure queues; cross-
-            // procedure dispatch arrives with the worklist scheduler that
-            // owns multiple procedure CFGs (step 4).
-            log::warn!(
-                target: "scheduler",
-                "[dispatch] {:?}: query for procedure {} dispatched on CFG for {} \
-                 — single-procedure scope only in step 3",
-                id, entry.query.procedure, procedure,
-            );
-        }
+        // Look up the procedure's context.  Cloning here keeps the
+        // borrow checker quiet — `self.create_and_merge_summary` needs
+        // `&mut self` later in this function.  Cost: one CFG clone per
+        // dispatch; acceptable until we restructure to a borrowing
+        // shape.
+        let ctx = match self.procedures.get(&entry.query.procedure).cloned() {
+            Some(ctx) => ctx,
+            None => {
+                log::warn!(
+                    target: "scheduler",
+                    "[dispatch] {:?}: procedure '{}' not registered",
+                    id, entry.query.procedure,
+                );
+                let outcome = DispatchOutcome::Unprovenanced;
+                self.completed.insert(id, outcome.clone());
+                return Some(outcome);
+            }
+        };
 
         let outcome = match entry.provenance.as_ref() {
             Some(prov) => {
@@ -179,14 +229,14 @@ impl Scheduler {
                     must_paths: BTreeMap::new(),
                 };
                 let run = smash::run_smash(
-                    cfg,
-                    procedure,
+                    &ctx.cfg,
+                    &entry.query.procedure,
                     &prov.site,
                     oracle,
                     &db,
                     config,
                     prov.verified_invariants.as_deref(),
-                    debug_names,
+                    &ctx.debug_names,
                 );
                 log::debug!(
                     target: "scheduler",
@@ -195,19 +245,15 @@ impl Scheduler {
                 );
 
                 // CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY from the query
-                // result and merge into `self.table`.  Skipped if no
-                // interface descriptor was supplied (we cannot project
-                // safely without knowing the formal parameter names).
-                if let Some(iface) = interface {
-                    self.create_and_merge_summary(&entry.query, &run.assertion, iface, oracle);
-                }
+                // result and merge into `self.table`.
+                self.create_and_merge_summary(&entry.query, &run.assertion, &ctx.interface, oracle);
 
                 DispatchOutcome::Completed(run)
             }
             None => {
-                // Step 4+: sub-queries spawned by call edges need their own
-                // dispatch path (build a synthetic AssertionSite from
-                // entry.query, project the result back).  For now flag.
+                // Sub-queries spawned by call edges need their own dispatch
+                // path (synthesize an assertion at the procedure exit with
+                // obligation = ¬query.post).  Step 6B/6C.
                 log::warn!(
                     target: "scheduler",
                     "[dispatch] {:?}: no provenance — sub-query dispatch not yet implemented",
@@ -302,31 +348,17 @@ impl Scheduler {
         }
     }
 
-    /// Drains all pending queries against the given procedure context.
-    /// Convenience wrapper around repeated `dispatch_next`.  Returns the
-    /// outcomes in dispatch order (also stable: the order queries were
-    /// enqueued, since step 3 has no subsumption-driven reordering).
-    #[allow(clippy::too_many_arguments)]
+    /// Drains all pending queries.  Each is dispatched against its
+    /// registered procedure context.  Returns the outcomes in dispatch
+    /// order (FIFO, no subsumption reordering yet).
     pub fn drain(
         &mut self,
-        cfg: &AbstractCfg,
-        procedure: &ProcedureName,
         oracle: &Oracle,
         legacy_tables: &SummaryTables,
         config: Option<&InvariantConfig>,
-        debug_names: &HashMap<String, String>,
-        interface: Option<&ProcedureInterface>,
     ) -> Vec<DispatchOutcome> {
         let mut out = Vec::new();
-        while let Some(o) = self.dispatch_next(
-            cfg,
-            procedure,
-            oracle,
-            legacy_tables,
-            config,
-            debug_names,
-            interface,
-        ) {
+        while let Some(o) = self.dispatch_next(oracle, legacy_tables, config) {
             out.push(o);
         }
         out

@@ -430,6 +430,7 @@ impl ContextualSummaryTable {
 ///   only interface symbols; if substitution can't reach all locals,
 ///   the projection fails and no summary is emitted (sound: callers
 ///   simply re-spawn the query).
+#[derive(Clone, Debug)]
 pub struct ProcedureInterface {
     /// Procedure being projected.
     pub procedure: ProcedureName,

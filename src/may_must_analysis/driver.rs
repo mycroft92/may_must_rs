@@ -377,6 +377,21 @@ pub fn analyze_with_summaries(
     // touching the driver again.  See `design_notes/QUERY_REFACTOR.md`.
     let legacy_tables_for_scheduler: SummaryTables = tables.cloned().unwrap_or_default();
     let mut sched = scheduler::Scheduler::new();
+    // Register this procedure with the scheduler.  Step 6A: the scheduler
+    // is per-module, so callers that want cross-procedure summary sharing
+    // can register multiple procedures into one scheduler.  This call
+    // site (analyze_with_summaries — one procedure at a time) registers
+    // just one.
+    let interface = crate::may_must_analysis::query::ProcedureInterface::new(
+        adapted.name.clone(),
+        adapted.formal_parameters.iter().cloned(),
+    );
+    sched.register_procedure(scheduler::ProcedureContext {
+        cfg: adapted.cfg.clone(),
+        assertions: adapted.assertions.clone(),
+        debug_names: adapted.debug_names.clone(),
+        interface,
+    });
     for site in &adapted.assertions {
         let verified = if tables.is_some() {
             precomputed_hints.as_deref().and_then(|hints| {
@@ -405,22 +420,7 @@ pub fn analyze_with_summaries(
         };
         sched.enqueue(query, Some(provenance));
     }
-    // Build the procedure interface so the scheduler can run
-    // CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY after each query completes
-    // and populate `sched.table` (ContextualSummaryTable).
-    let interface = crate::may_must_analysis::query::ProcedureInterface::new(
-        adapted.name.clone(),
-        adapted.formal_parameters.iter().cloned(),
-    );
-    let outcomes = sched.drain(
-        &adapted.cfg,
-        &adapted.name,
-        oracle,
-        &legacy_tables_for_scheduler,
-        config,
-        &adapted.debug_names,
-        Some(&interface),
-    );
+    let outcomes = sched.drain(oracle, &legacy_tables_for_scheduler, config);
     let site_results: Vec<smash::SmashRunResult> = outcomes
         .into_iter()
         .filter_map(|o| match o {
