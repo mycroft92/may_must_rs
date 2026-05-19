@@ -85,10 +85,26 @@ semantics change.
 |---|---|---|
 | Backward NOT-MAY (WP) | `RuleEngine::notmay_pre*` | ✅ Correct rule; needs query-context plumbing |
 | Forward MAY (SP) | `RuleEngine::forward_may_post*` | ✅ Renamed in v0.15.0 |
-| Forward MUST | Realized as backward NOT-MAY on acyclic CFG (native or BMC-unrolled) | See `design_notes/SMASH_FORWARD_MUST.md` |
+| Forward MUST | Realized as backward NOT-MAY on acyclic CFG (native or BMC-unrolled).  `RuleEngine::forward_must_post` + `must_bugfound` + `NodeSummary.must_reach` exist as the paper-equivalent direct rule but are currently inert until SP becomes memory-aware. | See `design_notes/SMASH_FORWARD_MUST.md` |
 | Loop invariant synthesis | ACHAR + observer + entry-safety | ✅ Our intentional addon |
 | `NotMaySummary { pre, post }` | `summaries::NotMaySummary` | Shape correct; needs subsumption & contextual reuse |
 | `MaySummary { pre, post }` | `summaries::MaySummary` | Shape correct; usage assumes `pre=True` today |
+| `MustSummary { pre, post }` | `query::ContextualMustSummary` | New under-approximate sibling.  Replaces the v0.14 `smash::MustPathSummary` scaffolding. |
+| Query worklist | `query::Query`, `scheduler::Scheduler` | ✅ Skeleton wired; drains every assertion verdict |
+| Projection | `query::project_to_interface` | ✅ Substitution-only; preserves all memory regions verbatim |
+
+## Deprecated scaffolding (delete in a future cleanup)
+
+- `smash::MustPathSummary` — v0.14 scaffolding, replaced by
+  `query::ContextualMustSummary`.
+- `smash::SmashSummaryDB` — v0.14 scaffolding, replaced by
+  `query::ContextualSummaryTable`.  `run_smash` will be simplified to
+  take `&SummaryTables` directly.
+- `smash::SmashRunResult` / `smash::VerdictEngine` — superseded by
+  `scheduler::DispatchOutcome` carrying `AssertionResult` directly.
+- Root-level `loop_redesign.md`, `Loop_search_and_use.md`, and the
+  case-equivalent `LOOPS.md`/`loops.md` — deleted (superseded by
+  `design_notes/LOOPS.md`).
 
 ## Soundness debt (paper-violating behaviours)
 

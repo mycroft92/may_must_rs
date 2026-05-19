@@ -49,21 +49,14 @@ pub struct NodeSummary {
     /// procedure is verified safe.
     pub state: Formula,
 
-    /// **Forward MUST (under-approximation, feasibility-checked SP).**  A
-    /// formula whose models are **definitely** concrete reachable states at
-    /// this node.  Every disjunct was added only after an SMT feasibility
-    /// check.  Starts as `False` (no concrete witness yet) and grows under
-    /// disjunction as forward MUST propagation discovers feasible paths.
+    /// **Forward MUST scaffolding — DEPRECATED.**
     ///
-    /// SMASH-paper term: **MUST**.  If `must_reach[assertion_site] ∧ ¬obligation`
-    /// is SAT with a model, the procedure has a real bug.  This is the only
-    /// sound way to declare `BugFound` for cyclic CFGs (where `reach` is
-    /// over-approximate and `reach ∧ state` SAT can be spurious).
-    ///
-    /// Loop handling: forward MUST cannot terminate over unbounded loops on
-    /// its own.  Cyclic CFGs are unrolled to a bound `k` (via
-    /// [`crate::may_must_analysis::bmc::bmc_check`]) before forward MUST
-    /// propagation runs over the resulting acyclic graph.
+    /// Originally intended as the under-approximate concrete-reachability
+    /// component, paired with `RuleEngine::forward_must_post`.  Never wired
+    /// into the fixpoint because `TransferFn::sp` does not model memory.
+    /// The functional realization of forward MUST is backward NOT-MAY on
+    /// an acyclic CFG — see `design_notes/SMASH_FORWARD_MUST.md`.  Slated
+    /// for deletion in a future cleanup.
     pub must_reach: Formula,
 }
 

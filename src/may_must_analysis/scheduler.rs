@@ -20,6 +20,10 @@
 //! touching the driver again.
 
 #![allow(dead_code)]
+// `smash::SmashSummaryDB` is deprecated scaffolding still used by the
+// transitional `run_smash` entry point.  This module's references will
+// disappear when `run_smash` takes `&SummaryTables` directly.
+#![allow(deprecated)]
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 

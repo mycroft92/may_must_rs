@@ -26,6 +26,18 @@
 //!   bug witnesses.
 //! - Iterating may/must to fixpoint over DB updates within a single procedure
 //!   (today the orchestrator runs each direction once).
+//!
+//! # Deprecation status
+//!
+//! The types `MustPathSummary`, `SmashSummaryDB`, `SmashRunResult`, and
+//! `VerdictEngine` are v0.14 scaffolding that the query-driven refactor
+//! (see `design_notes/QUERY_REFACTOR.md`) supersedes.  They will go away
+//! once `run_smash` is simplified to take `&SummaryTables` directly and
+//! return `AssertionResult`; the deprecation marks are present to flag
+//! the migration to readers.  Internal uses inside this module are
+//! intentional and silenced below.
+
+#![allow(deprecated)]
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -44,12 +56,15 @@ use crate::may_must_analysis::summaries::{ProcedureName, SummaryTables};
 
 /// A concrete bug-witness path discovered by the **must** direction.
 ///
-/// Produced by [`bmc::bmc_check`] when it finds a BugFound at some unrolling
-/// depth.  The fields describe the concrete pre-state at the procedure entry
-/// and post-state at the assertion site, both extracted from the SMT model.
-///
-/// Future consumers (cross-procedure propagation, ACHAR pruning) read these
-/// entries from the [`SmashSummaryDB`].
+/// **DEPRECATED.**  This was the v0.14 scaffolding for cross-procedure
+/// must-path propagation.  In the query-driven architecture, BMC-derived
+/// bug witnesses flow back to callers via `ContextualMustSummary` in
+/// `query::ContextualSummaryTable` (still being wired up).  Slated for
+/// deletion once `CREATE_MUSTSUMMARY` writes to the contextual table.
+#[deprecated(
+    note = "v0.14 scaffolding; replaced by query::ContextualMustSummary in the \
+            contextual summary table"
+)]
 #[derive(Clone, Debug)]
 pub struct MustPathSummary {
     /// Procedure where the must-path was found.
@@ -65,10 +80,13 @@ pub struct MustPathSummary {
 
 /// Shared summary database for the SMASH orchestrator.
 ///
-/// Extends the may-side [`SummaryTables`] (invariants + not-may/must summaries)
-/// with the must-side [`MustPathSummary`] entries.  The orchestrator reads
-/// invariant entries from `tables` and writes must-path entries to
-/// `must_paths` when BMC finds a bug.
+/// **DEPRECATED.**  The query-driven architecture uses
+/// [`crate::may_must_analysis::query::ContextualSummaryTable`] instead.
+/// `run_smash` still accepts this wrapper today only because it threads
+/// through the legacy `SummaryTables`; `must_paths` is built with an empty
+/// `BTreeMap` and never consulted.  Slated for deletion once `run_smash`
+/// takes `&SummaryTables` directly.
+#[deprecated(note = "use query::ContextualSummaryTable; this is v0.14 scaffolding")]
 #[derive(Clone, Debug, Default)]
 pub struct SmashSummaryDB {
     /// May-side summaries (existing structure).  Re-used as-is so this layer

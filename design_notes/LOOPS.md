@@ -13,8 +13,8 @@ Companion documents:
 
 - [`QUERY_REFACTOR.md`](QUERY_REFACTOR.md) — the query model itself.
 - [`SMASH_FORWARD_MUST.md`](SMASH_FORWARD_MUST.md) — forward MUST = backward NOT-MAY on acyclic (native or BMC-unrolled) CFG.
-- [`../loops.md`](../loops.md) — current implementation of
-  `check_loop_invariant_verbose` (three-stage check).
+- Source: `src/may_must_analysis/loops.rs` — `check_loop_invariant_verbose`
+  three-stage check (initiation + inductiveness + exit closure).
 
 ---
 

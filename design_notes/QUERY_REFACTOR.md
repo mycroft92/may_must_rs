@@ -10,8 +10,7 @@ Companion documents:
 
 - [`SMASH_FORWARD_MUST.md`](SMASH_FORWARD_MUST.md) — directional mapping
   (forward MUST = backward NOT-MAY on acyclic / BMC-unrolled CFG).
-- [`../loops.md`](../loops.md) — how loop invariants interact with the
-  query model.
+- [`LOOPS.md`](LOOPS.md) — how loop invariants interact with the query model.
 
 **Goal:** complete equivalence with the paper, with ACHAR loop-invariant
 synthesis as the only intentional addon.  Correctness comes first;
@@ -439,7 +438,7 @@ impl Scheduler {
 | `analyze_module_with_llm` | `driver.rs:200` | Becomes a thin wrapper that builds top-level queries and calls `Scheduler::analyze_module` |
 | `compute_return_summary` | `adapter.rs:1651` | Stays as optimization; when it produces a summary equivalent to `MustSummary(True, post)`, register it in the contextual table |
 | `must_post_usesummary` (now `forward_may_usesummary`) | `rules.rs:368` | Honour `precondition` via implication check instead of assuming `True` |
-| Loop-invariant caching | `summaries::SummaryTables::loop_invariants` | Move into `ContextualSummaryTable`; keyed by (procedure, query.post) since invariants depend on the assertion context.  See `loops.md`. |
+| Loop-invariant caching | `summaries::SummaryTables::loop_invariants` | Move into `ContextualSummaryTable`; keyed by (procedure, query.post) since invariants depend on the assertion context.  See `LOOPS.md`. |
 
 ---
 
@@ -470,7 +469,7 @@ impl Scheduler {
 8. **In-progress tracking & recursion**: in-progress map, dependency
    wake-ups, optimistic placeholders, iterative refinement on cycle
    completion.  Demote the current CHC path.
-9. **Loop invariants in the query model**: see `loops.md`.
+9. **Loop invariants in the query model**: see `LOOPS.md`.
 
 Every step ends with `cargo test` green.  No commit lands until 119
 tests pass.

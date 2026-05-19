@@ -189,7 +189,19 @@ impl<'a> RuleEngine<'a> {
     }
 
     /// **Forward MUST rule** — under-approximate concrete reachability
-    /// propagation across `edge`.
+    /// propagation across `edge`.  Paper-correct.
+    ///
+    /// **Currently inert** in [`run_to_fixpoint`] because `TransferFn::sp`
+    /// does not model memory (`sp_one` for `MemoryStore` / `Load` is a
+    /// no-op), so the propagated `must_reach` would mis-evaluate any
+    /// memory-using program.  Today the functional realization of
+    /// forward MUST is backward NOT-MAY on an acyclic CFG (native or
+    /// BMC-unrolled) — see `design_notes/SMASH_FORWARD_MUST.md`.
+    ///
+    /// **Keep**: this rule is paper-equivalent and will become active
+    /// when SP is upgraded to handle memory (tracked in TODO.md under
+    /// "Memory-aware forward SP").  Removing it would walk back paper
+    /// equivalence.
     ///
     /// Computes the strongest-postcondition of `source.must_reach` through
     /// the source node's transfer function, the edge guard, and the edge's
