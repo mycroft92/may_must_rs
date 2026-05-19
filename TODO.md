@@ -43,6 +43,8 @@ Totals: ~51 UNKNOWN · 3 UNSOUND · 7 MISSED · 105 files.
 
 - `c/loops/array-2` — direct analysis returns UNKNOWN; `--bmc-bound 1` finds
   the bug (BugFound after 1 loop iteration, regression test added in v0.12.x).
+  BMC engine now uses incremental deepening + single WP pass (one SAT query per
+  depth, no fixpoint) so small bounds are fast (v0.12.3).
   Benchmark runner does not pass `--bmc-bound` yet; plumb it in to count this
   as fixed in the SV-COMP score.
 - `c/loops/ludcmp`

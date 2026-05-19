@@ -1,49 +1,57 @@
 //! Bounded model checking (BMC) via loop unrolling.
 //!
-//! Unrolls each loop in the CFG up to a configurable `bound`, producing an
-//! acyclic CFG that the existing backward analysis can reason about directly.
 //! BMC is sound for **bug finding only**: a `BugFound` result is a real
-//! counterexample.  The absence of a bug within the bound is not a proof of
-//! safety — callers should treat a `None` return as UNKNOWN.
+//! counterexample.  The absence of a bug within the bound is UNKNOWN.
+//!
+//! # Backend: single WP pass + one SAT query
+//!
+//! After unrolling, the CFG is acyclic.  Rather than running the full
+//! bidirectional fixpoint engine (designed for proving, not for finding bugs),
+//! [`bmc_sat_check`] does:
+//!
+//! 1. Seed `state[assertion_node] = transfer_fn.wp(NOT obligation)`.
+//! 2. One backward pass in reverse topological order: propagate each node's
+//!    state through its incoming edges (edge effects + guard + source transfer),
+//!    OR-joining at merge points.  No intermediate SMT queries.
+//! 3. One `feasibility_with_model` at the entry.  SAT → `BugFound`; else None.
+//!
+//! This is O(1) SMT queries per depth (versus O(edges) for the proof engine).
+//!
+//! # Incremental deepening
+//!
+//! [`bmc_check`] tries k = 1, 2, …, bound in order and stops at the first bug.
+//! Each depth gets a fresh unrolled CFG.  Bugs reachable in fewer iterations are
+//! found without paying for deeper unrollings.
 //!
 //! # Unrolling strategy
 //!
 //! For a loop with body nodes `{H, B…, L}` and back edge `L→H`:
 //! - Iteration 0 reuses the original nodes.
-//! - Iterations 1..=bound are fresh node copies (`bound` total extra copies).
-//! - `L_i → H_{i+1}` replaces the back edge at each step; the original back
-//!   edge is removed so the CFG becomes acyclic.
-//! - Exit edges (from the loop header, or wherever the loop tests the condition)
-//!   are present in the original nodes AND in every extra copy.  This means the
-//!   loop can exit after 0, 1, 2, …, or exactly `bound` full iterations.
-//! - The latch of the final copy (iteration `bound`) is a dead end — no further
-//!   iterations are possible beyond the bound.
+//! - Iterations 1..=k are fresh copies (k extra copies per depth k).
+//! - Exit edges are replicated on every copy so the loop can exit after
+//!   0, 1, …, or exactly k full iterations.
+//! - The latch of the final copy is a dead end.
 //!
-//! **Why `bound` extra copies, not `bound-1`:**
-//! To model "exit after exactly k iterations" we need k full body traversals
-//! followed by a header visit where the exit branch is taken.  That requires
-//! k extra header copies (one per body traversal).  With only `bound-1` copies,
-//! the largest reachable "exit" header is copy `bound-2`, modelling at most
-//! `bound-1` iterations — off by one.
-//!
-//! Nested loops are not supported; `bmc_check` returns `None` for those cases.
-//! Independent (non-nested) loops in the same function are each unrolled with
+//! Nested loops are not supported; independent loops are each unrolled with
 //! the same bound.
 
 use crate::common::abstract_cfg::{AbstractCfg, CfgNodeId};
 use crate::common::adapter::AssertionSite;
 use crate::common::alpha_rename;
-use crate::common::oracle::Oracle;
-use crate::may_must_analysis::backward::{self, AssertionResult};
+use crate::common::formula::Formula;
+use crate::common::oracle::{Feasibility, Oracle};
+use crate::may_must_analysis::backward::AssertionResult;
 use crate::may_must_analysis::loops::{detect_loops, sort_innermost_first, LoopInfo};
+use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::rules::Judgement;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Try to find a bug in `site` within `bound` loop iterations.
 ///
-/// Builds a k-times-unrolled version of `cfg` and runs the backward analysis
-/// on the acyclic result.  Returns `Some(result)` with a `BugFound` judgement
-/// if a counterexample is found within the bound; `None` otherwise.
+/// Uses incremental deepening: tries k = 1, 2, …, bound in order, stopping
+/// at the first counterexample.  Each depth unrolls the CFG k times and runs
+/// one SAT query (via [`bmc_sat_check`]) — no fixpoint engine, no intermediate
+/// SMT calls.  Returns `None` when no bug is found within the bound (UNKNOWN).
 pub fn bmc_check(
     cfg: &AbstractCfg,
     site: &AssertionSite,
@@ -73,70 +81,117 @@ pub fn bmc_check(
         }
     }
 
-    let mut bmc_cfg = cfg.clone();
+    let assertion_in_any_loop = loops.iter().any(|l| l.body.contains(&site.node));
 
-    // For each loop, track additional copies of the assertion node so we can
-    // check violations that occur at a specific iteration depth.
-    let mut assertion_node_copies: Vec<CfgNodeId> = vec![site.node];
+    for k in 1..=bound {
+        let mut bmc_cfg = cfg.clone();
+        let mut assertion_node_copies: Vec<CfgNodeId> = vec![site.node];
 
-    for loop_info in &loops {
-        let copy_maps = unroll_single_loop(&mut bmc_cfg, loop_info, bound);
-
-        if loop_info.body.contains(&site.node) {
-            for copy_map in &copy_maps {
-                if let Some(&new_node) = copy_map.get(&site.node) {
-                    assertion_node_copies.push(new_node);
+        for loop_info in &loops {
+            let copy_maps = unroll_single_loop(&mut bmc_cfg, loop_info, k);
+            if loop_info.body.contains(&site.node) {
+                for copy_map in &copy_maps {
+                    if let Some(&new_node) = copy_map.get(&site.node) {
+                        assertion_node_copies.push(new_node);
+                    }
                 }
             }
+            bmc_cfg.remove_edge(loop_info.back_edge);
         }
 
-        bmc_cfg.remove_edge(loop_info.back_edge);
-    }
+        log::debug!(
+            target: "bmc",
+            "bmc_check: k={k} nodes={} assertion_copies={}",
+            bmc_cfg.nodes().len(),
+            assertion_node_copies.len()
+        );
 
-    log::debug!(
-        target: "bmc",
-        "bmc_check: bound={bound} unrolled nodes={} assertion_copies={}",
-        bmc_cfg.nodes().len(),
-        assertion_node_copies.len()
-    );
+        let sites_to_check: Vec<AssertionSite> = if assertion_in_any_loop {
+            assertion_node_copies
+                .iter()
+                .map(|&node| AssertionSite {
+                    id: site.id,
+                    node,
+                    source_location: site.source_location.clone(),
+                    location: site.location.clone(),
+                    obligation: site.obligation.clone(),
+                })
+                .collect()
+        } else {
+            vec![site.clone()]
+        };
 
-    // For assertions inside a loop body: check each iteration copy separately.
-    // For assertions outside loops: the single backward pass propagates through
-    // all k unrolled copies simultaneously, so one check suffices.
-    let assertion_in_any_loop = loops.iter().any(|l| l.body.contains(&site.node));
-    let sites_to_check: Vec<AssertionSite> = if assertion_in_any_loop {
-        assertion_node_copies
-            .iter()
-            .map(|&node| AssertionSite {
-                id: site.id,
-                node,
-                source_location: site.source_location.clone(),
-                location: site.location.clone(),
-                obligation: site.obligation.clone(),
-            })
-            .collect()
-    } else {
-        vec![site.clone()]
-    };
-
-    for check_site in &sites_to_check {
-        match backward::analyze(&bmc_cfg, check_site, oracle) {
-            Ok(result) if matches!(result.judgement, Judgement::BugFound { .. }) => {
+        for check_site in &sites_to_check {
+            if let Some(result) = bmc_sat_check(&bmc_cfg, check_site, oracle) {
                 log::info!(
                     target: "bmc",
-                    "bmc_check: BugFound at node {:?} (bound={bound})",
+                    "bmc_check: BugFound at node {:?} (k={k})",
                     check_site.node
                 );
                 return Some(result);
             }
-            Ok(_) => {}
-            Err(e) => {
-                log::debug!(target: "bmc", "bmc_check: analysis error: {e}");
-            }
         }
+
+        log::debug!(target: "bmc", "bmc_check: k={k} no bug found");
     }
 
     None
+}
+
+/// Single-pass WP bug-finder for an acyclic (BMC-unrolled) CFG.
+///
+/// Propagates `NOT obligation` backward in one topological pass — no fixpoint,
+/// no `reach` component, no intermediate SMT calls.  One `feasibility_with_model`
+/// at the entry: SAT means a real counterexample exists at this unroll depth.
+fn bmc_sat_check(cfg: &AbstractCfg, site: &AssertionSite, oracle: &Oracle) -> Option<AssertionResult> {
+    // Acyclicity guard — returns None if back edges weren't removed.
+    let topo = cfg.topological_order()?;
+
+    let mut state: BTreeMap<CfgNodeId, Formula> = BTreeMap::new();
+
+    // Seed: WP of (NOT obligation) through the assertion node's transfer fn.
+    let neg_obligation = Formula::not(site.obligation.clone());
+    let pre_at_site = cfg.node(site.node).ok()?.transfer.wp(&neg_obligation);
+    state.insert(site.node, pre_at_site);
+
+    // Backward pass: process each node (reverse topo = successors before
+    // predecessors).  For each node that has a state, propagate it backward
+    // through every incoming edge and OR-join into the source node's state.
+    for &node in topo.iter().rev() {
+        let Some(node_state) = state.get(&node).cloned() else {
+            continue;
+        };
+        for edge_id in cfg.incoming_edges(node) {
+            let Ok(edge) = cfg.edge(edge_id) else { continue };
+            let edge = edge.clone();
+            // WP through edge effects (phi assignments, etc.), then AND guard.
+            let edge_pre = edge.transfer().wp(&node_state);
+            let guarded = Formula::and(edge.guard.clone(), edge_pre);
+            // WP through the source node's transfer fn.
+            let Ok(src_node) = cfg.node(edge.source) else { continue };
+            let src_pre = src_node.transfer.wp(&guarded);
+            // OR-join into the accumulated source state.
+            let acc = state.entry(edge.source).or_insert(Formula::False);
+            *acc = Formula::or(acc.clone(), src_pre);
+        }
+    }
+
+    let entry_state = state.get(&cfg.entry()).cloned().unwrap_or(Formula::False);
+    let report = oracle.feasibility_with_model(&entry_state).ok()?;
+
+    if report.feasibility != Feasibility::Feasible {
+        return None;
+    }
+
+    Some(AssertionResult {
+        site_id: site.id,
+        site_label: site.location.clone(),
+        source_location: site.source_location.clone().into(),
+        judgement: Judgement::BugFound { model: report.model },
+        entry_summary: NodeSummary { node: cfg.entry(), reach: Formula::True, state: entry_state },
+        assertion_summary: NodeSummary { node: site.node, reach: Formula::True, state: neg_obligation },
+        debug_names: HashMap::new(),
+    })
 }
 
 /// Add `bound−1` additional copies of the loop body to `cfg` and wire them
