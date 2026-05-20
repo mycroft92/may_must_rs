@@ -41,29 +41,31 @@ pub struct Node {
     pub successors: BTreeSet<Instruction>,
 }
 
-/// A `may_assert` call site extracted from the LLVM IR.
+/// A `may_assert` (or equivalent) call site extracted from the LLVM IR.
 ///
-/// The `may_assert` call itself is **not** inserted as a graph node — it is
-/// stripped from the visible-instruction list. Instead, each call site is
-/// recorded here so that the backward analysis knows what to verify and where
-/// to anchor it in the CFG.
+/// The call itself is **not** inserted as a graph node — it is stripped from
+/// the visible-instruction list. Instead, each call site is recorded here so
+/// that the backward analysis knows what to verify and where to anchor it in
+/// the CFG.
 ///
 /// Fields:
 /// - `asserted_value`: the first argument to `may_assert(cond)` — the `i1`
-///   value that must be non-zero on all reachable executions.
-/// - `predecessor`: the last visible instruction before the `may_assert` call
-///   in the same basic block, if any. Used to attach the obligation at the
-///   right program point.
-/// - `successor`: the first visible instruction after the `may_assert` call
-///   in the same basic block, if any.
-/// - `source_location`: file/line/column from DWARF debug info, used in
-///   human-readable diagnostic output.
+///   value that must be non-zero on all reachable executions.  Unused when
+///   `is_unconditional_fail` is true (the call instruction itself is stored).
+/// - `predecessor`: the last visible instruction before the call in the same
+///   basic block, if any. Used to attach the obligation at the right point.
+/// - `successor`: the first visible instruction after the call, if any.
+/// - `source_location`: file/line/column from DWARF debug info.
+/// - `is_unconditional_fail`: true for calls to `reach_error`, `__assert_fail`,
+///   or `__VERIFIER_error`.  The adapter emits `Formula::False` as the
+///   obligation, meaning the call site must be unreachable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssertSite {
     pub asserted_value: Instruction,
     pub predecessor: Option<Instruction>,
     pub successor: Option<Instruction>,
     pub source_location: SourceLocation,
+    pub is_unconditional_fail: bool,
 }
 
 /// A `may_assume` or `may_type_bound` call site extracted from the LLVM IR.
@@ -271,6 +273,17 @@ impl FunctionGraph {
                         predecessor: previous_visible_instruction(&instructions, index),
                         successor: next_visible_instruction(&instructions, index),
                         source_location,
+                        is_unconditional_fail: false,
+                    });
+                }
+                if is_unconditional_fail_call(instruction) {
+                    let source_location = instruction.get_debug_location().unwrap_or_default();
+                    graph.asserts.push(AssertSite {
+                        asserted_value: instruction,
+                        predecessor: previous_visible_instruction(&instructions, index),
+                        successor: next_visible_instruction(&instructions, index),
+                        source_location,
+                        is_unconditional_fail: true,
                     });
                 }
                 if is_may_assume_call(instruction) || is_may_type_bound_call(instruction) {
@@ -445,6 +458,7 @@ fn should_skip_instruction(instruction: Instruction) -> bool {
     is_may_assert_call(instruction)
         || is_may_assume_call(instruction)
         || is_may_type_bound_call(instruction)
+        || is_unconditional_fail_call(instruction)
         || is_noise_call(instruction)
 }
 
@@ -471,6 +485,25 @@ fn is_may_assume_call(instruction: Instruction) -> bool {
 /// identity, SP = `pre AND cond`) rather than a regular `Assume`.
 fn is_may_type_bound_call(instruction: Instruction) -> bool {
     instruction.get_called_function().as_deref() == Some("may_type_bound")
+}
+
+/// Return `true` if `instruction` is a call to a known error-termination
+/// sentinel that must never be reached on a safe execution.
+///
+/// These functions are treated as `may_assert(false)`: the call site is
+/// stripped from the visible CFG and recorded as an [`AssertSite`] with
+/// `is_unconditional_fail: true`.  The adapter emits `Formula::False` as
+/// the obligation, so the backward analysis must prove the site unreachable.
+///
+/// Recognized names:
+/// - `reach_error` — SV-COMP unreach-call property marker
+/// - `__assert_fail` — C standard library assert macro implementation
+/// - `__VERIFIER_error` — older SV-COMP error sentinel
+fn is_unconditional_fail_call(instruction: Instruction) -> bool {
+    matches!(
+        instruction.get_called_function().as_deref(),
+        Some("reach_error") | Some("__assert_fail") | Some("__VERIFIER_error")
+    )
 }
 
 fn is_noise_call(instruction: Instruction) -> bool {
@@ -602,6 +635,34 @@ mod tests {
                     graph.assumes[0].assumed_value.display_name(),
                     "%cond".to_string()
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn reach_error_is_recorded_as_unconditional_fail_and_stripped() {
+        with_graphs(
+            r#"
+                declare void @reach_error()
+
+                define void @main(i1 %cond) {
+                entry:
+                    br i1 %cond, label %ok, label %err
+                err:
+                    call void @reach_error()
+                    ret void
+                ok:
+                    ret void
+                }
+            "#,
+            |graphs| {
+                let graph = &graphs[0];
+                assert_eq!(graph.asserts.len(), 1);
+                assert!(graph.asserts[0].is_unconditional_fail);
+                assert!(graph
+                    .vertices
+                    .iter()
+                    .all(|instruction| !instruction.print().contains("@reach_error")));
             },
         );
     }

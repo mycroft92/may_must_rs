@@ -2,39 +2,29 @@
 //!
 //! # Responsibilities
 //!
-//! This module drives the full interprocedural analysis of an LLVM module:
+//! 1. **Return-summary inference** — for each function a [`ReturnSummary`]
+//!    relating the return value to formal parameters is computed.  Acyclic
+//!    functions use `compute_return_summary`; looping functions that observe an
+//!    array argument use the *observer pattern* ([`infer_cyclic_observer_summary`]).
 //!
-//! 1. **Return-summary inference** — for each function, a [`ReturnSummary`]
-//!    relating the return value to the formal parameters is computed.  Acyclic
-//!    functions are handled directly by `compute_return_summary`; looping
-//!    functions that observe an array argument are handled by the *observer
-//!    pattern* ([`infer_cyclic_observer_summary`]).
+//! 2. **Per-function verification** — [`analyze_with_summaries`] lowers a
+//!    [`FunctionGraph`] via the adapter, synthesises loop invariants via
+//!    [`discover_loop_invariants`], and enqueues one assertion query per
+//!    [`AssertionSite`] into the [`Scheduler`].
 //!
-//! 2. **Call order / recursion detection** — [`recursive_functions`] identifies
-//!    mutually recursive functions so their summaries can be flagged.
-//!
-//! 3. **Per-function verification** — [`analyze_with_summaries`] lowers a
-//!    [`FunctionGraph`] via the adapter, synthesises loop invariants once per
-//!    function via [`discover_loop_invariants`], and calls [`analyze_with_tables`]
-//!    for each [`AssertionSite`].
+//! 3. **Recursion detection** — [`recursive_functions`] identifies mutually
+//!    recursive functions so their [`ProcedureReport`] can be flagged.
 //!
 //! # Observer pattern for cyclic callees
 //!
 //! When a looping callee reads an array parameter and returns a summary value
-//! (e.g. a maximum or sum), [`infer_cyclic_observer_summary`] synthesises an
+//! (e.g. maximum or sum), [`infer_cyclic_observer_summary`] synthesises an
 //! invariant by examining which array indices the function accesses, then
 //! verifying a candidate relation `retval >= array[i]` via the full
 //! bidirectional check.  [`observer_summary_invariants`] runs initiation,
 //! inductiveness, and exit-closure checks against the real assertion
-//! postconditions, returning [`VerifiedLoopInvariant`] values.  These are
-//! passed directly to [`analyze_with_tables`] which completes the proof.
-
-#![allow(dead_code)]
-
-// `rayon` was used by the previous per-assertion `par_iter` over
-// `adapted.assertions`.  The query-driven scheduler dispatches sequentially
-// today; parallelism over disjoint procedures will return as an
-// optimisation once the cross-procedure scheduler is in place.
+//! postconditions and returns [`VerifiedLoopInvariant`] values passed directly
+//! to [`analyze_with_tables`].
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, SourceLocation};
 use crate::common::adapter::{
     adapt, adapt_with_purity_and_summaries, collect_callee_names, compute_return_summary,
@@ -51,7 +41,7 @@ use crate::may_must_analysis::backward::{
 };
 use crate::may_must_analysis::loops::{
     check_loop_invariant_verbose, detect_loops, normalize_candidate, sort_innermost_first,
-    InvariantCheckResult, LoopInfo, VerifiedLoopInvariant,
+    InvariantCheckResult, VerifiedLoopInvariant,
 };
 use crate::may_must_analysis::providers::{CandidateProvider, NoProvider};
 use crate::may_must_analysis::rules::{Judgement, RuleEngine};
@@ -155,8 +145,8 @@ pub fn analyze_function_graph(
 /// Analyse every function in an LLVM module and return a [`ModuleReport`].
 ///
 /// Convenience wrapper that runs with a default [`InvariantConfig`] and no
-/// external candidate provider.  See [`analyze_module_with_llm`] for the
-/// full pipeline description.
+/// external candidate provider.  See [`analyze_module_with_llm`] for the full
+/// pipeline description.
 pub fn analyze_module(
     graphs: &[FunctionGraph],
     memory_pure: &BTreeSet<String>,
@@ -185,21 +175,6 @@ pub fn analyze_module_with_provider(
     )
 }
 
-/// Full whole-module analysis entry point.
-///
-/// Orchestrates the following passes in order:
-///
-/// 0. Run [`run_alias_analysis`] once on the entire module.  The resulting
-///    [`AliasResult`] is shared across all lowering calls so that
-///    `resolve_memory_effects` can resolve pointer operations that the local
-///    `PointerEnv` alone cannot handle.
-/// 1. Load manually-provided summaries from `provider` for any callee not
-///    defined in the module.
-/// 2. Iteratively infer [`ReturnSummary`] entries for all in-module functions
-///    (up to `graphs.len()` rounds to converge mutual calls).
-/// 3. Convert inferred summaries to must/not-may entries in [`SummaryTables`].
-/// 4. Run [`analyze_with_summaries`] for each function using `inv_config` to
-///    control the invariant search, and collect per-procedure reports.
 pub fn analyze_module_with_llm(
     graphs: &[FunctionGraph],
     memory_pure: &BTreeSet<String>,
@@ -210,10 +185,6 @@ pub fn analyze_module_with_llm(
     let alias = run_alias_analysis(graphs);
     let mut summaries = CallSummaryRegistry::new();
 
-    // Pre-scan all graphs to build the module-wide vtable map.  This ensures that vtable
-    // entries discovered in one function (e.g. a C++ constructor that stores the vptr) are
-    // available in all other functions during adaptation, even if those functions never
-    // directly reference the vtable global.
     for graph in graphs {
         summaries.scan_graph_vtables(graph);
     }
@@ -352,7 +323,6 @@ pub fn analyze_with_summaries(
     } else {
         adapt_with_purity_and_summaries(graph, memory_pure, summaries, &alias)?
     };
-    // Discover InductiveHints once per function (no exit closure, no assertion site yet).
     let precomputed_hints: Option<Vec<(CfgNodeId, Formula)>> = tables
         .and_then(|tables| {
             let invariants = tables.get_loop_invariants(&adapted.name);
@@ -368,20 +338,8 @@ pub fn analyze_with_summaries(
             )
         });
 
-    // Build top-level queries from assertions and drain them through the
-    // query-driven scheduler.  Behaviour identical to the previous
-    // per-assertion par_iter: each query still ultimately calls
-    // `run_smash` via `Scheduler::dispatch_next`.  The reason for this
-    // routing is so subsequent steps (CREATE_*_SUMMARY, contextual call
-    // mediation, recursion) can be added inside the scheduler without
-    // touching the driver again.  See `design_notes/QUERY_REFACTOR.md`.
     let legacy_tables_for_scheduler: SummaryTables = tables.cloned().unwrap_or_default();
     let mut sched = scheduler::Scheduler::new();
-    // Register this procedure with the scheduler.  Step 6A: the scheduler
-    // is per-module, so callers that want cross-procedure summary sharing
-    // can register multiple procedures into one scheduler.  This call
-    // site (analyze_with_summaries — one procedure at a time) registers
-    // just one.
     let interface = crate::may_must_analysis::query::ProcedureInterface::new(
         adapted.name.clone(),
         adapted.formal_parameters.iter().cloned(),
@@ -402,8 +360,6 @@ pub fn analyze_with_summaries(
         } else {
             None
         };
-        // For top-level assertion queries, `post = WP(site.transfer, ¬obligation)`
-        // and `pre = True` (no caller constraint).  See QUERY_REFACTOR.md §1.
         let neg_obligation = Formula::not(site.obligation.clone());
         let pre_at_assertion = match adapted.cfg.node(site.node) {
             Ok(node) => node.transfer.wp(&neg_obligation),
@@ -432,10 +388,6 @@ pub fn analyze_with_summaries(
     let mut assertions = Vec::new();
     let failures: Vec<String> = Vec::new();
     for run in site_results {
-        // Newly discovered must-paths could be merged back into `db` for
-        // cross-assertion / cross-procedure cross-feed once that step lands;
-        // for now we keep this layer additive and just collect the verdicts.
-        let _ = &run.new_must_paths;
         assertions.push(run.assertion);
     }
 
@@ -475,28 +427,6 @@ fn infer_return_summary(
     })
 }
 
-/// Infer a return summary for a looping function that observes an array argument.
-///
-/// This implements the *observer pattern*: if a function iterates over an array
-/// pointer parameter and returns a value derived from the array elements, this
-/// function attempts to prove relations of the form
-/// `retval >= array[i]` for each candidate index `i`.
-///
-/// The approach:
-/// 1. Skip acyclic functions and functions without pointer parameters.
-/// 2. For each pointer parameter, scan the CFG for accessed indices
-///    ([`observer_candidate_indices`]).
-/// 3. For each index, construct a synthetic assertion site at the function exit
-///    and call [`observer_summary_invariants`] to get a loop invariant.
-/// 4. Run the full [`analyze_with_tables`] bidirectional check to verify the
-///    obligation.
-/// 5. Collect all verified relations into a conjunction forming the
-///    [`ReturnSummary`].
-///
-/// # Example
-///
-/// For a function `find_max(array, n)` that returns the maximum element,
-/// this synthesises the summary: `retval >= array[0] && retval >= array[1] && ...`
 fn infer_cyclic_observer_summary(
     graph: &FunctionGraph,
     adapted: &AdaptedProcedure,
@@ -867,26 +797,6 @@ fn const_int_value(term: &Term) -> Option<i64> {
     }
 }
 
-/// Synthesise loop invariants needed to discharge an observer-pattern obligation.
-///
-/// For each detected loop the function examines the preliminary backward state
-/// at the header (the state propagated backward from the synthetic exit
-/// assertion with back edges cut).  It expects the header state to contain a
-/// conjunct of the form `counter >= exit_value` (exit condition) and a
-/// comparison `accumulator < observed_value` (the potential violation), and
-/// constructs the disjunctive invariant:
-///
-/// ```text
-/// counter <= observed_index  OR  accumulator >= observed_value
-/// ```
-///
-/// The invariant is checked for all three conditions — initiation, inductiveness,
-/// and **exit closure** — via [`check_loop_invariant_verbose`] with real
-/// `assertion_postconditions` derived from the assertion site.  The result is a
-/// [`VerifiedLoopInvariant`] suitable for direct use in [`run_backward`].
-///
-/// The [`analyze_with_tables`] call in [`infer_cyclic_observer_summary`] then
-/// runs the full bidirectional check using these pre-verified invariants.
 fn observer_summary_invariants(
     cfg: &AbstractCfg,
     site: &AssertionSite,
@@ -965,76 +875,6 @@ fn preliminary_backward_states(
         .collect())
 }
 
-fn loop_counter_term(cfg: &AbstractCfg, loop_info: &LoopInfo) -> Option<Term> {
-    for edge_id in cfg.outgoing_edges(loop_info.header) {
-        let edge = cfg.edge(edge_id).ok()?;
-        if loop_info.body.contains(&edge.target) {
-            if let Some(counter) = counter_term_from_guard(&edge.guard) {
-                return Some(counter);
-            }
-        }
-    }
-    counter_term_from_guard(&loop_info.back_edge_guard)
-}
-
-fn counter_term_from_guard(guard: &Formula) -> Option<Term> {
-    match guard {
-        Formula::Lt(lhs, _) | Formula::Le(lhs, _) => Some(lhs.clone()),
-        Formula::Not(inner) => match inner.as_ref() {
-            Formula::Ge(lhs, _) | Formula::Gt(lhs, _) => Some(lhs.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn summary_accumulator_term(cfg: &AbstractCfg, site: &AssertionSite) -> Option<Term> {
-    let pre = cfg
-        .node(site.node)
-        .ok()?
-        .transfer
-        .wp(&Formula::not(site.obligation.clone()));
-    match pre {
-        Formula::Not(inner) => match *inner {
-            Formula::Ge(lhs, _) => Some(lhs),
-            Formula::Le(_, rhs) => Some(rhs),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn summary_observed_term(cfg: &AbstractCfg, site: &AssertionSite) -> Option<Term> {
-    let pre = cfg
-        .node(site.node)
-        .ok()?
-        .transfer
-        .wp(&Formula::not(site.obligation.clone()));
-    match pre {
-        Formula::Not(inner) => match *inner {
-            Formula::Ge(_, rhs) => Some(rhs),
-            Formula::Le(lhs, _) => Some(lhs),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Extract `(counter_term, accumulator_term, observed_term)` from a header
-/// backward state formula.
-///
-/// The formula is expected to be a conjunction containing:
-/// - One conjunct matching [`extract_exit_counter`] — the loop exit condition
-///   (e.g. `i >= n`).
-/// - One conjunct matching [`extract_lt_pair`] — the potential violation
-///   (e.g. `acc < array[i]`).
-///
-/// Returns `None` if either component is missing.
-///
-/// # Purpose
-///
-/// Used by [`observer_summary_invariants`] to decompose the backward state
-/// into components for building the observer-pattern invariant.
 fn extract_counter_acc_obs(formula: &Formula) -> Option<(Term, Term, Term)> {
     let conjuncts: Vec<&Formula> = match formula {
         Formula::And(items) => items.iter().collect(),
@@ -1060,17 +900,7 @@ fn extract_counter_acc_obs(formula: &Formula) -> Option<(Term, Term, Term)> {
     Some((counter, acc, obs))
 }
 
-/// Extract the left-hand side of a loop exit condition of the form
-/// `lhs >= rhs`, `lhs > rhs`, `NOT (lhs < rhs)`, or `NOT (lhs <= rhs)`.
-///
-/// This is used by [`extract_counter_acc_obs`] to identify the counter
-/// variable after the loop has terminated.
-///
-/// # Examples
-///
-/// - `i >= n` → `Some(i)`
-/// - `NOT (i < n)` → `Some(i)`
-/// - `i < n` → `None` (not an exit condition)
+/// Extract the LHS of a loop exit condition (`lhs >= rhs`, `NOT (lhs < rhs)`, etc.).
 fn extract_exit_counter(formula: &Formula) -> Option<Term> {
     match formula {
         Formula::Ge(lhs, _) | Formula::Gt(lhs, _) => Some(lhs.clone()),
@@ -1606,6 +1436,61 @@ mod tests {
                 main_report.verdict()
             );
         });
+    }
+
+    #[test]
+    fn reach_error_on_unreachable_branch_is_safe() {
+        // reach_error() called only on the false branch of (x == x), which is
+        // never taken.  The checker must prove the call site unreachable and
+        // return Safe.
+        with_graphs(
+            r#"
+                declare void @reach_error()
+
+                define void @main(i32 %x) {
+                entry:
+                    %eq = icmp eq i32 %x, %x
+                    br i1 %eq, label %ok, label %err
+                err:
+                    call void @reach_error()
+                    ret void
+                ok:
+                    ret void
+                }
+            "#,
+            |graphs| {
+                let oracle = Oracle::new();
+                let report = analyze_function_graph(&graphs[0], &oracle).unwrap();
+                assert_eq!(report.verdict(), SafetyVerdict::Safe);
+            },
+        );
+    }
+
+    #[test]
+    fn reach_error_on_reachable_branch_is_unsafe() {
+        // reach_error() is called on the false branch of (x == 0), which is
+        // reachable for x != 0.  The checker must find a counterexample.
+        with_graphs(
+            r#"
+                declare void @reach_error()
+
+                define void @main(i32 %x) {
+                entry:
+                    %eq = icmp eq i32 %x, 0
+                    br i1 %eq, label %ok, label %err
+                err:
+                    call void @reach_error()
+                    ret void
+                ok:
+                    ret void
+                }
+            "#,
+            |graphs| {
+                let oracle = Oracle::new();
+                let report = analyze_function_graph(&graphs[0], &oracle).unwrap();
+                assert_eq!(report.verdict(), SafetyVerdict::Unsafe);
+            },
+        );
     }
 
     #[test]

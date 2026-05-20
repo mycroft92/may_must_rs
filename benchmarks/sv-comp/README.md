@@ -63,11 +63,21 @@ benchmarks/sv-comp/
 
 ### Sentinel mapping
 
-| SV-COMP sentinel | Our intrinsic | Semantics |
+| SV-COMP sentinel | Encoding | Semantics |
 |---|---|---|
-| `__VERIFIER_error()` | `may_assert((_Bool)0)` | Assert false — prove this call is unreachable |
-| `__VERIFIER_assume(cond)` | `assume((_Bool)(cond))` | Prune infeasible paths |
+| `__VERIFIER_error()` | `may_assert((_Bool)0)` macro (shim) | Assert false — prove this call is unreachable |
+| `reach_error()` | `may_assert((_Bool)0)` natively + macro (shim) | Same as `__VERIFIER_error`; used by `__VERIFIER_assert` bodies |
+| `__assert_fail(...)` | `may_assert(false)` natively | C library assert macro expansion — site must be unreachable |
+| `__VERIFIER_assume(cond)` | `assume((_Bool)(cond))` macro (shim) | Prune infeasible paths |
 | `__VERIFIER_nondet_*()`  | extern stub | Unconstrained input — models nondeterminism |
+
+**Native encoding:** `reach_error`, `__assert_fail`, and `__VERIFIER_error` are
+recognized directly by `program_graph.rs` and recorded as false-assertion sites
+with `is_unconditional_fail: true`.  The adapter emits `Formula::False` as the
+obligation, so the backward analysis must prove the call site is unreachable.
+The shim macros in `svcomp_shim.h` provide a second layer for cases where these
+functions are defined in the benchmark (their bodies are stripped by `convert.py`
+so the remaining call sites see the macro).
 
 ### Conversion pipeline (per file)
 

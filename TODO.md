@@ -80,16 +80,12 @@ semantics change.
 
 ## Deprecated scaffolding (delete in a future cleanup)
 
-- `smash::MustPathSummary` — v0.14 scaffolding, replaced by
-  `query::ContextualMustSummary`.
-- `smash::SmashSummaryDB` — v0.14 scaffolding, replaced by
-  `query::ContextualSummaryTable`.  `run_smash` will be simplified to
-  take `&SummaryTables` directly.
+- `smash::SmashSummaryDB` — v0.14 scaffolding wrapping `SummaryTables`.
+  `run_smash` will be simplified to take `&SummaryTables` directly when the
+  query-driven refactor removes the wrapper.
 - `smash::SmashRunResult` / `smash::VerdictEngine` — superseded by
-  `scheduler::DispatchOutcome` carrying `AssertionResult` directly.
-- Root-level `loop_redesign.md`, `Loop_search_and_use.md`, and the
-  case-equivalent `LOOPS.md`/`loops.md` — deleted (superseded by
-  `design_notes/LOOPS.md`).
+  `scheduler::DispatchOutcome` carrying `AssertionResult` directly once the
+  transitional path through `run_smash` is removed.
 
 ## Soundness debt (paper-violating behaviours)
 

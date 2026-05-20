@@ -119,6 +119,18 @@ The header declares two sentinel functions:
   is `c AND post`, ensuring that paths where `c` is false (which the assume
   would have pruned) are excluded from the violation precondition.
 
+The tool also natively recognizes three error-termination sentinels without
+requiring any header:
+- `reach_error()` — SV-COMP unreach-call property marker.
+- `__assert_fail(...)` — C standard library assert macro expansion.
+- `__VERIFIER_error()` — older SV-COMP error sentinel.
+
+Calls to any of these are treated as `may_assert(false)`: the call site is
+stripped from the visible CFG and recorded as an obligation that must be
+unreachable. The backward analysis propagates `True` from these sites, so
+`reach AND True = reach`; if the path to the call is empty, the result is
+`Verified`.
+
 If `<assert.h>` is also included, `verification.h` shadows its `assert`
 definition — include `verification.h` last (or first — it unconditionally
 `#undef`s `assert`).

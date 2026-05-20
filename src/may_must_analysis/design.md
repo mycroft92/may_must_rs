@@ -45,7 +45,8 @@ modules. Instead:
 `adapter.rs`
 
 - lowers a raw `FunctionGraph` into `AdaptedProcedure`
-- records assertion sites
+- records assertion sites; `reach_error`/`__assert_fail`/`__VERIFIER_error`
+  calls become `AssertionSite { obligation: Formula::False }` (must-unreachable)
 - maps `phi` nodes to predecessor-edge assignments
 - lowers branches to edge guards
 - rewrites memory effects through the integer-array model, using `AliasResult`

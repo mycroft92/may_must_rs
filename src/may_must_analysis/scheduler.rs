@@ -1,29 +1,21 @@
 //! Demand-driven query worklist scheduler.
 //!
-//! Per `design_notes/QUERY_REFACTOR.md`, this module owns the work queue
-//! that drives intra-procedural analysis from top-level assertion queries
-//! plus (eventually) call-spawned sub-queries.
+//! Owns the work queue that drives intra-procedural analysis from top-level
+//! assertion queries.  See `design_notes/QUERY_REFACTOR.md` for the full
+//! architectural design.
 //!
-//! # Scope (steps 3, 5, 6A)
+//! # Current scope
 //!
-//! - `Scheduler` is **per-module**: it owns a [`ProcedureContext`] for
-//!   every procedure in the module and a shared
-//!   [`ContextualSummaryTable`] that all dispatches read from and write
-//!   into.  Step 6A: a single `Scheduler` for the whole module so that
-//!   summaries created by one procedure's analysis become available to
-//!   the others without an extra plumbing step.
-//! - `enqueue(query)` adds a query; `dispatch_next()` pops one and runs
-//!   the existing intra-procedural analysis (`run_smash` internals)
-//!   against the CFG owned by the registered procedure context.
-//! - Calls are still inlined eagerly via the legacy `ReturnSummary` path
-//!   (no sub-query spawning yet — that's step 6B/6C).
-//! - No subsumption-aware caching of *queries* yet (step 7).
-
-#![allow(dead_code)]
-// `smash::SmashSummaryDB` is deprecated scaffolding still used by the
-// transitional `run_smash` entry point.  This module's references will
-// disappear when `run_smash` takes `&SummaryTables` directly.
-#![allow(deprecated)]
+//! - [`Scheduler`] is **per-module**: it registers one [`ProcedureContext`]
+//!   per procedure and shares a [`ContextualSummaryTable`] across all
+//!   dispatches so that summaries produced by one procedure become available
+//!   to others without an extra plumbing step.
+//! - [`Scheduler::enqueue`] adds an assertion query; [`Scheduler::drain`]
+//!   pops and dispatches each one via [`smash::run_smash`], collecting
+//!   [`DispatchOutcome`]s.
+//! - Calls are still inlined eagerly via the legacy [`ReturnSummary`] path
+//!   (call-spawned sub-queries are a future step).
+//! - Query-result subsumption caching (step 7 of QUERY_REFACTOR) is pending.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -226,7 +218,6 @@ impl Scheduler {
                 // Existing intra-procedural analysis path.
                 let db = SmashSummaryDB {
                     tables: legacy_tables.clone(),
-                    must_paths: BTreeMap::new(),
                 };
                 let run = smash::run_smash(
                     &ctx.cfg,

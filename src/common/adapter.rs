@@ -1822,7 +1822,11 @@ fn lower_assertions(
     let mut sites = Vec::new();
     for (index, site) in graph.asserts.iter().enumerate() {
         let node = choose_assert_node(site, instruction_nodes).ok_or(AdapterError::MissingStart)?;
-        let obligation = lower_bool_value(function_name, site.asserted_value)?;
+        let obligation = if site.is_unconditional_fail {
+            Formula::False
+        } else {
+            lower_bool_value(function_name, site.asserted_value)?
+        };
         sites.push(AssertionSite {
             id: index + 1,
             node,

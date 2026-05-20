@@ -1,24 +1,22 @@
-#![allow(dead_code)]
-
 //! Safe-ish Rust boundary around the LLVM C API.
 //!
 //! This module is intentionally the narrowest place where most `unsafe` LLVM
-//! calls live. The rest of the analyzer should work with small copyable wrapper
+//! calls live. The rest of the analyzer works with small copyable wrapper
 //! types (`Module`, `Function`, `BasicBlock`, `Instruction`) instead of raw
 //! `LLVM*Ref` pointers. That keeps the design honest:
 //!
-//! - ownership and disposal live near the C API (`Drop` for `Context` and
-//!   `Module`);
-//! - callers get Rust `Option`/`Vec`/`String` results instead of null pointers;
-//! - pointer identity remains available for graph keys by deriving `Hash`/`Eq`
-//!   on the wrapper types;
-//! - adding new LLVM queries means adding one wrapper method here rather than
+//! - Ownership and disposal live near the C API (`Drop` for `Context` and
+//!   `Module`).
+//! - Callers get Rust `Option`/`Vec`/`String` results instead of null pointers.
+//! - Pointer identity is preserved for graph keys via `Hash`/`Eq` derived on
+//!   the wrapper types.
+//! - Adding new LLVM queries means adding one wrapper method here rather than
 //!   spreading `unsafe` through analysis code.
 //!
-//! These wrappers are not a complete type-safe LLVM binding. They are a local
-//! boundary for the subset of LLVM IR the analyzer currently needs. No paper
-//! reasoning should be implemented here; this file exists only to query LLVM
-//! safely enough for the raw graph builder and later loop/call lowering.
+//! These wrappers are not a complete type-safe LLVM binding — only the subset
+//! of LLVM IR the analyzer currently needs. No paper reasoning belongs here;
+//! this file exists only to query LLVM safely enough for the raw graph builder
+//! and later loop/call lowering.
 
 use crate::common::source::SourceLocation;
 use llvm_sys::bit_reader::*;
@@ -33,188 +31,84 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr;
 
-// DbgRecord content APIs present in LLVM 20 but not yet wrapped in llvm-sys.
-extern "C" {
-    fn LLVMDbgVariableRecordGetValue(Record: LLVMDbgRecordRef) -> LLVMValueRef;
-    fn LLVMDbgVariableRecordGetVariable(Record: LLVMDbgRecordRef) -> LLVMMetadataRef;
-}
-
 /// A Rust-friendly mirror of `LLVMOpcode`, covering the subset of LLVM IR
-/// opcodes that the analyzer cares about.
+/// opcodes the analyzer cares about.
 ///
 /// The conversion from `LLVMOpcode` is exhaustive for all opcodes present in
 /// the version of `llvm-sys` in use; any opcode not listed maps to [`Unknown`].
-/// Analysis code should match on concrete variants rather than relying on the
-/// printed IR text, so that lowering stays independent of LLVM's textual format.
-///
-/// Variants are grouped by the LLVM IR Reference categories:
-/// terminators, unary/binary arithmetic, logical, memory, cast, and other.
+/// Analysis code should match on concrete variants rather than relying on
+/// LLVM's textual format, so that lowering stays independent of IR printing.
 ///
 /// [`Unknown`]: InstructionOpcode::Unknown
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstructionOpcode {
-    // Terminator Instructions
-    /// `ret` — returns control (and optionally a value) to the caller.
     Ret,
-    /// `br` — conditional or unconditional branch; examined by the CFG builder
-    /// to wire successor edges between basic blocks.
     Br,
-    /// `switch` — multi-way branch on an integer value.
     Switch,
-    /// `indirectbr` — branch to an address stored in a register (e.g. computed
-    /// goto). The analyzer does not fully model indirect control flow.
     IndirectBr,
-    /// `invoke` — call with an associated unwind destination; treated like a
-    /// regular call for purposes of the current analysis.
     Invoke,
-    /// `resume` — resumes propagation of an in-flight exception.
     Resume,
-    /// `unreachable` — tells LLVM (and the analyzer) that this point is
-    /// unreachable; the backward analysis treats it as a trivially-verified
-    /// sink.
     Unreachable,
-    /// `cleanupret` — returns from a cleanup pad (C++ EH).
     CleanupRet,
-    /// `catchret` — returns from a catch pad (C++ EH).
     CatchRet,
-    /// `catchswitch` — dispatches to catch handlers (C++ EH).
     CatchSwitch,
-    /// `callbr` — call that may also branch to inline-asm labels (used by GCC
-    /// `asm goto`). The analyzer treats this as an unknown terminator.
     CallBr,
-
-    // Standard Unary Operators
-    /// `fneg` — floating-point negation.
     FNeg,
-
-    // Standard Binary Operators
-    /// `add` — integer addition (wraps on overflow in two's-complement).
     Add,
-    /// `fadd` — floating-point addition.
     FAdd,
-    /// `sub` — integer subtraction.
     Sub,
-    /// `fsub` — floating-point subtraction.
     FSub,
-    /// `mul` — integer multiplication.
     Mul,
-    /// `fmul` — floating-point multiplication.
     FMul,
-    /// `udiv` — unsigned integer division.
     UDiv,
-    /// `sdiv` — signed integer division.
     SDiv,
-    /// `fdiv` — floating-point division.
     FDiv,
-    /// `urem` — unsigned integer remainder.
     URem,
-    /// `srem` — signed integer remainder.
     SRem,
-    /// `frem` — floating-point remainder.
     FRem,
-
-    // Logical Operators
-    /// `shl` — left shift.
     Shl,
-    /// `lshr` — logical (unsigned) right shift.
     LShr,
-    /// `ashr` — arithmetic (signed) right shift.
     AShr,
-    /// `and` — bitwise AND.
     And,
-    /// `or` — bitwise OR.
     Or,
-    /// `xor` — bitwise XOR; `xor x, -1` is the canonical LLVM `not`.
     Xor,
-
-    // Memory Operators
-    /// `alloca` — stack allocation; lowered to a named `stack_N` region in
-    /// `adapter.rs`.
     Alloca,
-    /// `load` — read from memory; lowered to an SMT `select` expression.
     Load,
-    /// `store` — write to memory; lowered to a `MemoryStore` effect.
     Store,
-    /// `getelementptr` — pointer arithmetic / struct-field offset computation.
     GetElementPtr,
-    /// `fence` — memory ordering barrier; not modelled by the current analysis.
     Fence,
-    /// `cmpxchg` — atomic compare-and-swap; not modelled.
     AtomicCmpXchg,
-    /// `atomicrmw` — atomic read-modify-write; not modelled.
     AtomicRMW,
-
-    // Cast Operators
-    /// `trunc` — truncate integer to a narrower type.
     Trunc,
-    /// `zext` — zero-extend integer to a wider type.
     ZExt,
-    /// `sext` — sign-extend integer to a wider type.
     SExt,
-    /// `fptoui` — floating-point to unsigned integer conversion.
     FPToUI,
-    /// `fptosi` — floating-point to signed integer conversion.
     FPToSI,
-    /// `uitofp` — unsigned integer to floating-point conversion.
     UIToFP,
-    /// `sitofp` — signed integer to floating-point conversion.
     SIToFP,
-    /// `fptrunc` — floating-point narrowing conversion.
     FPTrunc,
-    /// `fpext` — floating-point widening conversion.
     FPExt,
-    /// `ptrtoint` — pointer to integer cast.
     PtrToInt,
-    /// `inttoptr` — integer to pointer cast.
     IntToPtr,
-    /// `bitcast` — reinterpret cast (no-op at the bit level).
     BitCast,
-    /// `addrspacecast` — cast between address spaces.
     AddrSpaceCast,
-
-    // Other Operators
-    /// `icmp` — integer comparison; the predicate is retrieved with
-    /// [`Instruction::get_icmp_predicate`].
     ICmp,
-    /// `fcmp` — floating-point comparison; predicate via
-    /// [`Instruction::get_fcmp_predicate`].
     FCmp,
-    /// `phi` — SSA φ-node; incoming (block, value) pairs are enumerated by
-    /// [`Instruction::get_phi_incomings`].
     PHI,
-    /// `call` — direct or indirect function call; the callee name (if
-    /// statically known) is available via [`Instruction::get_called_function`].
     Call,
-    /// `select` — ternary conditional `(cond ? a : b)`, does not create a new
-    /// basic block.
     Select,
-    /// Reserved for use by LLVM front-ends; not generated by standard Clang.
     UserOp1,
-    /// Reserved for use by LLVM front-ends; not generated by standard Clang.
     UserOp2,
-    /// `va_arg` — variadic argument extraction.
     VAArg,
-    /// `extractelement` — extract a lane from a vector.
     ExtractElement,
-    /// `insertelement` — insert a lane into a vector.
     InsertElement,
-    /// `shufflevector` — permute or combine vectors.
     ShuffleVector,
-    /// `extractvalue` — extract a field from an aggregate (struct/array).
     ExtractValue,
-    /// `insertvalue` — insert a field into an aggregate.
     InsertValue,
-    /// `landingpad` — marks the entry of an EH landing pad.
     LandingPad,
-    /// `cleanuppad` — marks the entry of a cleanup pad (C++ EH).
     CleanupPad,
-    /// `catchpad` — marks the entry of a catch pad (C++ EH).
     CatchPad,
-    /// `freeze` — converts `undef`/`poison` to a fixed but unspecified value.
     Freeze,
-
-    /// Catch-all for any opcode not explicitly listed above, or for opcodes
-    /// introduced in a newer LLVM version than this binding was written for.
     Unknown,
 }
 
@@ -706,51 +600,31 @@ impl Function {
         }
     }
 
-    /// Build a map from alloca `Instruction` → source variable name by scanning
-    /// all instructions in the function for `#dbg_declare` records.
+    /// Build a map from alloca `Instruction` → source variable name.
     ///
-    /// The result is used by the adapter to annotate abstract memory regions
-    /// (`main$stack0`, `main$stack1`, …) with human-readable source names for
-    /// debug display.  Returns an empty map when no LLVM debug info is present.
+    /// For `-O0` IR the alloca's SSA name IS the C source variable name
+    /// (clang preserves it).  Returns an empty map when no names are present.
     pub fn collect_alloca_debug_names(&self) -> HashMap<Instruction, String> {
         let mut map = HashMap::new();
         unsafe {
-            let module = LLVMGetGlobalParent(self.0);
-            let context = LLVMGetModuleContext(module);
             let mut bb = LLVMGetFirstBasicBlock(self.0);
             while !bb.is_null() {
                 let mut inst = LLVMGetFirstInstruction(bb);
                 while !inst.is_null() {
-                    let mut record = LLVMGetFirstDbgRecord(inst);
-                    while !record.is_null() {
-                        let val = LLVMDbgVariableRecordGetValue(record);
-                        // Only care about alloca-backed declarations.
-                        if !val.is_null() && !LLVMIsAAllocaInst(val).is_null() {
-                            let meta = LLVMDbgVariableRecordGetVariable(record);
-                            if !meta.is_null() {
-                                let meta_val = LLVMMetadataAsValue(context, meta);
-                                if !meta_val.is_null() && LLVMGetMDNodeNumOperands(meta_val) >= 2 {
-                                    let mut ops = vec![
-                                        ptr::null_mut();
-                                        LLVMGetMDNodeNumOperands(meta_val) as usize
-                                    ];
-                                    LLVMGetMDNodeOperands(meta_val, ops.as_mut_ptr());
-                                    // Operand 1 of DILocalVariable is the name MDString.
-                                    let name_op = ops[1];
-                                    if !name_op.is_null() {
-                                        let mut str_len = 0u32;
-                                        let str_ptr = LLVMGetMDString(name_op, &mut str_len);
-                                        if !str_ptr.is_null() && str_len > 0 {
-                                            let name = CStr::from_ptr(str_ptr)
-                                                .to_string_lossy()
-                                                .into_owned();
-                                            map.insert(Instruction(val), name);
-                                        }
-                                    }
-                                }
+                    if !LLVMIsAAllocaInst(inst).is_null() {
+                        let mut len = 0usize;
+                        let name_ptr = LLVMGetValueName2(inst, &mut len);
+                        if !name_ptr.is_null() && len > 0 {
+                            let name = std::str::from_utf8(std::slice::from_raw_parts(
+                                name_ptr as *const u8,
+                                len,
+                            ))
+                            .unwrap_or("")
+                            .to_owned();
+                            if !name.is_empty() {
+                                map.insert(Instruction(inst), name);
                             }
                         }
-                        record = LLVMGetNextDbgRecord(record);
                     }
                     inst = LLVMGetNextInstruction(inst);
                 }
