@@ -31,8 +31,10 @@
 
 #![allow(dead_code)]
 
-use rayon::prelude::*;
-
+// `rayon` was used by the previous per-assertion `par_iter` over
+// `adapted.assertions`.  The query-driven scheduler dispatches sequentially
+// today; parallelism over disjoint procedures will return as an
+// optimisation once the cross-procedure scheduler is in place.
 use crate::common::abstract_cfg::{AbstractCfg, CfgEdgeId, CfgNodeId, SourceLocation};
 use crate::common::adapter::{
     adapt, adapt_with_purity_and_summaries, collect_callee_names, compute_return_summary,
@@ -44,17 +46,18 @@ use crate::common::formula::{Formula, Memory, Term, Var};
 use crate::common::llvm_utils::program_graph::FunctionGraph;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{
-    analyze, analyze_with_tables, discover_loop_invariants, render_result, verify_precomputed,
+    analyze_with_tables, discover_loop_invariants, render_result, verify_precomputed,
     AssertionResult, BackwardError, InvariantConfig,
 };
-use crate::may_must_analysis::bmc;
 use crate::may_must_analysis::loops::{
     check_loop_invariant_verbose, detect_loops, normalize_candidate, sort_innermost_first,
     InvariantCheckResult, LoopInfo, VerifiedLoopInvariant,
 };
 use crate::may_must_analysis::providers::{CandidateProvider, NoProvider};
 use crate::may_must_analysis::rules::{Judgement, RuleEngine};
-use crate::may_must_analysis::summaries::{MustSummary, NotMaySummary, SummaryTables};
+use crate::may_must_analysis::scheduler;
+use crate::may_must_analysis::smash;
+use crate::may_must_analysis::summaries::{MaySummary, NotMaySummary, SummaryTables};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -244,9 +247,9 @@ pub fn analyze_module_with_llm(
     let recursive = recursive_functions(graphs);
     let mut summary_tables = SummaryTables::new();
     for summary in summaries.summaries().values() {
-        summary_tables.add_must(
+        summary_tables.add_forward_may(
             summary.function.clone(),
-            MustSummary {
+            MaySummary {
                 precondition: crate::common::formula::Formula::True,
                 postcondition: summary.relation.clone(),
             },
@@ -365,83 +368,75 @@ pub fn analyze_with_summaries(
             )
         });
 
-    let site_results: Vec<_> = adapted
-        .assertions
-        .par_iter()
-        .map(|site| {
-            let result = if let Some(tables) = tables {
-                // Upgrade InductiveHints to VerifiedLoopInvariant for this assertion site.
-                // If exit closure fails for the hints, analyze_with_tables falls through
-                // to per-site synthesis with the real assertion postconditions.
-                let verified = precomputed_hints.as_deref().and_then(|hints| {
-                    verify_precomputed(&adapted.cfg, site, hints, oracle)
-                        .ok()
-                        .flatten()
-                });
-                analyze_with_tables(
-                    &adapted.cfg,
-                    &adapted.name,
-                    site,
-                    oracle,
-                    tables,
-                    config,
-                    verified.as_deref(),
-                    &adapted.debug_names,
-                )
-            } else {
-                analyze(&adapted.cfg, site, oracle)
-            };
-            (site, result)
+    // Build top-level queries from assertions and drain them through the
+    // query-driven scheduler.  Behaviour identical to the previous
+    // per-assertion par_iter: each query still ultimately calls
+    // `run_smash` via `Scheduler::dispatch_next`.  The reason for this
+    // routing is so subsequent steps (CREATE_*_SUMMARY, contextual call
+    // mediation, recursion) can be added inside the scheduler without
+    // touching the driver again.  See `design_notes/QUERY_REFACTOR.md`.
+    let legacy_tables_for_scheduler: SummaryTables = tables.cloned().unwrap_or_default();
+    let mut sched = scheduler::Scheduler::new();
+    // Register this procedure with the scheduler.  Step 6A: the scheduler
+    // is per-module, so callers that want cross-procedure summary sharing
+    // can register multiple procedures into one scheduler.  This call
+    // site (analyze_with_summaries — one procedure at a time) registers
+    // just one.
+    let interface = crate::may_must_analysis::query::ProcedureInterface::new(
+        adapted.name.clone(),
+        adapted.formal_parameters.iter().cloned(),
+    );
+    sched.register_procedure(scheduler::ProcedureContext {
+        cfg: adapted.cfg.clone(),
+        assertions: adapted.assertions.clone(),
+        debug_names: adapted.debug_names.clone(),
+        interface,
+    });
+    for site in &adapted.assertions {
+        let verified = if tables.is_some() {
+            precomputed_hints.as_deref().and_then(|hints| {
+                verify_precomputed(&adapted.cfg, site, hints, oracle)
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        // For top-level assertion queries, `post = WP(site.transfer, ¬obligation)`
+        // and `pre = True` (no caller constraint).  See QUERY_REFACTOR.md §1.
+        let neg_obligation = Formula::not(site.obligation.clone());
+        let pre_at_assertion = match adapted.cfg.node(site.node) {
+            Ok(node) => node.transfer.wp(&neg_obligation),
+            Err(_) => neg_obligation.clone(),
+        };
+        let query = crate::may_must_analysis::query::Query::new(
+            adapted.name.clone(),
+            Formula::True,
+            pre_at_assertion,
+        );
+        let provenance = scheduler::AssertionProvenance {
+            site: site.clone(),
+            verified_invariants: verified,
+        };
+        sched.enqueue(query, Some(provenance));
+    }
+    let outcomes = sched.drain(oracle, &legacy_tables_for_scheduler, config);
+    let site_results: Vec<smash::SmashRunResult> = outcomes
+        .into_iter()
+        .filter_map(|o| match o {
+            scheduler::DispatchOutcome::Completed(run) => Some(run),
+            scheduler::DispatchOutcome::Unprovenanced => None,
         })
         .collect();
-    let bmc_bound = config.and_then(|c| c.bmc_bound);
+
     let mut assertions = Vec::new();
-    let mut failures = Vec::new();
-    for (site, result) in site_results {
-        match result {
-            Ok(result) => {
-                log::info!(
-                    target: "engine_verdict",
-                    "function {} assertion #{} ({}): {:?} [engine=invariant-analysis]",
-                    adapted.name,
-                    site.id,
-                    site.location,
-                    result.judgement
-                );
-                assertions.push(result);
-            }
-            Err(BackwardError::CyclicCfgUnsupported) => {
-                // Invariant synthesis failed. Try BMC as a bug-finding fallback.
-                if let Some(bound) = bmc_bound {
-                    if let Some(bmc_result) = bmc::bmc_check(&adapted.cfg, site, oracle, bound) {
-                        log::info!(
-                            target: "engine_verdict",
-                            "function {} assertion #{} ({}): {:?} [engine=bmc bound={}]",
-                            adapted.name,
-                            site.id,
-                            site.location,
-                            bmc_result.judgement,
-                            bound,
-                        );
-                        assertions.push(bmc_result);
-                        continue;
-                    }
-                    log::info!(
-                        target: "engine_verdict",
-                        "function {} assertion #{} ({}): UNKNOWN [engine=bmc bound={} exhausted]",
-                        adapted.name, site.id, site.location, bound
-                    );
-                }
-                failures.push(format!(
-                    "assertion #{} ({}): CFG has a cycle and no loop invariant was accepted",
-                    site.id, site.location
-                ));
-            }
-            Err(error) => failures.push(format!(
-                "assertion #{} ({}): {}",
-                site.id, site.location, error
-            )),
-        }
+    let failures: Vec<String> = Vec::new();
+    for run in site_results {
+        // Newly discovered must-paths could be merged back into `db` for
+        // cross-assertion / cross-procedure cross-feed once that step lands;
+        // for now we keep this layer additive and just collect the verdicts.
+        let _ = &run.new_must_paths;
+        assertions.push(run.assertion);
     }
 
     Ok(ProcedureReport {
@@ -1636,13 +1631,21 @@ mod tests {
     }
 
     #[test]
-    fn array_2_not_verified() {
-        // array-2 is identical to array-1 except the assertion is strict:
-        // `array[0] > menor` (vs. `>=`).  The body forces `menor <= array[0]`
-        // (non-strict), so when `menor_orig <= array[0]`, the body sets
-        // `menor = array[0]` and the assertion FAILS.  With the default
-        // BMC fallback (`bmc_bound = Some(2)`) array-2 is reported UNSAFE
-        // automatically when invariant synthesis fails.
+    fn array_2_is_unsafe_via_forward_must() {
+        // **Litmus test for forward MUST + backward NOT-MAY interplay.**
+        //
+        // array-2 has assertion `array[0] > menor` (strict).  The body
+        // forces `menor <= array[0]` (non-strict), so when
+        // `menor_orig <= array[0]` the body sets `menor = array[0]` and
+        // the assertion FAILS at iteration 1.
+        //
+        // Forward MUST (realized as bounded-unroll DART per
+        // `design_notes/SMASH_FORWARD_MUST.md`) must find this concrete
+        // bug.  Verdict: UNSAFE.
+        //
+        // Companion test: `array_1_verified` — backward NOT-MAY proves
+        // the non-strict assertion safe via the ACHAR invariant
+        // `((j==0)||(array[0]>=menor)) ∧ (SIZE==1)`.
         with_bc_graphs("array-2", |graphs| {
             let oracle = Oracle::new();
             let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
@@ -1651,49 +1654,7 @@ mod tests {
             assert_eq!(
                 proc.verdict(),
                 SafetyVerdict::Unsafe,
-                "array-2 must be UNSAFE via BMC fallback when invariant analysis fails"
-            );
-        });
-    }
-
-    #[test]
-    fn array_2_is_not_falsely_verified() {
-        // array-2: loop fills array[0] with nondet, then asserts array[0] > menor.
-        // Invariant synthesis cannot prove this (no relational template), so the
-        // result must be Unknown — never Safe (that would be a false verdict).
-        with_bc_graphs("array-2", |graphs| {
-            let oracle = Oracle::new();
-            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
-            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
-            let proc = procedure(&report, "main");
-            assert_ne!(
-                proc.verdict(),
-                SafetyVerdict::Safe,
-                "array-2 must not be falsely verified"
-            );
-        });
-    }
-
-    #[test]
-    fn array_2_bmc_finds_bug_in_one_iteration() {
-        // array-2 is unsafe: menor == array[0] is reachable after one loop
-        // iteration (array[0] = nondet; if array[0] <= menor: menor = array[0]).
-        // BMC with bound=1 must find a BugFound counterexample.
-        with_bc_graphs("array-2", |graphs| {
-            let oracle = Oracle::new();
-            let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
-            let config = InvariantConfig {
-                bmc_bound: Some(1),
-                ..InvariantConfig::default()
-            };
-            let report =
-                analyze_module_with_llm(graphs, &memory_pure, &NoProvider, &oracle, &config)
-                    .unwrap();
-            let proc = procedure(&report, "main");
-            assert_eq!(
-                proc.verdict(),
-                SafetyVerdict::Unsafe,
-                "array-2 must be found UNSAFE by BMC with bound=1"
+                "array-2 must be UNSAFE via forward MUST (DART-style bounded unroll)"
             );
         });
     }

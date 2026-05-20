@@ -155,12 +155,12 @@ impl Default for InvariantConfig {
             mode: SynthesisMode::Default,
             max_function_size: 500,
             achar_timeout: std::time::Duration::from_secs(10),
-            // Default to a small BMC bound so that programs where invariant
-            // synthesis cannot prove safety still have a chance to report a
-            // concrete BugFound (e.g. `tests/array-2.c`, where one unrolled
-            // iteration exhibits the violation).  The CLI's `--bmc-bound`
-            // overrides this if a larger budget is desired.
-            bmc_bound: Some(2),
+            // BMC is **not** the default forward-MUST realization under the
+            // strict QUERY_REFACTOR path; the paper-equivalent loop-summary
+            // mechanism is being built in `query` / `scheduler`.  Set to
+            // `None` so the auto-fallback never fires.  Tests that
+            // explicitly want BMC may still set `bmc_bound: Some(k)`.
+            bmc_bound: None,
         }
     }
 }
@@ -341,7 +341,17 @@ fn run_backward(
     engine.set_state(site.node, pre_at_assertion)?;
     engine.run_to_fixpoint(&order, tables, oracle)?;
 
-    let bug = engine.bugfound(cfg.entry(), oracle)?;
+    // Verdict logic:
+    //
+    // - **Backward NOT-MAY** (over-approx, paper's NOT-MAY): if
+    //   `reach ∧ state` at entry is infeasible, the assertion is safe.
+    // - **Acyclic BugFound** — sound only on natively-acyclic CFGs (no
+    //   loop-invariant widening; SP and WP are precise modulo SMT).
+    //   For cyclic CFGs the forward-MUST direction must be realized via
+    //   bounded unrolling (`bmc::bmc_check`) — see
+    //   `design_notes/SMASH_FORWARD_MUST.md`.
+    let cfg_is_acyclic = cfg.detect_back_edges().is_empty();
+    let bug = engine.bugfound(cfg.entry(), oracle, cfg_is_acyclic)?;
     let judgement = if let Some(model) = bug {
         Judgement::BugFound { model }
     } else if engine.verified(cfg.entry(), oracle)? {
@@ -421,7 +431,7 @@ fn synthesize_loop_invariants(
 
     for (index, loop_info) in loops.into_iter().enumerate() {
         let loop_loc = crate::may_must_analysis::loops::fmt_loop_loc(&loop_info);
-        log::info!(
+        log::debug!(
             target: "loop_invariant",
             "function {function} loop {} [{}]: synthesizing invariant [mode={}]",
             index + 1, loop_loc, mode.name()
@@ -542,7 +552,7 @@ fn synthesize_loop_invariants(
         }
 
         if accepted_candidate.is_none() {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: no invariant accepted — synthesis failed",
                 index + 1
@@ -709,7 +719,7 @@ fn first_accepted_candidate(
             render_invariant_result(&result)
         );
         if result.is_accepted() {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: {} accepted invariant: {}",
                 loop_index, phase, pretty_formula_with_names(&normalized, debug_names)
@@ -1042,26 +1052,12 @@ mod tests {
         assert!(matches!(result.judgement, Judgement::Verified));
     }
 
-    #[test]
-    fn analyze_rejects_cyclic_cfg() {
-        let mut cfg = AbstractCfg::new("entry");
-        let n = cfg.add_node("n", TransferFn::identity());
-        cfg.add_edge(cfg.entry(), n, Formula::True, vec![]).unwrap();
-        cfg.add_edge(n, cfg.entry(), Formula::True, vec![]).unwrap();
-        cfg.mark_exit(n).unwrap();
-        let site = AssertionSite {
-            id: 1,
-            node: n,
-            source_location: SourceLocation::new("t.c", 1, 1),
-            location: "loop".to_string(),
-            obligation: Formula::True,
-        };
-        let oracle = Oracle::new();
-        assert!(matches!(
-            analyze(&cfg, &site, &oracle),
-            Err(BackwardError::CyclicCfgUnsupported)
-        ));
-    }
+    // Removed: `analyze_rejects_cyclic_cfg`.  The old contract was that
+    // cyclic CFGs without a verifiable loop invariant returned an error
+    // (`CyclicCfgUnsupported`).  After the forward-MUST direction landed
+    // (`run_forward_must_only`), cyclic CFGs without an invariant fall
+    // through to a forward-MUST-only path that can return Unknown or
+    // BugFound.  The old test's expectation no longer holds.
 
     #[test]
     fn render_result_contains_judgement() {

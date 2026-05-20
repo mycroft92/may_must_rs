@@ -183,7 +183,10 @@ indeterminate → `UNKNOWN`.
 Every candidate must pass all three checks — initiation, inductiveness, and
 exit closure against the real assertion postconditions — before reaching the
 backward analysis. The `VerifiedLoopInvariant` type enforces this at compile
-time. See [LOOPS.md](LOOPS.md) for the full soundness analysis.
+time. See [design_notes/LOOPS.md](design_notes/LOOPS.md) for how loop
+invariants fit into the query-driven architecture, and
+[design_notes/SMASH_FORWARD_MUST.md](design_notes/SMASH_FORWARD_MUST.md)
+for the directional mapping that makes the soundness story explicit.
 
 **Bounded model checking** (`--bmc-bound N`) unrolls each loop up to N
 iterations and runs the backward analysis on the acyclic result. A `BugFound`
@@ -275,9 +278,10 @@ src/common/smt/solver.rs               raw Z3 term/formula lowering
 
 Unsupported procedures return `UNKNOWN` rather than terminating the run.
 
-See [LOOPS.md](LOOPS.md) for the loop invariant checking and soundness analysis,
-[MEMORY_MODEL.md](MEMORY_MODEL.md) for the full roadmap, and
-[REFERENCES.md](REFERENCES.md) for citations.
+See [design_notes/LOOPS.md](design_notes/LOOPS.md) for the loop invariant
+checking design under the query-driven architecture,
+[design_notes/QUERY_REFACTOR.md](design_notes/QUERY_REFACTOR.md) for the
+main analysis architecture, and [REFERENCES.md](REFERENCES.md) for citations.
 
 ---
 

@@ -211,12 +211,21 @@ fn bmc_sat_check(
         entry_summary: NodeSummary {
             node: cfg.entry(),
             reach: Formula::True,
-            state: entry_state,
+            state: entry_state.clone(),
+            // BMC's bug witness is a concrete reachable bug state at the
+            // assertion site, propagated back to the entry through the
+            // unrolled (acyclic) CFG.  Therefore the entry-side under-
+            // approximation is just `True` constrained by the entry state.
+            must_reach: entry_state,
         },
         assertion_summary: NodeSummary {
             node: site.node,
             reach: Formula::True,
-            state: neg_obligation,
+            state: neg_obligation.clone(),
+            // At the assertion site the WP-derived violation precondition is
+            // identical to the (concrete) must_reach: BMC's feasibility
+            // check on the unrolled CFG just confirmed this state is reachable.
+            must_reach: neg_obligation,
         },
         debug_names: HashMap::new(),
     })

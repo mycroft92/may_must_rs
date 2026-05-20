@@ -1,25 +1,44 @@
-//! Local propagation rules for the bidirectional may/must fixpoint.
+//! Local propagation rules for the SMASH-paper analysis directions.
 //!
 //! [`RuleEngine`] owns the per-node [`NodeSummary`] map for one CFG and drives
-//! the two interleaved propagation passes:
+//! the propagation passes that implement the paper's directions:
 //!
-//! - **Forward pass** (`must_post` / `must_post_usesummary`): propagates
-//!   `reach` along outgoing edges, accumulating reachability evidence.
-//! - **Backward pass** (`notmay_pre` / `notmay_pre_usesummary`): propagates
-//!   `state` (WP of violation) backward along incoming edges.
+//! - **Forward MAY** (over-approx SP): [`forward_may_post`],
+//!   [`forward_may_usesummary`].  Widens `reach` via disjunction.  In
+//!   SMASH-paper terminology this is the MAY family — used to prune backward
+//!   not-may propagation in [`notmay_pre_pruned`].
+//! - **Backward NOT-MAY** (over-approx WP): [`notmay_pre`],
+//!   [`notmay_pre_usesummary`], [`notmay_pre_pruned`].  Propagates `state`
+//!   (WP of the violation post) backward.  Proves safety when `reach ∧ state`
+//!   at the entry is infeasible.
+//! - **Forward MUST** (under-approx, feasibility-checked SP):
+//!   [`forward_must_post`] (scaffolding).  Currently NOT wired into
+//!   [`run_to_fixpoint`] because `TransferFn::sp` does not yet model memory.
+//!   The functional realization of forward MUST is backward NOT-MAY on a CFG
+//!   that is acyclic — either natively, or after BMC unrolling.  See
+//!   [`crate::may_must_analysis::bmc::bmc_check`] and
+//!   `design_notes/SMASH_FORWARD_MUST.md`.
 //!
-//! After each backward step an optional pruning check
-//! (`notmay_pre_pruned`) uses the [`Oracle`] to detect edges whose
-//! `reach ∧ state` is already infeasible, permanently blocking those paths
-//! from further propagation.
+//! # Debug logging convention
 //!
-//! [`run_to_fixpoint`] orchestrates both passes until no new edges are blocked.
-//! The caller then inspects the entry-node summary with [`verified`] /
-//! [`bugfound`] to obtain the final [`Judgement`].
+//! Every rule application emits a `log::debug!(target: "rules", ...)` line
+//! whose first token is the rule name in `[brackets]` and whose body names
+//! the formula it added (or the action it took).  This makes a trace of
+//! a fixpoint run mechanically reconstructible — `RUST_LOG=rules=debug`
+//! shows exactly which rule changed which node summary, in order.  The
+//! verdict-producing methods ([`verified`], [`bugfound`], [`must_bugfound`])
+//! follow the same convention.
 //!
 //! [`run_to_fixpoint`]: RuleEngine::run_to_fixpoint
 //! [`verified`]: RuleEngine::verified
 //! [`bugfound`]: RuleEngine::bugfound
+//! [`forward_may_post`]: RuleEngine::forward_may_post
+//! [`forward_may_usesummary`]: RuleEngine::forward_may_usesummary
+//! [`forward_must_post`]: RuleEngine::forward_must_post
+//! [`notmay_pre`]: RuleEngine::notmay_pre
+//! [`notmay_pre_usesummary`]: RuleEngine::notmay_pre_usesummary
+//! [`notmay_pre_pruned`]: RuleEngine::notmay_pre_pruned
+//! [`must_bugfound`]: RuleEngine::must_bugfound
 
 #![allow(dead_code)]
 
@@ -169,11 +188,217 @@ impl<'a> RuleEngine<'a> {
         Ok(())
     }
 
-    /// **Forward rule** — propagates `reach` across `edge`.
+    /// **Forward MUST rule** — under-approximate concrete reachability
+    /// propagation across `edge`.  Paper-correct.
+    ///
+    /// **Currently inert** in [`run_to_fixpoint`] because `TransferFn::sp`
+    /// does not model memory (`sp_one` for `MemoryStore` / `Load` is a
+    /// no-op), so the propagated `must_reach` would mis-evaluate any
+    /// memory-using program.  Today the functional realization of
+    /// forward MUST is backward NOT-MAY on an acyclic CFG (native or
+    /// BMC-unrolled) — see `design_notes/SMASH_FORWARD_MUST.md`.
+    ///
+    /// **Keep**: this rule is paper-equivalent and will become active
+    /// when SP is upgraded to handle memory (tracked in TODO.md under
+    /// "Memory-aware forward SP").  Removing it would walk back paper
+    /// equivalence.
+    ///
+    /// Computes the strongest-postcondition of `source.must_reach` through
+    /// the source node's transfer function, the edge guard, and the edge's
+    /// own transfer (PHI assignments).  Then **feasibility-checks** the
+    /// result via the SMT oracle.  Only feasible propagations are joined
+    /// into `target.must_reach`.
+    ///
+    /// This is the SMASH-paper **MUST** direction: the under-approximate
+    /// counterpart to forward MAY.  Every disjunct in `target.must_reach`
+    /// after this rule fires corresponds to a real concrete reachable
+    /// execution.  Combined with the assertion's violation formula, it
+    /// soundly detects BugFound on acyclic CFGs (cyclic CFGs are unrolled
+    /// first via [`crate::may_must_analysis::bmc::bmc_check`]).
+    ///
+    /// Skips blocked edges silently.  Skips when `source.must_reach` is
+    /// already `False` (no concrete path reaches the source).
+    pub fn forward_must_post(
+        &mut self,
+        edge_id: CfgEdgeId,
+        oracle: &Oracle,
+    ) -> Result<(), RuleError> {
+        // NOTE: Deliberately NOT checking `is_blocked` here.  Back-edges
+        // are typically blocked for the backward direction (so
+        // `notmay_pre` doesn't loop), but forward MUST *needs* back-edge
+        // propagation to iterate the loop body concretely.  The fixpoint's
+        // `max_iterations` cap (`edges + 1`) bounds the total work.  Per
+        // SMASH-paper Fig 8–10 + the DART concolic-execution model in
+        // `design_notes/SMASH_FORWARD_MUST.md`, forward MUST enumerates
+        // concrete paths whose depth is determined by feasibility, not by
+        // a global edge-blocking decision.
+        let edge = self
+            .cfg
+            .edge(edge_id)
+            .map_err(|_| RuleError::UnknownEdge { edge: edge_id })?
+            .clone();
+        log::debug!(
+            target: "rules",
+            "[forward_must_post] {:?}→{:?}: entered",
+            edge.source, edge.target
+        );
+
+        let source_must = self.summary(edge.source)?.must_reach.clone();
+        if source_must == Formula::False {
+            log::debug!(
+                target: "rules",
+                "[forward_must_post] {:?}→{:?}: source must_reach is False — skip",
+                edge.source, edge.target
+            );
+            return Ok(());
+        }
+
+        // SP through source node's transfer, then edge guard, then edge's effects.
+        let source_post = self
+            .cfg
+            .node(edge.source)
+            .map_err(|_| RuleError::UnknownNode { node: edge.source })?
+            .transfer
+            .sp(&source_must);
+        let guarded = Formula::and(source_post, edge.guard.clone());
+        let through_edge = edge.transfer().sp(&guarded);
+
+        // Feasibility-check the propagated state.  Only join if SAT — the
+        // under-approximation invariant requires every disjunct in
+        // `must_reach` to have at least one model corresponding to a real
+        // execution.
+        let feas = oracle.feasibility(&through_edge)?;
+        if feas != Feasibility::Feasible {
+            log::debug!(
+                target: "rules",
+                "[forward_must_post] {:?}→{:?}: feasibility={:?} — skip",
+                edge.source, edge.target, feas
+            );
+            return Ok(());
+        }
+
+        log::debug!(
+            target: "rules",
+            "[forward_must_post] {:?}→{:?}: must_reach += {}",
+            edge.source,
+            edge.target,
+            fmt_formula(&through_edge),
+        );
+        self.summary_mut(edge.target)?
+            .join_must_reach(&through_edge);
+        Ok(())
+    }
+
+    /// **Forward MUST rule with callee summaries.**  At a call edge,
+    /// applies callee's `MustSummary` (primary, under-approximate
+    /// witness) and `NotMaySummary` (auxiliary, narrows away
+    /// counterfactual states) to enrich `must_reach[target]`.
+    ///
+    /// Soundness:
+    /// - **Must summary** `(pre_s, post_s)` says: "from some state
+    ///   satisfying `pre_s`, the callee reaches a state satisfying
+    ///   `post_s`".  If `caller.must_reach ⇒ pre_s` (caller's concrete
+    ///   state lies in summary's pre-range), then `post_s` is
+    ///   concretely reachable after the call — join `post_s` into
+    ///   `target.must_reach`.
+    /// - **NotMay summary** `(pre_s, post_s)` says: "from `pre_s`, the
+    ///   callee cannot reach `post_s`".  If `caller.must_reach ⇒ pre_s`,
+    ///   then `¬post_s` holds after the call — join `¬post_s` into
+    ///   `target.must_reach` (narrowing).
+    ///
+    /// Both checks gate on **`caller.must_reach ⇒ summary.pre`** via
+    /// the SMT oracle.  Skipped if `caller.must_reach == False` (no
+    /// concrete path reaches this call).
+    pub fn forward_must_usesummary(
+        &mut self,
+        edge_id: CfgEdgeId,
+        tables: &SummaryTables,
+        oracle: &Oracle,
+    ) -> Result<(), RuleError> {
+        if self.is_blocked(edge_id) {
+            return Ok(());
+        }
+        let edge = self
+            .cfg
+            .edge(edge_id)
+            .map_err(|_| RuleError::UnknownEdge { edge: edge_id })?
+            .clone();
+        let Some(callee) = callee_of(
+            self.cfg
+                .node(edge.source)
+                .map_err(|_| RuleError::UnknownNode { node: edge.source })?,
+        ) else {
+            return Ok(());
+        };
+        let caller_must = self.summary(edge.source)?.must_reach.clone();
+        if caller_must == Formula::False {
+            return Ok(());
+        }
+
+        // Must summaries — primary source of concrete reach contribution.
+        for summary in tables.must(&callee) {
+            let applies = if matches!(summary.precondition, Formula::True) {
+                true
+            } else {
+                matches!(
+                    oracle.implies(&caller_must, &summary.precondition)?,
+                    Validity::Valid
+                )
+            };
+            if !applies {
+                continue;
+            }
+            log::debug!(
+                target: "rules",
+                "[forward_must_usesummary] {:?}→{:?}: callee '{}' must-summary applies: must_reach += {}",
+                edge.source, edge.target, callee, fmt_formula(&summary.postcondition),
+            );
+            self.summary_mut(edge.target)?
+                .join_must_reach(&summary.postcondition);
+        }
+
+        // NotMay summaries — auxiliary; their negation narrows the
+        // post-call concrete state.  Per the user's cross-direction
+        // requirement: forward MUST consults both summary kinds.
+        for summary in tables.notmay(&callee) {
+            let applies = if matches!(summary.precondition, Formula::True) {
+                true
+            } else {
+                matches!(
+                    oracle.implies(&caller_must, &summary.precondition)?,
+                    Validity::Valid
+                )
+            };
+            if !applies {
+                continue;
+            }
+            let narrowing = Formula::not(summary.postcondition.clone());
+            log::debug!(
+                target: "rules",
+                "[forward_must_usesummary] {:?}→{:?}: callee '{}' notmay-summary narrows: must_reach ∧= {}",
+                edge.source, edge.target, callee, fmt_formula(&narrowing),
+            );
+            // For NotMay narrowing we conjoin (not disjoin) because the
+            // narrowing is universally true at the call's post-state.
+            let target_must = self.summary(edge.target)?.must_reach.clone();
+            let narrowed = Formula::and(target_must, narrowing);
+            if oracle.feasibility(&narrowed)? == Feasibility::Feasible {
+                self.summary_mut(edge.target)?.must_reach = narrowed;
+            }
+        }
+        Ok(())
+    }
+
+    /// **Forward MAY rule** — propagates `reach` across `edge` via SP.
     ///
     /// Computes `source.reach ∧ edge.guard` and joins the result into
-    /// `target.reach`.  Skips blocked edges silently.
-    pub fn must_post(&mut self, edge_id: CfgEdgeId) -> Result<(), RuleError> {
+    /// `target.reach`.  The join is a disjunction, so this is an
+    /// over-approximation (SMASH-paper "MAY" semantics), not an
+    /// under-approximation.
+    ///
+    /// Renamed from `must_post` in v0.15.0 to reflect honest semantics.  Skips
+    /// blocked edges silently.
+    pub fn forward_may_post(&mut self, edge_id: CfgEdgeId) -> Result<(), RuleError> {
         if self.is_blocked(edge_id) {
             return Ok(());
         }
@@ -186,7 +411,7 @@ impl<'a> RuleEngine<'a> {
         let propagated = Formula::and(source_reach, edge.guard);
         log::debug!(
             target: "rules",
-            "[must_post] {:?}→{:?}: reach += {}",
+            "[forward_may_post] {:?}→{:?}: reach += {}",
             edge.source,
             edge.target,
             fmt_formula(&propagated),
@@ -312,16 +537,26 @@ impl<'a> RuleEngine<'a> {
         Ok(())
     }
 
-    /// **Forward rule with callee summaries** — applies must summaries from
-    /// `tables` at a call edge.
+    /// **Forward MAY rule with callee summaries** — applies forward-may
+    /// summaries from `tables` at a call edge, gated by a **precondition
+    /// implication check** (subsumption).
     ///
-    /// If the source node is a call site, joins each matching must-summary
-    /// postcondition into `target.reach`, propagating reachability information
-    /// derived from the callee's proven postconditions.
-    pub fn must_post_usesummary(
+    /// Soundness condition: only join the summary's `postcondition` into
+    /// `target.reach` when `caller.reach ⇒ summary.precondition`.  Without
+    /// this check, callers whose reach is outside the summary's pre-range
+    /// would receive a `post` that doesn't actually hold for them.
+    ///
+    /// For legacy summaries with `precondition: True` (the eager-inlined
+    /// `compute_return_summary` shape) the implication is trivially Valid,
+    /// so this rule reduces to the v0.15 behaviour.  For paper-equivalent
+    /// contextual summaries with non-True preconditions, mismatched call
+    /// contexts are silently skipped — sound; the caller's analysis simply
+    /// doesn't learn the post for that summary.
+    pub fn forward_may_usesummary(
         &mut self,
         edge_id: CfgEdgeId,
         tables: &SummaryTables,
+        oracle: &Oracle,
     ) -> Result<(), RuleError> {
         if self.is_blocked(edge_id) {
             return Ok(());
@@ -338,10 +573,29 @@ impl<'a> RuleEngine<'a> {
         ) else {
             return Ok(());
         };
-        for summary in tables.must(&callee) {
+        let caller_reach = self.summary(edge.source)?.reach.clone();
+        for summary in tables.forward_may(&callee) {
+            // Cheap shortcut for the legacy True-precondition case.
+            let applies = if matches!(summary.precondition, Formula::True) {
+                true
+            } else {
+                matches!(
+                    oracle.implies(&caller_reach, &summary.precondition)?,
+                    Validity::Valid
+                )
+            };
+            if !applies {
+                log::debug!(
+                    target: "rules",
+                    "[forward_may_usesummary] {:?}→{:?}: callee '{}' summary skipped — \
+                     caller.reach does not imply summary.precondition",
+                    edge.source, edge.target, callee,
+                );
+                continue;
+            }
             log::debug!(
                 target: "rules",
-                "[must_post_usesummary] {:?}→{:?}: callee '{}' must-summary: reach += {}",
+                "[forward_may_usesummary] {:?}→{:?}: callee '{}' may-summary applies: reach += {}",
                 edge.source,
                 edge.target,
                 callee,
@@ -356,19 +610,28 @@ impl<'a> RuleEngine<'a> {
     /// Runs interleaved forward and backward passes to a fixpoint.
     ///
     /// Each iteration:
-    /// 1. Forward pass over `order` — applies [`must_post`] and
-    ///    [`must_post_usesummary`] on outgoing edges.
-    /// 2. Backward pass over `order` in reverse — applies [`notmay_pre`],
-    ///    [`notmay_pre_usesummary`], and [`notmay_pre_pruned`] on incoming
-    ///    edges.
+    /// 1. Forward MAY pass over `order` — applies [`forward_may_post`] and
+    ///    [`forward_may_usesummary`] on outgoing edges (SP, over-approximate).
+    /// 2. Forward MUST pass over `order` — applies [`forward_must_post`] on
+    ///    outgoing edges (SP + per-step SMT feasibility check;
+    ///    under-approximate, "MUST" semantics).
+    /// 3. Backward NOT-MAY pass over `order` in reverse — applies
+    ///    [`notmay_pre`], [`notmay_pre_usesummary`], and [`notmay_pre_pruned`]
+    ///    on incoming edges (WP, over-approximate).
+    ///
+    /// Passes 1 and 3 are MAY-family (over-approximations).  Pass 2 is the
+    /// MUST direction (under-approximate, feasibility-checked) — its result
+    /// at the assertion site combined with the violation formula is the only
+    /// sound BugFound witness for cyclic CFGs once they have been unrolled
+    /// via [`crate::may_must_analysis::bmc::bmc_check`].
     ///
     /// Terminates when no new edges are blocked between two consecutive
     /// iterations, or after `|edges| + 1` iterations as a safety bound.
     /// `tables` provides interprocedural summaries; `oracle` is used for
     /// feasibility queries during pruning.
     ///
-    /// [`must_post`]: RuleEngine::must_post
-    /// [`must_post_usesummary`]: RuleEngine::must_post_usesummary
+    /// [`forward_may_post`]: RuleEngine::forward_may_post
+    /// [`forward_may_usesummary`]: RuleEngine::forward_may_usesummary
     /// [`notmay_pre`]: RuleEngine::notmay_pre
     /// [`notmay_pre_usesummary`]: RuleEngine::notmay_pre_usesummary
     /// [`notmay_pre_pruned`]: RuleEngine::notmay_pre_pruned
@@ -383,8 +646,19 @@ impl<'a> RuleEngine<'a> {
             let blocked_before = self.blocked_count();
             for node in order {
                 for edge in self.cfg.outgoing_edges(*node) {
-                    self.must_post(edge)?;
-                    self.must_post_usesummary(edge, tables)?;
+                    self.forward_may_post(edge)?;
+                    self.forward_may_usesummary(edge, tables, oracle)?;
+                    // NOTE: `forward_must_post` / `forward_must_usesummary`
+                    // are NOT wired here.  Their soundness requires
+                    // memory-aware SP (Skolemized stores + scalar
+                    // assigns) which is too expensive on loop unrolling
+                    // (4000+ character formulas tripping SMT timeouts).
+                    // The paper-equivalent forward-MUST realization for
+                    // cyclic CFGs is the DART-style bounded-input path
+                    // enumeration that lives in `bmc::bmc_check`; the
+                    // orchestrator invokes it via `analyze_with_tables`
+                    // when the may-side cannot prove safety.  See
+                    // `design_notes/SMASH_FORWARD_MUST.md`.
                 }
             }
             for node in order.iter().rev() {
@@ -407,28 +681,144 @@ impl<'a> RuleEngine<'a> {
     /// means no reachable state can violate the assertion, so the assertion
     /// holds on all reachable paths.
     pub fn verified(&self, entry: CfgNodeId, oracle: &Oracle) -> Result<bool, RuleError> {
-        let result = oracle.check_summary(self.summary(entry)?)?;
-        Ok(result.feasibility == Feasibility::Infeasible)
+        let summary = self.summary(entry)?;
+        let result = oracle.check_summary(summary)?;
+        let verified = result.feasibility == Feasibility::Infeasible;
+        log::debug!(
+            target: "rules",
+            "[verified] entry {:?}: reach={} state={} → {}",
+            entry,
+            fmt_formula(&summary.reach),
+            fmt_formula(&summary.state),
+            if verified { "Verified (reach∧state UNSAT)" } else { "not verified" }
+        );
+        Ok(verified)
     }
 
     /// Returns a potential counterexample if a bug was found, or `None` if the
     /// analysis could not confirm a violation.
     ///
-    /// Returns `Some(model)` when the oracle finds `reach ∧ state` feasible at
-    /// the entry node, where `model` is `Some(witness)` if the solver produced
-    /// a concrete state or `None` if it only confirmed feasibility without a
-    /// model.  Returns `None` when the combined formula is infeasible or the
-    /// oracle returns `Unknown`.
+    /// # Soundness (v0.15.0+)
+    ///
+    /// This check inspects `reach ∧ state` at the entry node.  In SMASH-paper
+    /// terms both components are **MAY-family over-approximations**:
+    ///
+    /// - `reach` is forward SP, widened at loop headers by injected invariants
+    ///   and at call sites by MAY summaries (disjunctive `join_reach`).
+    /// - `state` is backward WP, propagated over the same widened control flow.
+    ///
+    /// Combining two over-approximations and finding a satisfying model does
+    /// **not** in general prove a real bug — the witness may sit entirely in
+    /// the over-approximation gap (a state that's spuriously in both reach
+    /// and state without corresponding to any concrete execution).  This is
+    /// the root cause of the historical false-UNSAFE verdicts on
+    /// `linear_sea.ch`, `veris_NetBSD-libc_loop.i`, and `bin-suffix-5`.
+    ///
+    /// Sound BugFound verdicts require an **under-approximate** witness — see
+    /// [`crate::may_must_analysis::bmc::bmc_check`] (MUST direction in the
+    /// SMASH orchestrator).
+    ///
+    /// To keep this method usable for legitimately acyclic CFGs without
+    /// MAY-summary widening — where SP/WP are precise modulo SMT — the caller
+    /// must explicitly confirm the CFG is acyclic via the `cfg_is_acyclic`
+    /// parameter.  When the CFG has back edges, this method returns `None`
+    /// (no bug reported); callers should defer to BMC for those programs.
     pub fn bugfound(
         &self,
         entry: CfgNodeId,
         oracle: &Oracle,
+        cfg_is_acyclic: bool,
     ) -> Result<Option<Option<SmtModel>>, RuleError> {
-        let result = oracle.check_summary(self.summary(entry)?)?;
-        Ok(match result.feasibility {
-            Feasibility::Feasible => Some(result.model),
-            Feasibility::Infeasible | Feasibility::Unknown => None,
-        })
+        if !cfg_is_acyclic {
+            log::debug!(
+                target: "rules",
+                "[bugfound] entry {:?}: cfg is cyclic — skipping unsound reach∧state \
+                 heuristic (deferring bug-finding to BMC)",
+                entry,
+            );
+            return Ok(None);
+        }
+        let summary = self.summary(entry)?;
+        let result = oracle.check_summary(summary)?;
+        match result.feasibility {
+            Feasibility::Feasible => {
+                log::debug!(
+                    target: "rules",
+                    "[bugfound] entry {:?}: reach∧state SAT on acyclic CFG → BugFound (witness retained)",
+                    entry,
+                );
+                Ok(Some(result.model))
+            }
+            Feasibility::Infeasible | Feasibility::Unknown => {
+                log::debug!(
+                    target: "rules",
+                    "[bugfound] entry {:?}: reach∧state {:?} → no bug",
+                    entry, result.feasibility,
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// **Paper-equivalent BugFound check** — under-approximate forward MUST.
+    ///
+    /// Conjoins `must_reach[assertion_site]` (a sound under-approximation of
+    /// concrete states reachable at the assertion) with the violation
+    /// formula `¬obligation` and asks the SMT oracle for a satisfying model.
+    /// If SAT, returns the model as a real bug witness.
+    ///
+    /// Soundness: every disjunct in `must_reach` was added only after
+    /// [`forward_must_post`] confirmed it feasible.  Therefore any model of
+    /// `must_reach ∧ ¬obligation` corresponds to a real execution that
+    /// reaches the assertion site and violates the obligation.
+    ///
+    /// Caller responsibility: the CFG passed to this engine should be
+    /// **acyclic**.  Cyclic CFGs must be unrolled (via
+    /// [`crate::may_must_analysis::bmc::bmc_check`]) before forward MUST
+    /// produces a meaningful `must_reach`.
+    pub fn must_bugfound(
+        &self,
+        assertion_site: CfgNodeId,
+        violation: &Formula,
+        oracle: &Oracle,
+    ) -> Result<Option<Option<SmtModel>>, RuleError> {
+        let must_reach_pre = &self.summary(assertion_site)?.must_reach;
+        if *must_reach_pre == Formula::False {
+            log::debug!(
+                target: "rules",
+                "[must_bugfound] site {:?}: must_reach is False — no concrete witness",
+                assertion_site,
+            );
+            return Ok(None);
+        }
+        let post = self
+            .cfg
+            .node(assertion_site)
+            .map_err(|_| RuleError::UnknownNode {
+                node: assertion_site,
+            })?
+            .transfer
+            .sp(must_reach_pre);
+        let combined = Formula::and(post, violation.clone());
+        let report = oracle.feasibility_with_model(&combined)?;
+        match report.feasibility {
+            Feasibility::Feasible => {
+                log::debug!(
+                    target: "rules",
+                    "[must_bugfound] site {:?}: SP(site.transfer, must_reach) ∧ ¬obligation SAT → real BugFound",
+                    assertion_site,
+                );
+                Ok(Some(report.model))
+            }
+            Feasibility::Infeasible | Feasibility::Unknown => {
+                log::debug!(
+                    target: "rules",
+                    "[must_bugfound] site {:?}: {:?} — no real witness",
+                    assertion_site, report.feasibility,
+                );
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -496,11 +886,11 @@ mod tests {
     }
 
     #[test]
-    fn must_post_propagates_guarded_reachability() {
+    fn forward_may_post_propagates_guarded_reachability() {
         let (cfg, _, n1, edge) = tiny_cfg();
         let mut engine = RuleEngine::new(&cfg);
         engine.init();
-        engine.must_post(edge).unwrap();
+        engine.forward_may_post(edge).unwrap();
         assert_eq!(
             engine.summary(n1).unwrap().reach,
             Formula::or(

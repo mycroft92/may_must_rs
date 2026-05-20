@@ -1,0 +1,336 @@
+//! SMASH-style bidirectional may/must orchestrator.
+//!
+//! Adapts the original *Compositional May-Must Analysis* (SMASH) paper:
+//! for each assertion, run the **may** direction (proves safety via
+//! [`analyze_with_tables`]'s combined `reach ∧ state` check) and the **must**
+//! direction (finds bugs via [`bmc::bmc_check`]'s bounded unrolling) as
+//! cooperating peers, sharing a [`SmashSummaryDB`].
+//!
+//! This module is the *top layer* over the existing passes — it does not
+//! re-implement may/must, it composes them.  See the SMASH section at the top
+//! of `TODO.md` for the design rationale.
+//!
+//! # Current scope (v0.14.0)
+//!
+//! - Orchestrator runs may → must in sequence per assertion.
+//! - BMC's BugFound results are recorded as [`MustPathSummary`] entries in
+//!   the DB (consumed by the next step in this milestone).
+//! - Engine attribution: every verdict is labelled with the engine that
+//!   produced it via the `engine_verdict` log target.
+//!
+//! # Deferred (next steps)
+//!
+//! - ACHAR consults [`MustPathSummary`] entries to prune candidates that any
+//!   known must-path violates.
+//! - Inter-procedural cross-feed: callee must-paths surface as caller-visible
+//!   bug witnesses.
+//! - Iterating may/must to fixpoint over DB updates within a single procedure
+//!   (today the orchestrator runs each direction once).
+//!
+//! # Deprecation status
+//!
+//! The types `MustPathSummary`, `SmashSummaryDB`, `SmashRunResult`, and
+//! `VerdictEngine` are v0.14 scaffolding that the query-driven refactor
+//! (see `design_notes/QUERY_REFACTOR.md`) supersedes.  They will go away
+//! once `run_smash` is simplified to take `&SummaryTables` directly and
+//! return `AssertionResult`; the deprecation marks are present to flag
+//! the migration to readers.  Internal uses inside this module are
+//! intentional and silenced below.
+
+#![allow(deprecated)]
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::common::abstract_cfg::AbstractCfg;
+use crate::common::adapter::AssertionSite;
+use crate::common::formula::Formula;
+use crate::common::oracle::Oracle;
+use crate::may_must_analysis::backward::{
+    analyze_with_tables, AssertionResult, BackwardError, InvariantConfig,
+};
+use crate::may_must_analysis::bmc;
+use crate::may_must_analysis::forward_must::{self, DartConfig};
+use crate::may_must_analysis::loops::VerifiedLoopInvariant;
+use crate::may_must_analysis::node_summary::NodeSummary;
+use crate::may_must_analysis::rules::Judgement;
+use crate::may_must_analysis::summaries::{ProcedureName, SummaryTables};
+
+/// A concrete bug-witness path discovered by the **must** direction.
+///
+/// **DEPRECATED.**  This was the v0.14 scaffolding for cross-procedure
+/// must-path propagation.  In the query-driven architecture, BMC-derived
+/// bug witnesses flow back to callers via `ContextualMustSummary` in
+/// `query::ContextualSummaryTable` (still being wired up).  Slated for
+/// deletion once `CREATE_MUSTSUMMARY` writes to the contextual table.
+#[deprecated(
+    note = "v0.14 scaffolding; replaced by query::ContextualMustSummary in the \
+            contextual summary table"
+)]
+#[derive(Clone, Debug)]
+pub struct MustPathSummary {
+    /// Procedure where the must-path was found.
+    pub procedure: ProcedureName,
+    /// Assertion site this path reaches.
+    pub site_id: usize,
+    /// Concrete pre-state at procedure entry (from the SMT model of the
+    /// satisfiable `reach ∧ state` formula on the unrolled CFG).
+    pub entry_state: Formula,
+    /// BMC bound that exposed this must-path.
+    pub bmc_bound: usize,
+}
+
+/// Shared summary database for the SMASH orchestrator.
+///
+/// **DEPRECATED.**  The query-driven architecture uses
+/// [`crate::may_must_analysis::query::ContextualSummaryTable`] instead.
+/// `run_smash` still accepts this wrapper today only because it threads
+/// through the legacy `SummaryTables`; `must_paths` is built with an empty
+/// `BTreeMap` and never consulted.  Slated for deletion once `run_smash`
+/// takes `&SummaryTables` directly.
+#[deprecated(note = "use query::ContextualSummaryTable; this is v0.14 scaffolding")]
+#[derive(Clone, Debug, Default)]
+pub struct SmashSummaryDB {
+    /// May-side summaries (existing structure).  Re-used as-is so this layer
+    /// is purely additive.
+    pub tables: SummaryTables,
+    /// Must-side bug witnesses, keyed by procedure name.
+    pub must_paths: BTreeMap<ProcedureName, Vec<MustPathSummary>>,
+}
+
+impl SmashSummaryDB {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the must-paths recorded for `procedure`, or an empty slice.
+    pub fn must_paths(&self, procedure: &str) -> &[MustPathSummary] {
+        self.must_paths
+            .get(procedure)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Inserts a must-path summary.  Deduplicates by structural equality of
+    /// `(site_id, entry_state, bmc_bound)`.  Returns `true` if newly added.
+    pub fn add_must_path(&mut self, summary: MustPathSummary) -> bool {
+        let entries = self
+            .must_paths
+            .entry(summary.procedure.clone())
+            .or_default();
+        let dup = entries.iter().any(|e| {
+            e.site_id == summary.site_id
+                && e.bmc_bound == summary.bmc_bound
+                && format!("{:?}", e.entry_state) == format!("{:?}", summary.entry_state)
+        });
+        if dup {
+            false
+        } else {
+            entries.push(summary);
+            true
+        }
+    }
+}
+
+/// Output of one orchestrator run for a single assertion.
+///
+/// Returned by [`run_smash`] so the caller can merge any newly discovered
+/// must-paths into the shared DB after a parallel batch completes.  Bundling
+/// them this way keeps the per-assertion call cleanly read-only on `tables`
+/// and the DB, which lets the driver `par_iter` over assertions without
+/// locking.
+#[derive(Clone, Debug)]
+pub struct SmashRunResult {
+    /// Final assertion verdict.  Always populated — never an Err.
+    pub assertion: AssertionResult,
+    /// Engine that produced the verdict, for telemetry / debugging.
+    pub engine: VerdictEngine,
+    /// Must-paths newly discovered by this run, to be merged into the DB.
+    pub new_must_paths: Vec<MustPathSummary>,
+}
+
+/// Which engine produced the final verdict for an assertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerdictEngine {
+    /// Verdict came from the may direction (combined `reach ∧ state` check).
+    MayInvariantAnalysis,
+    /// Verdict came from forward MUST (DART path enumeration).
+    MustDart,
+    /// Verdict came from BMC at a specific bound (legacy fallback; kept as
+    /// a backup mode but no longer wired into the primary verdict pipeline).
+    MustBmc { bound: usize },
+    /// Both engines failed to produce a decisive verdict; final = Unknown.
+    Inconclusive,
+}
+
+impl VerdictEngine {
+    pub fn label(self) -> String {
+        match self {
+            VerdictEngine::MayInvariantAnalysis => "may/invariant-analysis".into(),
+            VerdictEngine::MustDart => "must/dart".into(),
+            VerdictEngine::MustBmc { bound } => format!("must/bmc bound={bound}"),
+            VerdictEngine::Inconclusive => "inconclusive".into(),
+        }
+    }
+}
+
+/// Run the SMASH orchestrator for one assertion.
+///
+/// Sequence (current iteration of the design):
+///
+/// 1. **May direction** — call [`analyze_with_tables`].
+///    - If `Verified` → return `Verified` immediately.
+///    - If `BugFound` → return `BugFound` immediately (the may path can find
+///      bugs in acyclic functions through `reach ∧ state` already being SAT
+///      at entry; no need to call BMC).
+///    - If `Unknown` or `CyclicCfgUnsupported` → fall through to must.
+///
+/// 2. **Must direction** — if `config.bmc_bound = Some(k)`, call
+///    [`bmc::bmc_check`] up to bound `k`.
+///    - If BMC finds a bug → return `BugFound`, record a `MustPathSummary`
+///      for cross-procedure use.
+///    - If BMC exhausts → return the may direction's `Unknown` verdict.
+///
+/// The orchestrator always returns a valid [`AssertionResult`], never an
+/// `Err`.  The current may/BMC fallback in `driver.rs` is structurally
+/// equivalent; this function exists so future enhancements (ACHAR pruning
+/// via must-paths, cross-procedure propagation, fixpoint iteration over the
+/// DB) compose without changing the driver's call site.
+#[allow(clippy::too_many_arguments)]
+pub fn run_smash(
+    cfg: &AbstractCfg,
+    procedure_name: &str,
+    site: &AssertionSite,
+    oracle: &Oracle,
+    db: &SmashSummaryDB,
+    config: Option<&InvariantConfig>,
+    verified_invariants: Option<&[VerifiedLoopInvariant]>,
+    debug_names: &HashMap<String, String>,
+) -> SmashRunResult {
+    // ── May direction ────────────────────────────────────────────────────
+    let may_result = analyze_with_tables(
+        cfg,
+        procedure_name,
+        site,
+        oracle,
+        &db.tables,
+        config,
+        verified_invariants,
+        debug_names,
+    );
+
+    let may_unknown_or_error = match may_result {
+        Ok(result) => {
+            // Verified or BugFound from may → decisive, return.  Unknown
+            // from may → fall through to must.
+            if matches!(
+                result.judgement,
+                Judgement::Verified | Judgement::BugFound { .. }
+            ) {
+                log::info!(
+                    target: "engine_verdict",
+                    "function {procedure_name} assertion #{} ({}): {:?} [engine=may/invariant-analysis]",
+                    site.id, site.location, result.judgement
+                );
+                return SmashRunResult {
+                    assertion: result,
+                    engine: VerdictEngine::MayInvariantAnalysis,
+                    new_must_paths: Vec::new(),
+                };
+            }
+            Some(result)
+        }
+        Err(BackwardError::CyclicCfgUnsupported) => None,
+        Err(other) => {
+            // Genuine analysis error (Rule/Oracle).  Return Unknown without
+            // attempting BMC — these errors indicate the inputs are
+            // malformed, not that BMC could rescue us.
+            log::warn!(
+                target: "engine_verdict",
+                "function {procedure_name} assertion #{} ({}): error {other:?} \
+                 — returning Unknown without BMC attempt",
+                site.id, site.location
+            );
+            return SmashRunResult {
+                assertion: empty_unknown_result(site, debug_names),
+                engine: VerdictEngine::Inconclusive,
+                new_must_paths: Vec::new(),
+            };
+        }
+    };
+
+    // ── Forward MUST direction (DART path enumeration) ─────────────────
+    //
+    // Per `design_docs/DART.md`, forward MUST is realized as DART:
+    // depth-first enumeration of concrete paths from entry to the
+    // assertion node, with one SMT feasibility-with-model query per
+    // path.  A SAT model on `path_condition ∧ phi2` is a real
+    // counterexample.  Loops are handled by the `max_loop_iters` knob
+    // — we walk each path on the original cyclic CFG up to that many
+    // re-visits per node, no physical CFG unrolling needed.
+    //
+    // The `bmc_bound` config field is reused as `max_loop_iters` so
+    // existing CLI flags still control unroll depth.  BMC remains
+    // present in `bmc.rs` as a worst-case backup but is no longer
+    // wired into the primary verdict pipeline (see `bmc.rs` module
+    // doc — kept available for the user's "BMC as ultimate backup"
+    // preference; bring back here if DART regresses).
+    let max_loop_iters = config.and_then(|c| c.bmc_bound).unwrap_or(2);
+    if max_loop_iters > 0 {
+        let dart_config = DartConfig {
+            max_loop_iters,
+            ..DartConfig::default()
+        };
+        if let Some(dart_result) =
+            forward_must::dart_explore(cfg, site, oracle, dart_config, debug_names)
+        {
+            log::info!(
+                target: "engine_verdict",
+                "function {procedure_name} assertion #{} ({}): {:?} [engine=forward-must/dart max_loop_iters={max_loop_iters}]",
+                site.id, site.location, dart_result.judgement
+            );
+            return SmashRunResult {
+                assertion: dart_result,
+                engine: VerdictEngine::MustDart,
+                new_must_paths: Vec::new(),
+            };
+        }
+        log::info!(
+            target: "engine_verdict",
+            "function {procedure_name} assertion #{} ({}): Unknown [engine=forward-must/dart max_loop_iters={max_loop_iters} exhausted]",
+            site.id, site.location
+        );
+    }
+    let _ = bmc::bmc_check; // keep bmc module reachable for the backup path
+
+    // ── Final: may's Unknown (or an empty Unknown if may also errored) ──
+    let assertion = may_unknown_or_error.unwrap_or_else(|| empty_unknown_result(site, debug_names));
+    SmashRunResult {
+        assertion,
+        engine: VerdictEngine::Inconclusive,
+        new_must_paths: Vec::new(),
+    }
+}
+
+/// Builds a placeholder [`AssertionResult`] with `Judgement::Unknown` when
+/// neither engine produced a usable result.  Used to keep the orchestrator's
+/// return type uniform (never `Err`).
+fn empty_unknown_result(
+    site: &AssertionSite,
+    debug_names: &HashMap<String, String>,
+) -> AssertionResult {
+    let empty = NodeSummary {
+        node: site.node,
+        reach: Formula::True,
+        state: Formula::True,
+        must_reach: Formula::False,
+    };
+    AssertionResult {
+        site_id: site.id,
+        site_label: site.location.clone(),
+        source_location: site.source_location.clone().into(),
+        judgement: Judgement::Unknown,
+        entry_summary: empty.clone(),
+        assertion_summary: empty,
+        debug_names: debug_names.clone(),
+    }
+}

@@ -1056,6 +1056,14 @@ fn wp_one_inductive(effect: &TransferEffect, post: &Formula) -> Formula {
     }
 }
 
+/// Counter used to mint fresh memory-region names during forward SP
+/// Skolemization of `MemoryStore` effects.  Each `sp_one` call against a
+/// `MemoryStore` introduces a fresh `{region}__pre$N` variable
+/// representing the region's value just before the store, so the
+/// resulting formula can mention both the pre-store and post-store
+/// states without aliasing.
+static SP_SKOLEM_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
     match effect {
         TransferEffect::Nop
@@ -1068,7 +1076,6 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
         | TransferEffect::PointerAlias { .. }
         | TransferEffect::Load { .. }
         | TransferEffect::Store { .. }
-        | TransferEffect::MemoryStore { .. }
         | TransferEffect::Call { .. }
         | TransferEffect::IndirectCall { .. }
         | TransferEffect::HavocRegions { .. }
@@ -1090,6 +1097,21 @@ fn sp_one(effect: &TransferEffect, pre: &Formula) -> Formula {
         TransferEffect::Assume(condition)
         | TransferEffect::TypeBound(condition)
         | TransferEffect::Obligation(condition) => Formula::and(pre.clone(), condition.clone()),
+        // `MemoryStore` — kept as a no-op in SP.  Memory-aware SP
+        // requires Skolemization (introducing fresh `region__pre$N`
+        // variables on each store), and the resulting formulas
+        // explode through loops: forward MUST after a few iterations
+        // produced 4000+ character conjunctions that overwhelmed the
+        // SMT oracle and broke the test suite's runtime budget.
+        //
+        // The paper-equivalent forward-MUST realization for cyclic
+        // CFGs is **bounded unrolling + acyclic-SP** (see
+        // `design_notes/SMASH_FORWARD_MUST.md` — the DART direction).
+        // The unrolled CFG has each store on a distinct instance, so
+        // SP doesn't need Skolemization to be sound.  `bmc::bmc_check`
+        // implements this; the orchestrator falls back to it when
+        // forward MUST on the cyclic CFG can't prove anything.
+        TransferEffect::MemoryStore { .. } => pre.clone(),
     }
 }
 

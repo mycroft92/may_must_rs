@@ -28,44 +28,61 @@ pub struct NodeSummary {
     /// The CFG node this summary belongs to.
     pub node: CfgNodeId,
 
-    /// **Forward component.** A formula whose models overapproximate the set of
-    /// entry states from which this node is reachable.  Starts as `False`
-    /// (unreachable) and grows under disjunction as forward propagation adds
-    /// new reachability paths.  Loop headers receive injected loop invariants
-    /// to accelerate convergence.
+    /// **Forward MAY (SP, over-approximation).** A formula whose models
+    /// over-approximate the set of entry states from which this node is
+    /// reachable.  Starts as `False` (unreachable) and grows under
+    /// disjunction as forward propagation adds new reachability paths.  Loop
+    /// headers receive injected loop invariants to accelerate convergence.
+    ///
+    /// SMASH-paper term: **MAY**.  Used to prune backward NOT-MAY propagation
+    /// via [`crate::may_must_analysis::rules::RuleEngine::notmay_pre_pruned`].
     pub reach: Formula,
 
-    /// **Backward component.** A formula whose models underapproximate the set
-    /// of entry states that can lead to an assertion violation through this
-    /// node.  Concretely, it is the weakest precondition of `NOT obligation`
-    /// accumulated from the assertion site backward through this node.  Starts
-    /// as `False` (no violation possible) and grows under disjunction as
-    /// backward propagation discovers new violation paths.
+    /// **Backward NOT-MAY (WP, over-approximation).**  A formula whose models
+    /// over-approximate the set of entry states that can lead to an assertion
+    /// violation through this node.  It is the weakest precondition of
+    /// `NOT obligation` accumulated from the assertion site backward through
+    /// this node.  Starts as `False` (no violation possible) and grows under
+    /// disjunction as backward propagation discovers new violation paths.
+    ///
+    /// SMASH-paper term: **NOT-MAY**.  If `state[entry]` is `False`, the
+    /// procedure is verified safe.
     pub state: Formula,
+
+    /// **Forward MUST scaffolding — DEPRECATED.**
+    ///
+    /// Originally intended as the under-approximate concrete-reachability
+    /// component, paired with `RuleEngine::forward_must_post`.  Never wired
+    /// into the fixpoint because `TransferFn::sp` does not model memory.
+    /// The functional realization of forward MUST is backward NOT-MAY on
+    /// an acyclic CFG — see `design_notes/SMASH_FORWARD_MUST.md`.  Slated
+    /// for deletion in a future cleanup.
+    pub must_reach: Formula,
 }
 
 impl NodeSummary {
     /// Creates a summary for a node that is considered **unreachable** at
-    /// initialisation time.  Both `reach` and `state` are `False`, reflecting
-    /// that nothing is known to flow through this node yet.
+    /// initialisation time.  All three components are `False`.
     pub fn unreachable(node: CfgNodeId) -> Self {
         Self {
             node,
             reach: Formula::False,
             state: Formula::False,
+            must_reach: Formula::False,
         }
     }
 
     /// Creates the seed summary for the **procedure entry** node.
     ///
-    /// `reach` is `True` (the entry is always reachable from itself) and
-    /// `state` is `False` (no violation condition has been propagated back to
-    /// the entry yet).
+    /// `reach` and `must_reach` are `True` (the entry is trivially reachable
+    /// both over- and under-approximately).  `state` is `False` (no violation
+    /// condition has been propagated back to the entry yet).
     pub fn entry(node: CfgNodeId) -> Self {
         Self {
             node,
             reach: Formula::True,
             state: Formula::False,
+            must_reach: Formula::True,
         }
     }
 
@@ -102,6 +119,17 @@ impl NodeSummary {
     pub fn join_state(&mut self, incoming: &Formula) {
         self.state = Formula::or(self.state.clone(), incoming.clone());
     }
+
+    /// Widens `must_reach` by joining it with `incoming` under disjunction.
+    ///
+    /// Callers must ensure `incoming` is **feasibility-checked** before
+    /// joining — i.e. the SMT oracle has confirmed there exists a model of
+    /// `incoming` corresponding to a real reachable execution.  The
+    /// resulting disjunction preserves the under-approximation invariant:
+    /// every model of `must_reach` is a real concrete reachable state.
+    pub fn join_must_reach(&mut self, incoming: &Formula) {
+        self.must_reach = Formula::or(self.must_reach.clone(), incoming.clone());
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +156,7 @@ mod tests {
             node: CfgNodeId(1),
             reach: Formula::False,
             state: Formula::bool_var("x"),
+            must_reach: Formula::False,
         };
         assert_eq!(summary.combined(), Formula::False);
     }

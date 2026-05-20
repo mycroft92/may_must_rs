@@ -916,7 +916,7 @@ fn run_tier(
             }
         );
         if result.is_accepted() {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "achar cegis: function {function} loop {loop_index} [{tier_name}]: \
                  accepted invariant: {}",

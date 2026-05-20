@@ -81,6 +81,11 @@ pub struct AdaptedProcedure {
     /// variable name from LLVM debug info (e.g. `array`).  Empty when compiled
     /// without `-g`.  Used only for human-readable debug output.
     pub debug_names: HashMap<String, String>,
+    /// SSA names of formal parameters as they appear inside the procedure
+    /// (e.g. `main$%0`, `main$%1`).  Required by `query::ProcedureInterface`
+    /// to distinguish formals (interface scalars) from local SSA registers
+    /// during projection.
+    pub formal_parameters: Vec<String>,
 }
 
 /// A single `may_assert(cond)` call site within a function.
@@ -568,6 +573,7 @@ pub fn adapt_with_purity_and_summaries(
         debug_names.insert(key, val);
     }
 
+    let formal_parameters = formal_parameter_names(graph, &graph.name);
     Ok(AdaptedProcedure {
         name: graph.name.clone(),
         cfg,
@@ -575,6 +581,7 @@ pub fn adapt_with_purity_and_summaries(
         instruction_nodes,
         ptr_at,
         debug_names,
+        formal_parameters,
     })
 }
 

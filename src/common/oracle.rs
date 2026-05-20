@@ -232,6 +232,7 @@ mod tests {
             node: CfgNodeId(0),
             reach: Formula::True,
             state: Formula::False,
+            must_reach: Formula::False,
         };
         let report = oracle.check_summary(&summary).unwrap();
         assert_eq!(report.feasibility, Feasibility::Infeasible);
