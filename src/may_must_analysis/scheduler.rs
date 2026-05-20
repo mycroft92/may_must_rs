@@ -33,8 +33,8 @@ use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::InvariantConfig;
 use crate::may_must_analysis::loops::VerifiedLoopInvariant;
 use crate::may_must_analysis::query::{
-    create_must_summary, create_notmay_summary, ContextualSummaryTable, ProcedureInterface, Query,
-    QueryId,
+    create_must_summary_with_debug_names, create_notmay_summary_with_debug_names,
+    ContextualSummaryTable, ProcedureInterface, Query, QueryId,
 };
 use crate::may_must_analysis::rules::Judgement;
 use crate::may_must_analysis::smash::{self, SmashRunResult, SmashSummaryDB};
@@ -246,7 +246,13 @@ impl Scheduler {
 
                 // CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY from the query
                 // result and merge into `self.table`.
-                self.create_and_merge_summary(&entry.query, &run.assertion, &ctx.interface, oracle);
+                self.create_and_merge_summary(
+                    &entry.query,
+                    &run.assertion,
+                    &ctx.interface,
+                    oracle,
+                    &ctx.debug_names,
+                );
 
                 DispatchOutcome::Completed(run)
             }
@@ -287,10 +293,13 @@ impl Scheduler {
         assertion: &crate::may_must_analysis::backward::AssertionResult,
         interface: &ProcedureInterface,
         oracle: &Oracle,
+        debug_names: &HashMap<String, String>,
     ) {
         match &assertion.judgement {
             Judgement::Verified => {
-                if let Some(summary) = create_notmay_summary(query, interface) {
+                if let Some(summary) =
+                    create_notmay_summary_with_debug_names(query, interface, Some(debug_names))
+                {
                     match self
                         .table
                         .merge_notmay(interface.procedure.clone(), summary, oracle)
@@ -320,7 +329,9 @@ impl Scheduler {
                 // we'll use the under-approximate `must_reach` instead.
                 let pre = &assertion.entry_summary.state;
                 let post = &assertion.assertion_summary.state;
-                if let Some(summary) = create_must_summary(pre, post, interface) {
+                if let Some(summary) =
+                    create_must_summary_with_debug_names(pre, post, interface, Some(debug_names))
+                {
                     match self
                         .table
                         .merge_must(interface.procedure.clone(), summary, oracle)

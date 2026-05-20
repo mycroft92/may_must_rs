@@ -431,7 +431,7 @@ fn synthesize_loop_invariants(
 
     for (index, loop_info) in loops.into_iter().enumerate() {
         let loop_loc = crate::may_must_analysis::loops::fmt_loop_loc(&loop_info);
-        log::info!(
+        log::debug!(
             target: "loop_invariant",
             "function {function} loop {} [{}]: synthesizing invariant [mode={}]",
             index + 1, loop_loc, mode.name()
@@ -552,7 +552,7 @@ fn synthesize_loop_invariants(
         }
 
         if accepted_candidate.is_none() {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: no invariant accepted — synthesis failed",
                 index + 1
@@ -719,7 +719,7 @@ fn first_accepted_candidate(
             render_invariant_result(&result)
         );
         if result.is_accepted() {
-            log::info!(
+            log::debug!(
                 target: "loop_invariant",
                 "function {function} loop {}: {} accepted invariant: {}",
                 loop_index, phase, pretty_formula_with_names(&normalized, debug_names)

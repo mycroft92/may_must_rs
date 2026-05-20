@@ -31,7 +31,7 @@ use crate::common::abstract_cfg::substitute_var_in_formula;
 use crate::common::formula::{Formula, Memory, SmtModel, Term, Var};
 use crate::common::oracle::{Oracle, OracleError, Validity};
 use crate::may_must_analysis::summaries::{MaySummary, NotMaySummary, ProcedureName};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A demand-driven query asking one Hoare-style question of one procedure.
 ///
@@ -611,6 +611,18 @@ impl ProcedureInterface {
 /// whose value couldn't be tied to interface inputs, or a conditional
 /// store whose unevaluated branch left a `select(_, branch_local)`).
 pub fn project_to_interface(formula: &Formula, interface: &ProcedureInterface) -> Option<Formula> {
+    project_to_interface_with_debug_names(formula, interface, None)
+}
+
+/// Same as [`project_to_interface`], but if projection fails the diagnostic
+/// log message renders the offending SSA names through `debug_names` (mapping
+/// e.g. `main$%6` → `cmp` / `j` from LLVM debug info) so the watchpoint is
+/// actionable from C source.
+pub fn project_to_interface_with_debug_names(
+    formula: &Formula,
+    interface: &ProcedureInterface,
+    debug_names: Option<&HashMap<String, String>>,
+) -> Option<Formula> {
     // Collect substitution candidates: equalities `Eq(Var(local), expr)`
     // or `Eq(expr, Var(local))` where local is a non-interface scalar.
     let mut substitutions: BTreeMap<String, Term> = BTreeMap::new();
@@ -635,18 +647,35 @@ pub fn project_to_interface(formula: &Formula, interface: &ProcedureInterface) -
     // Verify no non-interface scalars remain.
     let remaining = find_non_interface_scalars(&projected, interface);
     if !remaining.is_empty() {
+        let rendered = render_locals_with_debug_names(&remaining, debug_names);
         log::info!(
             target: "projection",
-            "project_to_interface({}): could not eliminate {:?} — discarding summary. \
+            "project_to_interface({}): could not eliminate {} — discarding summary. \
              Debug-watchpoint: these locals were not bound by an Eq(local, interface-only-expr) \
              conjunct in the formula being projected.",
             interface.procedure,
-            remaining,
+            rendered,
         );
         return None;
     }
 
     Some(projected)
+}
+
+/// Render a set of SSA local names like `{main$%6, main$%8}` with their C-source
+/// names attached when available, e.g. `{main$%6 (cmp), main$%8 (j)}`.
+fn render_locals_with_debug_names(
+    locals: &BTreeSet<String>,
+    debug_names: Option<&HashMap<String, String>>,
+) -> String {
+    let parts: Vec<String> = locals
+        .iter()
+        .map(|name| match debug_names.and_then(|m| m.get(name)) {
+            Some(src) if src != name => format!("{name} ({src})"),
+            _ => name.clone(),
+        })
+        .collect();
+    format!("{{{}}}", parts.join(", "))
 }
 
 // ── CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY ────────────────────────────
@@ -676,8 +705,18 @@ pub fn create_notmay_summary(
     query: &Query,
     interface: &ProcedureInterface,
 ) -> Option<NotMaySummary> {
-    let pre = project_to_interface(&query.pre, interface)?;
-    let post = project_to_interface(&query.post, interface)?;
+    create_notmay_summary_with_debug_names(query, interface, None)
+}
+
+/// Same as [`create_notmay_summary`], but threads `debug_names` into the
+/// projection diagnostic so failed projections show C-source names.
+pub fn create_notmay_summary_with_debug_names(
+    query: &Query,
+    interface: &ProcedureInterface,
+    debug_names: Option<&HashMap<String, String>>,
+) -> Option<NotMaySummary> {
+    let pre = project_to_interface_with_debug_names(&query.pre, interface, debug_names)?;
+    let post = project_to_interface_with_debug_names(&query.post, interface, debug_names)?;
     log::debug!(
         target: "summaries",
         "[CREATE_NOTMAYSUMMARY] {}: pre={:?} post={:?}",
@@ -713,8 +752,19 @@ pub fn create_must_summary(
     concrete_post: &Formula,
     interface: &ProcedureInterface,
 ) -> Option<ContextualMustSummary> {
-    let pre = project_to_interface(concrete_entry, interface)?;
-    let post = project_to_interface(concrete_post, interface)?;
+    create_must_summary_with_debug_names(concrete_entry, concrete_post, interface, None)
+}
+
+/// Same as [`create_must_summary`], but threads `debug_names` into the
+/// projection diagnostic so failed projections show C-source names.
+pub fn create_must_summary_with_debug_names(
+    concrete_entry: &Formula,
+    concrete_post: &Formula,
+    interface: &ProcedureInterface,
+    debug_names: Option<&HashMap<String, String>>,
+) -> Option<ContextualMustSummary> {
+    let pre = project_to_interface_with_debug_names(concrete_entry, interface, debug_names)?;
+    let post = project_to_interface_with_debug_names(concrete_post, interface, debug_names)?;
     log::debug!(
         target: "summaries",
         "[CREATE_MUSTSUMMARY] {}: pre={:?} post={:?}",

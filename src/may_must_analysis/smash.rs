@@ -49,6 +49,7 @@ use crate::may_must_analysis::backward::{
     analyze_with_tables, AssertionResult, BackwardError, InvariantConfig,
 };
 use crate::may_must_analysis::bmc;
+use crate::may_must_analysis::forward_must::{self, DartConfig};
 use crate::may_must_analysis::loops::VerifiedLoopInvariant;
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::rules::Judgement;
@@ -152,7 +153,10 @@ pub struct SmashRunResult {
 pub enum VerdictEngine {
     /// Verdict came from the may direction (combined `reach ∧ state` check).
     MayInvariantAnalysis,
-    /// Verdict came from the must direction (BMC at a specific bound).
+    /// Verdict came from forward MUST (DART path enumeration).
+    MustDart,
+    /// Verdict came from BMC at a specific bound (legacy fallback; kept as
+    /// a backup mode but no longer wired into the primary verdict pipeline).
     MustBmc { bound: usize },
     /// Both engines failed to produce a decisive verdict; final = Unknown.
     Inconclusive,
@@ -162,6 +166,7 @@ impl VerdictEngine {
     pub fn label(self) -> String {
         match self {
             VerdictEngine::MayInvariantAnalysis => "may/invariant-analysis".into(),
+            VerdictEngine::MustDart => "must/dart".into(),
             VerdictEngine::MustBmc { bound } => format!("must/bmc bound={bound}"),
             VerdictEngine::Inconclusive => "inconclusive".into(),
         }
@@ -253,40 +258,49 @@ pub fn run_smash(
         }
     };
 
-    // ── Forward MUST direction (realized as DART-style bounded unroll) ──
+    // ── Forward MUST direction (DART path enumeration) ─────────────────
     //
-    // The paper's forward MUST direction is an under-approximate
-    // concrete-path enumerator.  For cyclic CFGs we realize it as
-    // **bounded unrolling**: pick a depth `k`, unroll loops to that
-    // depth, and run the (now-acyclic) backward analysis.  Each
-    // completed path through the unrolled CFG is a real concrete
-    // execution; if its `reach ∧ state` is SAT, the witness is a real
-    // bug.
+    // Per `design_docs/DART.md`, forward MUST is realized as DART:
+    // depth-first enumeration of concrete paths from entry to the
+    // assertion node, with one SMT feasibility-with-model query per
+    // path.  A SAT model on `path_condition ∧ phi2` is a real
+    // counterexample.  Loops are handled by the `max_loop_iters` knob
+    // — we walk each path on the original cyclic CFG up to that many
+    // re-visits per node, no physical CFG unrolling needed.
     //
-    // The unroll bound comes from `config.bmc_bound`.  Per the user's
-    // direction (paper-equivalent forward MUST via DART, falling back
-    // to bounded unrolling), this is "BMC as forward-MUST realization"
-    // — same algorithm, paper-correct framing.
-    let bmc_bound = config.and_then(|c| c.bmc_bound).unwrap_or(2);
-    if bmc_bound > 0 {
-        if let Some(bmc_result) = bmc::bmc_check(cfg, site, oracle, bmc_bound) {
+    // The `bmc_bound` config field is reused as `max_loop_iters` so
+    // existing CLI flags still control unroll depth.  BMC remains
+    // present in `bmc.rs` as a worst-case backup but is no longer
+    // wired into the primary verdict pipeline (see `bmc.rs` module
+    // doc — kept available for the user's "BMC as ultimate backup"
+    // preference; bring back here if DART regresses).
+    let max_loop_iters = config.and_then(|c| c.bmc_bound).unwrap_or(2);
+    if max_loop_iters > 0 {
+        let dart_config = DartConfig {
+            max_loop_iters,
+            ..DartConfig::default()
+        };
+        if let Some(dart_result) =
+            forward_must::dart_explore(cfg, site, oracle, dart_config, debug_names)
+        {
             log::info!(
                 target: "engine_verdict",
-                "function {procedure_name} assertion #{} ({}): {:?} [engine=forward-must/bmc bound={bmc_bound}]",
-                site.id, site.location, bmc_result.judgement
+                "function {procedure_name} assertion #{} ({}): {:?} [engine=forward-must/dart max_loop_iters={max_loop_iters}]",
+                site.id, site.location, dart_result.judgement
             );
             return SmashRunResult {
-                assertion: bmc_result,
-                engine: VerdictEngine::MustBmc { bound: bmc_bound },
+                assertion: dart_result,
+                engine: VerdictEngine::MustDart,
                 new_must_paths: Vec::new(),
             };
         }
         log::info!(
             target: "engine_verdict",
-            "function {procedure_name} assertion #{} ({}): Unknown [engine=forward-must/bmc bound={bmc_bound} exhausted]",
+            "function {procedure_name} assertion #{} ({}): Unknown [engine=forward-must/dart max_loop_iters={max_loop_iters} exhausted]",
             site.id, site.location
         );
     }
+    let _ = bmc::bmc_check; // keep bmc module reachable for the backup path
 
     // ── Final: may's Unknown (or an empty Unknown if may also errored) ──
     let assertion = may_unknown_or_error.unwrap_or_else(|| empty_unknown_result(site, debug_names));

@@ -3,6 +3,7 @@ pub mod backward;
 pub mod bmc;
 pub mod chc;
 pub mod driver;
+pub mod forward_must;
 pub mod loops;
 pub mod node_summary;
 pub mod providers;
