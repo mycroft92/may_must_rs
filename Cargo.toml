@@ -26,3 +26,8 @@ z3-sys = "0"
 [[bin]]
 name = "main"
 path = "src/main.rs"
+
+
+[target.x86_64-unknown-linux-gnu] # Adjust the target triple as needed
+linker = "cc"
+rustflags = ["-Clinker-flavor=ld.gold"] 
