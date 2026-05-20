@@ -8,18 +8,18 @@ and flags any soundness or completeness anomalies.
 
 ---
 
-## 2026-05-20 — `2a5f88b`
+## 2026-05-20 — `577e672`
 
 Run: all files
 
 | Category | SAFE | UNSAFE | UNKNOWN | TIMEOUT | ERROR | Wrong | Total |
 |---|---|---|---|---|---|---|---|
 | infeasible-control-flow | 10 | 0 | 0 | 0 | 0 | 0 | 10 |
-| locks | 0 | 0 | 9 | 4 | 0 | 0 | 13 |
+| locks | 0 | 0 | 12 | 1 | 0 | 0 | 13 |
 | loop-crafted | 5 | 1 | 3 | 0 | 0 | 0 | 9 |
 | loop-invariants | 5 | 1 | 4 | 0 | 0 | **1** | 10 |
-| loops | 20 | 16 | 27 | 0 | 0 | **10** | 63 |
-| **Total** | **40** | **18** | **43** | **4** | **0** | **11** | **105** |
+| loops | 20 | 13 | 30 | 0 | 0 | **10** | 63 |
+| **Total** | **40** | **15** | **49** | **1** | **0** | **11** | **105** |
 
 **Soundness / completeness flags:**
   - MISSED:  `c/loops/compact` expected UNSAFE, got SAFE
@@ -39,18 +39,18 @@ Run: all files
 ---
 
 
-## 2026-05-19 — `492758c`
+## 2026-05-20 — `2a5f88b`
 
 Run: all files
 
 | Category | SAFE | UNSAFE | UNKNOWN | TIMEOUT | ERROR | Wrong | Total |
 |---|---|---|---|---|---|---|---|
 | infeasible-control-flow | 10 | 0 | 0 | 0 | 0 | 0 | 10 |
-| locks | 0 | 0 | 8 | 5 | 0 | 0 | 13 |
+| locks | 0 | 0 | 9 | 4 | 0 | 0 | 13 |
 | loop-crafted | 5 | 1 | 3 | 0 | 0 | 0 | 9 |
 | loop-invariants | 5 | 1 | 4 | 0 | 0 | **1** | 10 |
 | loops | 20 | 16 | 27 | 0 | 0 | **10** | 63 |
-| **Total** | **40** | **18** | **42** | **5** | **0** | **11** | **105** |
+| **Total** | **40** | **18** | **43** | **4** | **0** | **11** | **105** |
 
 **Soundness / completeness flags:**
   - MISSED:  `c/loops/compact` expected UNSAFE, got SAFE
