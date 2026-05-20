@@ -48,6 +48,7 @@ use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::{
     analyze_with_tables, AssertionResult, BackwardError, InvariantConfig,
 };
+use crate::may_must_analysis::bmc;
 use crate::may_must_analysis::loops::VerifiedLoopInvariant;
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::rules::Judgement;
@@ -252,19 +253,40 @@ pub fn run_smash(
         }
     };
 
-    // ── Must direction ───────────────────────────────────────────────────
+    // ── Forward MUST direction (realized as DART-style bounded unroll) ──
     //
-    // BMC was previously called here as a stopgap forward-MUST
-    // realization.  Per the strict QUERY_REFACTOR path, we now wait for
-    // the paper-equivalent forward MUST (loop-summary based,
-    // under-approximate, paired with backward NOT-MAY) to mature.  The
-    // `bmc::bmc_check` engine remains available for explicit invocation
-    // but is no longer auto-invoked from the analysis path.
+    // The paper's forward MUST direction is an under-approximate
+    // concrete-path enumerator.  For cyclic CFGs we realize it as
+    // **bounded unrolling**: pick a depth `k`, unroll loops to that
+    // depth, and run the (now-acyclic) backward analysis.  Each
+    // completed path through the unrolled CFG is a real concrete
+    // execution; if its `reach ∧ state` is SAT, the witness is a real
+    // bug.
     //
-    // The result of cutting BMC: cyclic programs whose safety we cannot
-    // prove via backward NOT-MAY become UNKNOWN instead of UNSAFE.
-    // UNKNOWN is sound (no false claims); a real bug witness will arrive
-    // when the paper-equivalent forward MUST direction is wired in.
+    // The unroll bound comes from `config.bmc_bound`.  Per the user's
+    // direction (paper-equivalent forward MUST via DART, falling back
+    // to bounded unrolling), this is "BMC as forward-MUST realization"
+    // — same algorithm, paper-correct framing.
+    let bmc_bound = config.and_then(|c| c.bmc_bound).unwrap_or(2);
+    if bmc_bound > 0 {
+        if let Some(bmc_result) = bmc::bmc_check(cfg, site, oracle, bmc_bound) {
+            log::info!(
+                target: "engine_verdict",
+                "function {procedure_name} assertion #{} ({}): {:?} [engine=forward-must/bmc bound={bmc_bound}]",
+                site.id, site.location, bmc_result.judgement
+            );
+            return SmashRunResult {
+                assertion: bmc_result,
+                engine: VerdictEngine::MustBmc { bound: bmc_bound },
+                new_must_paths: Vec::new(),
+            };
+        }
+        log::info!(
+            target: "engine_verdict",
+            "function {procedure_name} assertion #{} ({}): Unknown [engine=forward-must/bmc bound={bmc_bound} exhausted]",
+            site.id, site.location
+        );
+    }
 
     // ── Final: may's Unknown (or an empty Unknown if may also errored) ──
     let assertion = may_unknown_or_error.unwrap_or_else(|| empty_unknown_result(site, debug_names));

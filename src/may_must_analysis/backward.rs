@@ -341,16 +341,15 @@ fn run_backward(
     engine.set_state(site.node, pre_at_assertion)?;
     engine.run_to_fixpoint(&order, tables, oracle)?;
 
-    // SMASH-paper verdict logic.  See `design_notes/SMASH_FORWARD_MUST.md`
-    // for the mapping between paper directions and our implementation.
+    // Verdict logic:
     //
-    // - **Verified (NOT-MAY at entry)** — backward over-approximation rules
-    //   out every violation: `reach ∧ state` infeasible at entry.
-    // - **BugFound (forward MUST)** — realized as backward WP on a CFG that
-    //   is acyclic (no loop-invariant widening, so WP is precise modulo SMT).
-    //   For cyclic CFGs this path is unsound and is disabled here; the SMASH
-    //   orchestrator calls `bmc::bmc_check` to unroll loops and re-run the
-    //   sound acyclic version of this same check.
+    // - **Backward NOT-MAY** (over-approx, paper's NOT-MAY): if
+    //   `reach ∧ state` at entry is infeasible, the assertion is safe.
+    // - **Acyclic BugFound** — sound only on natively-acyclic CFGs (no
+    //   loop-invariant widening; SP and WP are precise modulo SMT).
+    //   For cyclic CFGs the forward-MUST direction must be realized via
+    //   bounded unrolling (`bmc::bmc_check`) — see
+    //   `design_notes/SMASH_FORWARD_MUST.md`.
     let cfg_is_acyclic = cfg.detect_back_edges().is_empty();
     let bug = engine.bugfound(cfg.entry(), oracle, cfg_is_acyclic)?;
     let judgement = if let Some(model) = bug {
@@ -1053,26 +1052,12 @@ mod tests {
         assert!(matches!(result.judgement, Judgement::Verified));
     }
 
-    #[test]
-    fn analyze_rejects_cyclic_cfg() {
-        let mut cfg = AbstractCfg::new("entry");
-        let n = cfg.add_node("n", TransferFn::identity());
-        cfg.add_edge(cfg.entry(), n, Formula::True, vec![]).unwrap();
-        cfg.add_edge(n, cfg.entry(), Formula::True, vec![]).unwrap();
-        cfg.mark_exit(n).unwrap();
-        let site = AssertionSite {
-            id: 1,
-            node: n,
-            source_location: SourceLocation::new("t.c", 1, 1),
-            location: "loop".to_string(),
-            obligation: Formula::True,
-        };
-        let oracle = Oracle::new();
-        assert!(matches!(
-            analyze(&cfg, &site, &oracle),
-            Err(BackwardError::CyclicCfgUnsupported)
-        ));
-    }
+    // Removed: `analyze_rejects_cyclic_cfg`.  The old contract was that
+    // cyclic CFGs without a verifiable loop invariant returned an error
+    // (`CyclicCfgUnsupported`).  After the forward-MUST direction landed
+    // (`run_forward_must_only`), cyclic CFGs without an invariant fall
+    // through to a forward-MUST-only path that can return Unknown or
+    // BugFound.  The old test's expectation no longer holds.
 
     #[test]
     fn render_result_contains_judgement() {

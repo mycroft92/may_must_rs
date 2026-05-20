@@ -1631,25 +1631,30 @@ mod tests {
     }
 
     #[test]
-    fn array_2_is_not_falsely_verified() {
-        // array-2 is identical to array-1 except the assertion is strict:
-        // `array[0] > menor` (vs. `>=`).  The body forces
-        // `menor <= array[0]` (non-strict), so when `menor_orig <= array[0]`
-        // the body sets `menor = array[0]` and the assertion FAILS.
+    fn array_2_is_unsafe_via_forward_must() {
+        // **Litmus test for forward MUST + backward NOT-MAY interplay.**
         //
-        // Under the strict QUERY_REFACTOR path (no BMC auto-fallback), the
-        // result must be **not-Safe** — Unknown today, eventually UNSAFE
-        // via the paper-equivalent forward MUST direction once it's wired
-        // in.  The litmus is that we never produce a false Safe verdict.
+        // array-2 has assertion `array[0] > menor` (strict).  The body
+        // forces `menor <= array[0]` (non-strict), so when
+        // `menor_orig <= array[0]` the body sets `menor = array[0]` and
+        // the assertion FAILS at iteration 1.
+        //
+        // Forward MUST (realized as bounded-unroll DART per
+        // `design_notes/SMASH_FORWARD_MUST.md`) must find this concrete
+        // bug.  Verdict: UNSAFE.
+        //
+        // Companion test: `array_1_verified` — backward NOT-MAY proves
+        // the non-strict assertion safe via the ACHAR invariant
+        // `((j==0)||(array[0]>=menor)) ∧ (SIZE==1)`.
         with_bc_graphs("array-2", |graphs| {
             let oracle = Oracle::new();
             let memory_pure = crate::common::adapter::infer_memory_pure_functions(graphs);
             let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
             let proc = procedure(&report, "main");
-            assert_ne!(
+            assert_eq!(
                 proc.verdict(),
-                SafetyVerdict::Safe,
-                "array-2 must not be falsely Verified"
+                SafetyVerdict::Unsafe,
+                "array-2 must be UNSAFE via forward MUST (DART-style bounded unroll)"
             );
         });
     }

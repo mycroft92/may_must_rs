@@ -51,7 +51,7 @@ Paper:
 | Subsumption-aware reuse (forward_may_usesummary checks pre via implies) | #18 | 6 | ✅ done |
 | 6A — Scheduler reshape to per-module | #16 | (decomposed) | ✅ done |
 | 6B — Module-level Scheduler ownership; bridge `sched.table` → legacy `SummaryTables` between procedures | #16 | 6 (cont'd) | in progress |
-| 6C — Cut `compute_return_summary` from analysis path; contextual summaries alone | #16 | 7 + 8 | pending |
+| 6C — ~~Cut `compute_return_summary`~~ KEEP as bottom-up summary harvester producing paper-valid `(pre=True, post=relation)` entries.  Query-driven flow adds context-specific entries on top. | #16 | 8 | resolved (keep) |
 | Per-region `N_e` evidence (only if test-motivated) | #19 | (skipped unless needed) | pending |
 | In-progress query subsumption for recursion | #21 | 9 | pending |
 
