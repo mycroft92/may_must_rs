@@ -358,7 +358,7 @@ pub fn check_loop_invariant_verbose(
         &[(info.latch, back_edge_requirement)],
         &excluded,
         Some(&info.body),
-        true,
+        false,
         inner,
         true,
     ) else {
@@ -368,7 +368,47 @@ pub fn check_loop_invariant_verbose(
         .get(&info.header)
         .cloned()
         .unwrap_or(Formula::False);
-    match oracle.implies_with_model(&candidate, &inductive_header) {
+
+    // Hoare-style inductiveness: {I ∧ loop_guard} body {I}
+    // i.e., I ∧ loop_guard → WP(body, I)
+    //
+    // backward_states propagates through the header→body edge, folding its guard
+    // into inductive_header. The check "I → inductive_header" wrongly requires
+    // I to imply the loop-continuation guard unconditionally. Instead we add the
+    // continuation guard to the antecedent so it only needs to hold when the loop
+    // actually iterates.
+    //
+    // Compute the loop-continuation guard in memory-cell terms by applying the
+    // header node's WP to each body-entering (non-exit) edge guard.
+    // Compute the loop-continuation guard in pre-state terms (at info.header) by
+    // running a backward propagation seeded with True at the latch.  This
+    // traverses the same body path as the inductiveness propagation but picks up
+    // ONLY the path condition (the branch guard on the body-entering edge), not
+    // any invariant preservation requirement.  The result at the header captures
+    // exactly the states from which the loop body can execute at least once.
+    //
+    // We need this because info.header is the first instruction of the header
+    // basic block (an instruction-level CFG), so its direct outgoing edges are
+    // sequential (guard=True).  The actual conditional branch is deeper in the
+    // body; backward propagation with a True seed correctly extracts it.
+    let continuation_guard: Formula = backward_states(
+        cfg,
+        &[(info.latch, Formula::True)],
+        &excluded,
+        Some(&info.body),
+        false,
+        inner,
+        false,
+    )
+    .and_then(|states| states.get(&info.header).cloned())
+    .unwrap_or(Formula::True);
+
+    // Hoare-style inductiveness: {I ∧ loop_guard} body {I}
+    // i.e., (I ∧ continuation_guard) → inductive_header
+    // where inductive_header = continuation_guard ∧ WP_body(I).
+    // Cancelling continuation_guard from both sides: I ∧ B → WP_body(I).
+    let inductive_antecedent = Formula::and(candidate.clone(), continuation_guard);
+    match oracle.implies_with_model(&inductive_antecedent, &inductive_header) {
         Ok((Validity::Valid, _)) => {}
         Ok((Validity::Invalid, model)) => {
             return InvariantCheckResult::InductivenessFailed { witness: model }
