@@ -1451,6 +1451,31 @@ mod tests {
     }
 
     #[test]
+    fn compact_small_is_unsafe() {
+        // Two sequential loops: fill array[3] with nondet chars, then search for
+        // a nondet target ND.  If no element matches, assert(0) fires.  Always
+        // reachable (pick ND and all array values to differ) → UNSAFE.
+        //
+        // Regression for the vacuous-initiation soundness bug (v0.20.0): when
+        // forward_reach_at_header returns False for the search loop (sequential
+        // counting loops — the acyclic skeleton cannot model the fill loop's
+        // counter reaching its exit value), any invariant candidate passed
+        // initiation trivially and the backward engine emitted a spurious SAFE.
+        // The small array size lets DART find the concrete counterexample.
+        with_bc_graphs("compact_small", |graphs| {
+            let oracle = Oracle::new();
+            let memory_pure = crate::cfg::adapter::infer_memory_pure_functions(graphs);
+            let report = analyze_module(graphs, &memory_pure, &oracle).unwrap();
+            let proc = procedure(&report, "main");
+            assert_eq!(
+                proc.verdict(),
+                SafetyVerdict::Unsafe,
+                "compact_small must be UNSAFE: error is reachable when no array element matches ND"
+            );
+        });
+    }
+
+    #[test]
     fn heap_distinct_malloc_sites_do_not_alias() {
         // Two calls to malloc in the same function must produce distinct abstract
         // regions so that a write through one pointer does not invalidate the
