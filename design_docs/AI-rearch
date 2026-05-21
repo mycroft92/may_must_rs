@@ -1,0 +1,368 @@
+❯ I want to do something different now. I want to reorgranize the codebase into multiple sections that let you (the agent) work better with
+  limited context. We will split the codebase into subcomponents based on what phase it is used in. For example: llvm_wrap to program_graph set
+   in precfg section, abstract_cfg preparation with loop detection (if the modules need renaming and splitting, please do so), forward must
+  analysis, backward not may analysis, analysis scheduler, loop invariant generation modules, loop invariant verifier modules, reporting etc..
+  For each of these subcomponent splits, attach a md file of what it does and how it does in detail along with the contract it maintains with
+  external modules. This will serve as a development guide when we work on that component. Kindly write the necessary guidance md file to do
+  this. Move this in clean multiple phases checkpointing often. The aim is to reduce context overhead required to develop and debug. Use this
+  opportunity to also remove useless functions that we are not using or dont fit into the paper-equivalence plan. This includes precomputed
+  summaries or shortcut loopinvariant discoveries that are unsound.
+
+
+
+ Phased reorganization of May-Must-Analysis
+
+ Context
+
+ Why this change. The codebase is ~25k LOC across files that mostly exceed 1000 lines (adapter.rs 3023, loops.rs 1527, backward.rs 1458,
+ llvm_wrap.rs 1263, abstract_cfg.rs 1141, chc.rs 1002, rules.rs 981, driver.rs 976). To work on any one phase of the analyzer, an agent must
+ read 5+ huge files, blowing the context budget before editing begins. The current top-level split (src/{common, may_must_analysis,
+ absint_analysis}/) is by kind of code (shared vs. analysis-specific), not by pipeline phase, so a single phase concern (e.g. "loop invariant
+ verifier") is scattered across loops.rs, backward.rs, chc.rs, and the LLM modules.
+
+ Intended outcome. Reorganize into one top-level directory per pipeline phase, each with a short component.md describing purpose, public API,
+ contract with neighbors, and what is not done there. An agent working on, e.g., DART can load forward_must/component.md + forward_must/dart.rs
+  + the upstream cfg_prep/component.md and have everything needed without reading the rest of the tree. Also: delete unsound shortcuts (Phase 1
+  + Phase 1b summary seeds) and clearly-orphaned modules (absint_analysis/, expressions/, most of assertions/, main.rs_bak, dead summaries
+ helpers) that the user has flagged as not fitting paper-equivalence.
+
+ Strategy. 8 phases. Each phase ends with a clean cargo build --release && cargo test -- --test-threads=1, then commit-and-push. Each phase is
+ a self-contained checkpoint so a context reset between phases is safe. Cleanup precedes moves so we move less code.
+
+ ---
+ Final layout
+
+ src/
+   formula/                  predicate vocabulary
+     formula.rs              Formula, Term, Var, Sort, Memory, Rational, ModelValue, SmtModel, FormulaError
+     var_names.rs            VarNameMap, fallback_translate
+     component.md
+   smt/                      single SMT (Z3) boundary
+     solver.rs               SmtScope, quick_sat_check
+     oracle.rs               Oracle, Feasibility, Validity, FeasibilityReport
+     component.md
+   precfg/                   LLVM bitcode → FunctionGraph
+     llvm_wrap.rs            LLVM C-API wrappers (Context, Module, Function, BasicBlock, Instruction, Type, TargetData)
+     program_graph.rs        FunctionGraph builder, AssertSite, dump_graphs, generate_program_graph
+     component.md
+   cfg_prep/                 FunctionGraph → AbstractCfg + assertion lowering + loop detection
+     abstract_cfg.rs         AbstractCfg, AbstractNode, AbstractEdge, TransferFn, TransferEffect, PointerEnv, NodeKind
+     flat_layout.rs          FlatLayout (ptrtoint/inttoptr addressing)
+     adapter.rs              10-step LLVM lowering (kitchen sink; left as-is for now)
+     loop_detection.rs       LoopInfo, detect_loops, fmt_loop_loc, sort_innermost_first, compute_body, compute_exit_edges
+     source.rs               SourceLocation
+     errors.rs
+     component.md
+   loop_inv_gen/             invariant *candidate* synthesis (no validation here)
+     algorithmic.rs          algorithmic_candidates + helpers
+     discover.rs             discover_loop_invariants — multi-method dispatch (algorithmic→Houdini→Template→LLM)
+     llm/
+       provider.rs           LlmCandidateProvider, SubprocessLlmBackend, StubLlmBackend
+       prompt.rs             FullLoopContext, build_full_loop_context, build_loop_invariant_prompt, render_template,
+ build_recursive_summary_prompt, parse_candidate, collect_*_sorts
+       response_parser.rs    chumsky parser, SortSeeds, ParseError, parse_invariant, parse_invariant_seeds
+     component.md
+   loop_inv_verifier/        the soundness gate
+     check.rs                check_loop_invariant, check_loop_invariant_verbose, check_initiation_holds, InvariantCheckResult
+     component.md
+   forward_must/             DART (Pillar 2 — finds bugs)
+     dart.rs                 DartConfig, DartPathSummary, DartOutcome, dart_explore + private path enumeration / SSA / memory-state
+     component.md
+   backward_not_may/         Pillar 1 — proves SAFE
+     smash.rs                analyze, analyze_with_tables, smash() recursive engine
+     rules.rs                RuleEngine, Judgement, QueryContext, RuleError, edge_view (paper rules INIT-PI-NE/OMEGA, MUST-POST, NOTMAY-PRE)
+     node_summary.rs         NodeSummary
+     skolemise.rs            skolemise_locals, freshen_for_callsite
+     query_stack.rs          QueryFrame, QueryStack
+     summaries.rs            SummaryTables, MustSummary, NotMaySummary, AddOutcome (after dead-code purge)
+     config.rs               EngineConfig, InvariantConfig, InvariantMethod, LlmInvariantConfig, AssertionResult, BackwardError
+     component.md
+   scheduler/                module-level analysis driver
+     driver.rs               analyze_module*, analyze_one_procedure, analyze_function_graph (after Phase 1+1b removal)
+     sccs.rs                 recursive_functions (Kosaraju)
+     providers.rs            CandidateProvider, NoProvider, ManualProvider, LoopContext
+     component.md
+   reporting/                textual output
+     report.rs               ProcedureReport, ModuleReport, SafetyVerdict
+     pretty.rs               pretty_formula, render_result
+     render.rs               print_module_report, print_summary (moved from main.rs)
+     component.md
+   main.rs                   CLI flag parsing only; everything else moved
+ docs/
+   architecture.md           top-level pipeline reference (NEW)
+   REORG_PLAN.md             this plan, copied in
+   DART.md                   stays
+   MEMORY_MODEL.md           stays
+   checkers_pr1_plan.md      stays (lattice checker on hold)
+   loop_analysis.md          stays
+   loop_invariant_discovery.md stays
+   llm_integration.md        stays
+
+ ---
+ Phases
+
+ Each phase: edit → cargo build --release → cargo test -- --test-threads=1 → commit → push. Per the user's auto-commit-push memory, do this
+ without asking on each clean phase. Tests must pass each checkpoint; otherwise revert (soundness-is-a-hard-gate memory).
+
+ Phase 0 — Architecture doc + plan checkpoint
+
+ - Write docs/architecture.md covering: pipeline diagram, two-pillar invariant, what each new component owns, contracts at boundaries (what
+ each component receives, returns, and never modifies). Replaces Rearch.md as the canonical architecture reference; delete Rearch.md (its key
+ insight — that demand-driven query-mediated calls are needed — is captured in the new architecture.md and TODO.md already).
+ - Copy this plan into docs/REORG_PLAN.md so it persists across context resets.
+ - No code change. Commit and push.
+
+ Phase 1 — Dead-code purge (deletes only, no moves)
+
+ Files deleted whole:
+ - src/main.rs_bak
+ - src/absint_analysis/ (whole directory) — drop mod absint_analysis; from src/main.rs:7
+ - src/common/expressions/ (whole directory) — only used by assertions/translation.rs
+ - src/common/assertions/ most of it — keep only SortSeeds (used by llm_response_parser.rs:52), inline it into
+ loop_inv_gen/llm/response_parser.rs once we move things; for Phase 1, cut translation.rs down to SortSeeds only and drop the
+ parser/translation tests
+
+ Phase 1 + Phase 1b removal in src/may_must_analysis/driver.rs:
+ - Lines ~207-227: delete the Phase 1 compute_return_summary loop and the recursive snapshot iteration.
+ - Lines ~244-262: delete the SummaryTables seeding from registry.all_summaries() (this only had value with Phase 1/1b; the empty registry can
+ still seed the static-extern path).
+ - Update the module doc comment (driver.rs:1-26) to reflect: Phase 0 (extern summaries from provider) and the per-procedure SMASH loop only —
+ no opportunistic seed.
+
+ src/common/adapter.rs — confirmed dead after the above:
+ - compute_return_summary (line 2271) → only callers were Phase 1 + build_horn_model. Delete.
+ - compute_write_effects (line 2343) → only compute_return_summary calls it. Delete.
+ - extract_ptr_writes (line 2244) → only compute_return_summary calls it. Delete.
+ - build_horn_model (line 2797) → only Phase 1b. Delete.
+ - formal_parameter_names, substitute_ext_regions*, formula_contains_var, term_contains_var, rename_callee_vars, rename_vars_in_*,
+ substitute_var_name_with_term, substitute_term_var_name, substitute_memory_var_name — verify each: if reachable only from
+ compute_return_summary chain, delete. Keep substitute_ext_regions* if apply_pending_return_summaries still uses them.
+
+
+ src/may_must_analysis/summaries.rs:
+ - merge_must (line 175), merge_notmay (line 166), merge_helper if it exists, and their #[cfg(test)] tests — only tests reference them. Delete.
+ - allowed_vars_for (line 365), is_skolem_name (line 393) — never called outside doc comments. Delete.
+ - validate_summary (line 212) — used by add_must/add_notmay. Keep.
+
+ Tests to update in driver.rs:
+ - callee_return_summary_makes_caller_verifiable (line 589) — depends on Phase 1. Delete (will be re-introduced as a paper-equivalent
+ demand-driven test once MAY-MUST-CALL lands).
+ - paper_fig2_must_summary_propagation (line 630), paper_fig3_must_from_notmay_summary (line 685), bidirectional_alternation_must_and_notmay
+ (line 734) — already #[ignore]'d. Delete (same reasoning; they're aspirational tests for a feature not yet implemented).
+
+ Compile + test gate. Then commit & push.
+
+ Phase 2 — precfg/, smt/, formula/ (low-risk leaf moves)
+
+ - Move src/common/llvm_utils/llvm_wrap.rs → src/precfg/llvm_wrap.rs
+ - Move src/common/llvm_utils/program_graph.rs → src/precfg/program_graph.rs
+ - Move src/common/oracle.rs → src/smt/oracle.rs
+ - Move src/common/smt/solver.rs → src/smt/solver.rs
+ - Move src/common/formula.rs → src/formula/formula.rs
+ - Move src/common/var_names.rs → src/formula/var_names.rs
+ - Add mod precfg; mod smt; mod formula; to src/main.rs; remove their pub mod lines from src/common/mod.rs.
+ - Rewrite use crate::common::llvm_utils::... → use crate::precfg::..., crate::common::oracle → crate::smt::oracle, crate::common::smt::solver
+ → crate::smt::solver, crate::common::formula → crate::formula::formula, crate::common::var_names → crate::formula::var_names. Per the explore
+ audit: ~49 import lines for formula, ~10 for oracle/smt, ~2 for llvm_utils.
+ - Write precfg/component.md, smt/component.md, formula/component.md.
+ - Compile + test → commit & push.
+
+ Phase 3 — cfg_prep/ (move + extract loop detection)
+
+ - Move src/common/abstract_cfg.rs → src/cfg_prep/abstract_cfg.rs
+ - Move src/common/adapter.rs → src/cfg_prep/adapter.rs (still kitchen-sink; future split is out of scope here)
+ - Move src/common/flat_layout.rs → src/cfg_prep/flat_layout.rs
+ - Move src/common/source.rs → src/cfg_prep/source.rs
+ - Move src/common/errors.rs → src/cfg_prep/errors.rs
+ - Extract loop detection out of src/may_must_analysis/loops.rs into src/cfg_prep/loop_detection.rs: LoopInfo (line 196), fmt_loop_loc (217),
+ detect_loops (229), compute_body (257), compute_exit_edges (294), sort_innermost_first (955). Loop detection is structural over the CFG; it
+ belongs at CFG-prep time. Loop invariant generation/verification stays out (next phases).
+ - Drop now-empty src/common/ and src/common/mod.rs. Remove mod common; from main.rs. The src/common/assertions/ survivor (translation.rs
+ SortSeeds remnant) was already trimmed in Phase 1; if anything is left, fold it into a loop_inv_gen/llm/ location now.
+ - Rewrite imports across may_must_analysis (~33 lines per audit).
+ - Write cfg_prep/component.md.
+ - Compile + test → commit & push.
+
+ Phase 4 — backward_not_may/ + scheduler/ (split big files)
+
+ Source: src/may_must_analysis/{backward.rs, rules.rs, summaries.rs, skolemise.rs, query_stack.rs, node_summary.rs, providers.rs, driver.rs}.
+
+ backward.rs (1458 LOC) splits as follows:
+ - analyze, analyze_with_tables, smash and all internal helpers → src/backward_not_may/smash.rs
+ - InvariantConfig, InvariantMethod, LlmInvariantConfig, EngineConfig, AssertionResult, BackwardError → src/backward_not_may/config.rs
+ - discover_loop_invariants → stays in backward_not_may for this phase as a temporary home; moves to loop_inv_gen/discover.rs in Phase 6
+ - pretty_formula, render_result → stays in backward_not_may for this phase; moves to reporting/pretty.rs in Phase 7
+
+ Other moves:
+ - rules.rs → src/backward_not_may/rules.rs
+ - node_summary.rs → src/backward_not_may/node_summary.rs
+ - skolemise.rs → src/backward_not_may/skolemise.rs
+ - query_stack.rs → src/backward_not_may/query_stack.rs
+ - summaries.rs → src/backward_not_may/summaries.rs
+ - providers.rs → src/scheduler/providers.rs (used at module level by driver)
+ - driver.rs → src/scheduler/driver.rs. Extract recursive_functions (Kosaraju, line 428) into src/scheduler/sccs.rs.
+
+ Drop the src/may_must_analysis/ directory entirely after this phase. Remove mod may_must_analysis; from main.rs; add mod backward_not_may; mod
+  scheduler;.
+
+ Rewrite all use crate::may_must_analysis::backward::... etc. across main.rs and tests.
+
+ Write backward_not_may/component.md and scheduler/component.md.
+
+ Compile + test → commit & push.
+
+ Phase 5 — forward_must/ (single-file move)
+
+ - Move src/may_must_analysis/forward_must.rs → src/forward_must/dart.rs. (At this point may_must_analysis/ no longer exists — forward_must.rs
+ was already moved out; this phase is about its destination, not its origin. If Phase 4 left forward_must.rs orphaned in the still-existing
+ may_must_analysis/ dir, do its move here instead.) Adjust phase ordering if simpler: move forward_must.rs as part of Phase 4 along with the
+ other may_must_analysis content.
+
+ (Decision: fold this into Phase 4 — move forward_must.rs → src/forward_must/dart.rs at the same time as the other may_must_analysis
+ dissolution. Drop Phase 5 as a standalone phase; renumber.)
+
+ Phase 5 (renumbered) — loop_inv_gen/ + loop_inv_verifier/ split
+
+ This is the heaviest split. Source files: loops.rs (post-detection-extraction ~1300 LOC),
+ llm_provider.rs (1017), llm_response_parser.rs (747).
+
+ Splits:
+ - loops.rs::algorithmic_candidates (line 313) + helpers → src/loop_inv_gen/algorithmic.rs
+ - loops.rs::houdini_candidates (line 478) + collect_int_constants_assign/formula/term, invariant_from_effect, is_counter_increment →
+ src/loop_inv_gen/houdini.rs
+ - llm_provider.rs::{LlmCandidateProvider, SubprocessLlmBackend, StubLlmBackend, LlmBackend, stub_backend, CegisAttempt} →
+ src/loop_inv_gen/llm/provider.rs
+ - llm_provider.rs::{FullLoopContext, RecursiveContext, build_full_loop_context, build_loop_invariant_prompt, render_template,
+ build_recursive_summary_prompt, parse_candidate, collect_variable_sorts, collect_formula_var_sorts} → src/loop_inv_gen/llm/prompt.rs
+ - llm_response_parser.rs (whole) + the surviving SortSeeds from assertions/translation.rs → src/loop_inv_gen/llm/response_parser.rs. Inline
+ SortSeeds here; delete the last src/common/assertions/ remnant.
+ - discover_loop_invariants (was kept in backward_not_may temporarily in Phase 4) → src/loop_inv_gen/discover.rs. This is the multi-method
+ dispatcher that calls the per-method modules.
+ - loops.rs::check_loop_invariant, check_loop_invariant_verbose, check_initiation_holds, InvariantCheckResult → src/loop_inv_verifier/check.rs.
+  The 3-check (initiation + inductiveness + exit-closure) is the soundness gate; isolating it makes its contract crystal clear.
+ - After all extractions, loops.rs is empty and gets deleted.
+
+ Write loop_inv_gen/component.md and loop_inv_verifier/component.md. The latter's contract is the load-bearing one: "every formula that flows
+ from loop_inv_gen to the rest of the analyzer MUST pass check_loop_invariant first; bypassing it is unsound."
+
+ Compile + test → commit & push.
+
+ Phase 6 (renumbered) — reporting/
+
+ - Move pretty_formula, render_result (currently in backward_not_may temporarily) → src/reporting/pretty.rs
+ - Move ProcedureReport, ModuleReport, SafetyVerdict, DriverError from scheduler/driver.rs → src/reporting/report.rs. driver.rs keeps
+ analyze_module* and analyze_one_procedure; the report types are pure data + display, not analysis.
+ - Move print_module_report, print_summary, graph_output_dir from main.rs → src/reporting/render.rs. main.rs shrinks to CLI flag parsing + a
+ single call into analyze_module_with_llm + render::print_module_report.
+ - Write reporting/component.md.
+ - Compile + test → commit & push.
+
+ Phase 7 (renumbered) — Documentation finalization
+
+ - Update docs/architecture.md to reflect the final layout (paths, module-quick-reference table).
+ - Rewrite README.md's "Source map" section.
+ - Rewrite CLAUDE.md's session-startup instructions to point at docs/architecture.md + relevant component.md instead of TASKVIEW.md for module
+ locations.
+ - Update TASKVIEW.md's module-quick-reference table to new paths.
+ - Update TODO.md task-location references.
+ - Update docs/DART.md, docs/MEMORY_MODEL.md cross-references.
+ - Compile + test → commit & push.
+
+ ---
+ component.md template
+
+ Each component dir gets a short README (~150-300 lines) with this skeleton:
+
+ # <component>
+
+ ## Purpose
+ <one paragraph: what pipeline phase this is, what it owns>
+
+ ## Public API
+ <table of types/functions exposed via `mod.rs`, one-line each>
+
+ ## Inputs
+ <what this component consumes from upstream — names + types + invariants assumed>
+
+ ## Outputs
+ <what this component produces — names + types + invariants guaranteed>
+
+ ## Files
+ <one-line per .rs file in this dir>
+
+ ## Out of scope
+ <things callers might expect here but live elsewhere — pointer to where>
+
+ ## Contract with neighbors
+ <who calls in, who this calls out to, what guarantees are exchanged>
+
+ Plus one top-level docs/architecture.md (~400-600 lines) with the full pipeline diagram, the two-pillar invariant, the cross-component
+ contracts, and a module quick-reference table.
+
+ ---
+ Files modified (critical paths)
+
+ - src/main.rs — module declarations updated each phase; final state has only CLI parsing.
+ - src/common/mod.rs, src/may_must_analysis/mod.rs, src/absint_analysis/mod.rs — deleted.
+ - src/common/adapter.rs — Phase 1: ~700 LOC removed (compute_return_summary chain + build_horn_model). Phase 3: moved to cfg_prep/adapter.rs.
+ - src/may_must_analysis/driver.rs — Phase 1: Phase 1+1b deleted (~80 LOC). Phase 4: split into scheduler/driver.rs + scheduler/sccs.rs +
+ report types into reporting/.
+ - src/may_must_analysis/backward.rs (1458 LOC) — Phase 4: split four ways (smash + config + temporary discover + temporary pretty),
+ loop_inv_gen and reporting reclaim their parts in Phases 5/6.
+ - src/may_must_analysis/loops.rs (1527 LOC) — Phase 3: detection extracted (~150 LOC). Phase 5: rest split into loop_inv_gen/{algorithmic,
+ houdini} + loop_inv_verifier/check.
+ 
+
+ Reused functions / utilities
+
+ - All existing wp / sp in abstract_cfg.rs::TransferFn — preserved verbatim, only its location changes.
+ - All existing RuleEngine rules (INIT-PI-NE, INIT-OMEGA, MUST-POST, NOTMAY-PRE, VERIFIED, BUGFOUND) — preserved verbatim in
+ backward_not_may/rules.rs.
+ - DART internals (dart_explore, enumerate_paths, compute_path_condition with append-only invariant) — preserved verbatim in
+ forward_must/dart.rs. Per CLAUDE.md and docs/DART.md §P1, the formula-is-append-only invariant is load-bearing — must not be touched.
+ - Oracle API surface — preserved
+ - SummaryTables::add_must/add_notmay (with validate_summary gate) — preserved.
+
+ Verification
+
+ Each phase ends with the same gate:
+
+ cargo build --release && cargo test -- --test-threads=1
+
+ Tests must pass. If a test fails, the phase reverts (per the "soundness is a hard gate" memory). On clean build + green tests, commit and push
+  immediately (per the "auto-commit-and-push" memory).
+
+ End-to-end smoke checks at every phase, in order of cost:
+
+ # 1. Single-fixture sanity
+ ./target/release/main --no-dot tests/out/array-2.bc
+ # Expected: BugFound for the assertion; verdict UNSAFE.
+
+ # 2. Single-fixture not-may pillar
+ ./target/release/main --no-dot --not-may-only tests/out/<verified-fixture>.bc
+ # Expected: Verified; verdict SAFE.
+
+ # 3. Loops benchmark slice (only after Phases 1, 4, 5)
+ bash benchmarks/run_benchmarks.sh loops --limit 10 --timeout 30
+ # Expected: same TN/TP/FP/FN/UNK counts as the pre-reorg baseline (currently TN=9, FP=0, FN=5, UNK=1 on first 15 of loops/).
+
+ Phase 1 specifically: confirm zero false positives in the loops benchmark slice, since deleting Phase 1+1b changes the SummaryTables seed. If
+ a previously-Verified fixture flips to Unknown that's expected (the engine now needs the demand-driven path which isn't wired yet); a flip to
+ Unsafe is a regression and reverts the phase.
+
+ Phase 5 specifically: re-run the loops benchmark slice with --inv-chc, --inv-houdini, and --inv-template flags to confirm each method
+ dispatches through the new module structure correctly. Re-run with --llm-force (capped 180s per the LLM-timeout memory) on one looping fixture
+  to confirm the LLM path still produces a candidate that the verifier accepts.
+
+ Phase 6: confirm the printed report format (procedure ... [N assertion(s) ...], indented assertions with judgement, Module verdict: ...) is
+ byte-identical to the pre-reorg output on tests/out/array-2.bc.
+
+ Final phase (7): re-run the full cargo test, the README's quick-start commands, and bash benchmarks/run_benchmarks.sh loops --limit 20
+ --timeout 30 to confirm the doc-stated invariants still hold.
+
+ Deferred / out of scope
+
+ - Splitting adapter.rs into per-step modules. It's a 3023 LOC kitchen sink even after Phase 1's purge (~2300 LOC remaining). Touching its
+ internal boundaries risks breaking pointer-write summary propagation, vtable resolution, and FlatLayout interplay simultaneously. Defer to a
+ focused follow-up.
+ - Implementing real MAY-MUST-CALL, MUST-POST-USESUMMARY, NOTMAY-PRE-USESUMMARY per Rearch.md — out of reorg scope; tracked in TODO.md.
