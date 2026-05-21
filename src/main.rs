@@ -1,18 +1,21 @@
 //! CLI entrypoint for the reconstructed may/must analyzer.
 
-mod absint_analysis;
-mod common;
-mod may_must_analysis;
+mod analysis;
+mod cfg;
+mod formula;
+mod frontend;
+mod pointer_analysis;
+mod smt;
 
+use analysis::backward::{self, InvariantConfig};
+use analysis::interproc::driver::{ModuleReport, SafetyVerdict};
+use analysis::interproc::providers::NoProvider;
+use cfg::adapter::{ReturnSummary, WriteEffectSummary};
 use clap::{arg, command, value_parser};
-use common::adapter::{ReturnSummary, WriteEffectSummary};
-use common::llvm_utils::llvm_wrap::{initialize_target, Context, Module};
-use common::llvm_utils::program_graph::{dump_graphs, generate_program_graph, FunctionGraph};
-use common::oracle::Oracle;
 use env_logger::{Builder, Env};
-use may_must_analysis::backward::{self, InvariantConfig};
-use may_must_analysis::driver::{ModuleReport, SafetyVerdict};
-use may_must_analysis::providers::NoProvider;
+use frontend::llvm_wrap::{initialize_target, Context, Module};
+use frontend::program_graph::{dump_graphs, generate_program_graph, FunctionGraph};
+use smt::oracle::Oracle;
 use std::path::Path;
 
 fn main() {
@@ -45,11 +48,6 @@ fn main() {
                 .required(false)
                 .value_parser(value_parser!(u64))
                 .default_value("10"),
-        )
-        .arg(
-            arg!(--"bmc-bound" <K> "When invariant synthesis fails, try bounded model checking up to K loop iterations as a bug-finding fallback (0 = disabled). If unset, defaults to the value in InvariantConfig::default().")
-                .required(false)
-                .value_parser(value_parser!(usize)),
         )
         .get_matches();
 
@@ -94,21 +92,10 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
     let max_function_size = *matches
         .get_one::<usize>("max-function-size")
         .unwrap_or(&500);
-
     let achar_timeout_secs = *matches.get_one::<u64>("achar-timeout").unwrap_or(&10);
-
-    // 0 disables BMC entirely; an unset flag falls back to the default in
-    // `InvariantConfig::default()` (a small bound for automatic bug-finding
-    // when invariant synthesis fails).
-    let bmc_bound = matches.get_one::<usize>("bmc-bound").copied().map_or_else(
-        || InvariantConfig::default().bmc_bound,
-        |raw| (raw > 0).then_some(raw),
-    );
-
     InvariantConfig {
         max_function_size,
         achar_timeout: std::time::Duration::from_secs(achar_timeout_secs),
-        bmc_bound,
     }
 }
 
@@ -141,9 +128,9 @@ fn handle(
         );
     }
 
-    let memory_pure = common::adapter::infer_memory_pure_functions(&graphs);
+    let memory_pure = cfg::adapter::infer_memory_pure_functions(&graphs);
     let oracle = Oracle::new();
-    let report = may_must_analysis::driver::analyze_module_with_provider(
+    let report = analysis::interproc::driver::analyze_module_with_provider(
         &graphs,
         &memory_pure,
         &NoProvider,

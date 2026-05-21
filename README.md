@@ -216,44 +216,37 @@ result is a real counterexample; absence of a bug within the bound is UNKNOWN.
 ## Architecture
 
 ```
-src/common/llvm_utils/llvm_wrap.rs     LLVM C API wrapper (types, opcodes, debug info,
+src/frontend/llvm_wrap.rs              LLVM C API wrapper (types, opcodes, debug info,
                                         TargetData for struct layout)
-src/common/llvm_utils/program_graph.rs raw instruction-level FunctionGraph builder
-src/common/source.rs                   SourceLocation type (file, line, column)
-src/common/formula.rs                  terms, predicates, memory arrays, SMT model types
-src/common/abstract_cfg.rs             abstract CFG, TransferEffect variants, WP/SP
-src/common/alpha_rename.rs             two-closure alpha-renaming (var_rename / region_rename)
-                                        used by adapter (call-summary application) and BMC
-src/common/alias_analysis.rs           field-sensitive flow-insensitive Andersen alias
-                                        analysis; run once per module before lowering
-src/common/adapter.rs                  FunctionGraph → AdaptedProcedure lowering
+src/frontend/program_graph.rs          raw instruction-level FunctionGraph builder
+src/frontend/source.rs                 SourceLocation type (file, line, column)
+src/frontend/assertions/               assertion/assume expression parser and translator
+src/formula/mod.rs                     terms, predicates, memory arrays, SMT model types
+src/formula/alpha_rename.rs            two-closure alpha-renaming (var_rename / region_rename)
+src/pointer_analysis/andersen.rs       field-sensitive flow-insensitive Andersen alias analysis
+src/pointer_analysis/pointer_env.rs    pointer → (region, offset) environment
+src/cfg/abstract_cfg.rs                abstract CFG, TransferEffect variants, WP/SP helpers
+src/cfg/adapter.rs                     FunctionGraph → AdaptedProcedure lowering
                                         (GEP offsets, per-field struct regions,
-                                         heap call-site abstraction (HeapAlloc),
-                                         vtable fn-ptr resolution (IndirectCall),
-                                         pointer environment resolution,
-                                         AA-assisted PointerStore/PointerLoad binding,
+                                         vtable fn-ptr resolution, pointer environment,
+                                         AA-assisted PointerStore/PointerLoad,
                                          return summary injection, memcpy unrolling)
-src/common/oracle.rs                   SMT feasibility / implication (Z3 boundary)
-src/may_must_analysis/node_summary.rs  per-node (reach, state) summaries
-src/may_must_analysis/rules.rs         local backward propagation rules, RuleEngine
-src/may_must_analysis/loops.rs         loop detection, invariant checking (initiation,
-                                        inductiveness, exit closure), entry-safety
-                                        candidates, forward reach computation
-src/may_must_analysis/achar.rs         ACHAR grammar-based ICE learner — vocabulary
-                                        collection, atom generation, ICE example states,
-                                        positive/negative filtering, candidate priorities
-src/may_must_analysis/chc.rs           Constrained Horn Clause encoding (retained for
-                                        future function-summarization use; not wired into
-                                        the synthesis pipeline)
-src/may_must_analysis/backward.rs      assertion checking, loop invariant synthesis
-                                        (entry-safety → ACHAR)
-src/may_must_analysis/bmc.rs           bounded model checking via loop unrolling;
-                                        bug-finding only (BugFound is real; absence ≠ safe)
-src/may_must_analysis/driver.rs        module orchestration, whole-module AA, bottom-up
-                                        summary accumulation, observer-invariant synthesis
-src/may_must_analysis/summaries.rs     SummaryTables and MustSummary data structures
-src/may_must_analysis/providers.rs     external/manual summary provider seam
-src/common/smt/solver.rs               raw Z3 term/formula lowering
+src/cfg/flat_layout.rs                 flat struct/array layout for GEP offset computation
+src/smt/solver.rs                      raw Z3 term/formula lowering
+src/smt/oracle.rs                      SMT feasibility / implication (Z3 boundary)
+src/analysis/backward/node_summary.rs  per-node (reach, state) summaries
+src/analysis/backward/rules.rs         local forward MAY and backward NOT-MAY rules, RuleEngine
+src/analysis/backward/mod.rs           assertion checking, loop invariant injection
+src/analysis/loops/mod.rs              loop detection, VerifiedLoopInvariant, 3-check verification
+src/analysis/invariants/mod.rs         ACHAR CEGIS — vocabulary, atom generation, ICE examples,
+                                        tiered candidate search (11 tiers)
+src/analysis/dart/mod.rs               forward MUST concrete path exploration (DART)
+src/analysis/interproc/summaries.rs    SummaryTables, MaySummary, NotMaySummary
+src/analysis/interproc/query.rs        ContextualSummaryTable, query types
+src/analysis/interproc/providers.rs    external/manual summary provider seam
+src/analysis/interproc/scheduler.rs    demand-driven query worklist
+src/analysis/interproc/smash.rs        SMASH bidirectional orchestrator per assertion
+src/analysis/interproc/driver.rs       module orchestration, summary inference, report generation
 ```
 
 ---

@@ -24,22 +24,30 @@ The relevant code lives under `src/` only. Do not extend or document any
 removed architecture.
 
 ```
-src/llvm_utils/llvm_wrap.rs        LLVM C API wrapper boundary
-src/llvm_utils/program_graph.rs    raw instruction graph generation
-src/common/formula.rs              terms, predicates, SMT model types
-src/common/abstract_cfg.rs         abstract CFG, transfer effects, WP helpers
-src/common/alpha_rename.rs         two-closure alpha-renaming for formulas/terms/memory/effects
-src/common/alias_analysis.rs       field-sensitive Andersen alias analysis
-src/common/adapter.rs              FunctionGraph -> AdaptedProcedure lowering
-src/common/oracle.rs               SMT feasibility / implication boundary
-src/may_must_analysis/node_summary.rs  per-node reach/state summaries
-src/may_must_analysis/rules.rs         local backward propagation rules
-src/may_must_analysis/backward.rs      assertion checking + loop invariant search
-src/may_must_analysis/loops.rs         loop detection and invariant checking
-src/may_must_analysis/driver.rs        module orchestration and call-summary reuse
-src/may_must_analysis/providers.rs     external/manual summary provider seam
-src/may_must_analysis/summaries.rs     summary table data structures
-src/smt/solver.rs                  raw Z3 lowering
+src/frontend/llvm_wrap.rs              LLVM C API wrapper boundary
+src/frontend/program_graph.rs          raw instruction graph generation
+src/frontend/assertions/              assertion/assume expression parser and translator
+src/formula/mod.rs                     terms, predicates, SMT model types
+src/formula/alpha_rename.rs            two-closure alpha-renaming for formulas/terms/memory/effects
+src/pointer_analysis/andersen.rs       field-sensitive Andersen alias analysis
+src/pointer_analysis/pointer_env.rs    pointer → (region, offset) environment
+src/cfg/abstract_cfg.rs                abstract CFG, transfer effects, WP/SP helpers
+src/cfg/adapter.rs                     FunctionGraph -> AdaptedProcedure lowering
+src/cfg/flat_layout.rs                 flat struct/array layout for GEP offset computation
+src/smt/solver.rs                      raw Z3 lowering
+src/smt/oracle.rs                      SMT feasibility / implication boundary
+src/analysis/backward/mod.rs           assertion checking, loop invariant injection
+src/analysis/backward/rules.rs         local forward MAY and backward NOT-MAY propagation rules
+src/analysis/backward/node_summary.rs  per-node (reach, state) summary pair
+src/analysis/loops/mod.rs              loop detection, VerifiedLoopInvariant type, 3-check verification
+src/analysis/invariants/mod.rs         ACHAR CEGIS loop invariant synthesis
+src/analysis/dart/mod.rs               forward MUST concrete path exploration (DART)
+src/analysis/interproc/summaries.rs    SummaryTables, MaySummary, NotMaySummary
+src/analysis/interproc/query.rs        ContextualSummaryTable and query types
+src/analysis/interproc/providers.rs    external/manual summary provider seam
+src/analysis/interproc/scheduler.rs    demand-driven query worklist
+src/analysis/interproc/smash.rs        SMASH bidirectional orchestrator per assertion
+src/analysis/interproc/driver.rs       module orchestration, summary inference, report generation
 ```
 
 ## Bidirectional Analysis — Core Invariant
@@ -67,16 +75,16 @@ checks (initiation, inductiveness, exit closure) and returns
 
 ## Key Semantic Boundaries
 
-- **`adapter.rs`**: the lowering boundary. Pointer parameters → `ext_region`
+- **`cfg/adapter.rs`**: the lowering boundary. Pointer parameters → `ext_region`
   (`fn$__ext_N`). Local allocas → `stack0`, `stack1`, ... Memory ops →
   `select`/`MemoryStore` on named regions. Source locations propagated from
   LLVM debug metadata (`-g` required at compile time).
-- **`oracle.rs`**: all SMT queries go through here. Do not add raw solver calls
+- **`smt/oracle.rs`**: all SMT queries go through here. Do not add raw solver calls
   elsewhere.
-- **`backward.rs`**: `analyze_with_tables` is the top-level entry for checking
+- **`analysis/backward/mod.rs`**: `analyze_with_tables` is the top-level entry for checking
   one assertion. `run_backward` is its core. `synthesize_loop_invariants`
   handles cyclic CFGs.
-- **`loops.rs`**: `check_loop_invariant_verbose` checks initiation,
+- **`analysis/loops/mod.rs`**: `check_loop_invariant_verbose` checks initiation,
   inductiveness, and optionally exit closure.
   **Invariant strength**: two kinds, enforced at the type level:
   - **`VerifiedLoopInvariant`** — passes all three checks (initiation +
@@ -95,8 +103,10 @@ checks (initiation, inductiveness, exit closure) and returns
   the loop condition) adds `c` to `WP(body, I)`, making the implication
   unprovable. Use `TypeBound` instead of `Assume` for type-system facts to
   keep these out of the WP.
-- **`driver.rs`**: orchestrates per-module analysis, caches summaries, and
-  drives interprocedural inference.
+- **`analysis/invariants/mod.rs`**: ACHAR CEGIS synthesis (11-tier candidate search).
+  Only produces `VerifiedLoopInvariant` — never raw hints.
+- **`analysis/interproc/driver.rs`**: orchestrates per-module analysis, caches summaries,
+  and drives interprocedural inference.
 
 ## CFG-to-Effects Lowering: How Pointers, Globals, and Memory Work
 
@@ -359,12 +369,14 @@ e.g. `v-udiv-urem-soundness` or `v-zext-sext-bounds`.
 Never push directly to stable without a passing `cargo test` locally first.
 
 ## Development Rules
-
-- Keep LLVM-specific logic in `llvm_utils/`.
-- Keep raw solver details in `smt/solver.rs` and policy in `oracle.rs`.
+- Always change to main branch before developing
+- Keep LLVM-specific logic in `frontend/`.
+- Keep raw solver details in `smt/solver.rs` and policy in `smt/oracle.rs`.
 - When a concept is logically independent, split it into a new module.
-- When broadening support, keep `formula.rs`, `abstract_cfg.rs`, `adapter.rs`,
-  `oracle.rs`, and `smt/solver.rs` aligned.
+- When broadening support, keep `formula/`, `cfg/abstract_cfg.rs`, `cfg/adapter.rs`,
+  `smt/oracle.rs`, and `smt/solver.rs` aligned.
 - Add focused unit tests for new logic.
-- Update `TODO.md` and `TASKVIEW.md` if the backlog or next-session plan changes.
+- Update `TODO.md` if the backlog or next-session plan changes.
 - Update `README.md` when CLI behavior or support boundaries change.
+- After every development test, commit, merge to stable and push.
+- When you find and fix a soundness bug, write a summary in bug\_summaries folder explaining the bug and the fix. Commit into repo.
