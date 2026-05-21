@@ -314,7 +314,7 @@ pub fn check_loop_invariant_verbose(
     // equations so the solver can determine initiation without needing to track
     // functional memory expressions across the SMT boundary.
     let reach_h = forward_reach_at_header(cfg, info.header, inner);
-    let initiation_violation = Formula::and(reach_h, Formula::not(candidate.clone()));
+    let initiation_violation = Formula::and(reach_h.clone(), Formula::not(candidate.clone()));
     match oracle.feasibility_with_model(&initiation_violation) {
         Ok(report) => match report.feasibility {
             crate::smt::oracle::Feasibility::Feasible => {
@@ -328,6 +328,21 @@ pub fn check_loop_invariant_verbose(
             crate::smt::oracle::Feasibility::Infeasible => {}
         },
         Err(_) => return InvariantCheckResult::InitiationFailed { witness: None },
+    }
+
+    // Vacuous-initiation guard: reject candidates that only pass initiation
+    // because reach_h is False (loop header unreachable in the acyclic
+    // skeleton) or because the candidate is never actually satisfied at any
+    // reachable loop entry.  Both cases make reach_h ∧ candidate infeasible.
+    // Accepting such a candidate injects False into reach, forcing
+    // reach ∧ state = False at entry and producing a spurious Verified verdict.
+    let reach_at_entry = Formula::and(reach_h, candidate.clone());
+    match oracle.feasibility_with_model(&reach_at_entry) {
+        Ok(report) if report.feasibility != crate::smt::oracle::Feasibility::Feasible => {
+            return InvariantCheckResult::InitiationFailed { witness: None };
+        }
+        Err(_) => return InvariantCheckResult::InitiationFailed { witness: None },
+        _ => {}
     }
 
     // Inductiveness and exit-closure checks restrict propagation to the loop
