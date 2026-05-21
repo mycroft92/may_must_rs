@@ -33,3 +33,26 @@ Run: all files
   - MISSED:  `c/loops/vogal-2.i` expected UNSAFE, got SAFE
   - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
 
+## 2026-05-21 — `f4273a3`
+
+Run: all files
+
+| Category | SAFE | UNSAFE | UNKNOWN | TIMEOUT | ERROR | Wrong | Total |
+|---|---|---|---|---|---|---|---|
+| infeasible-control-flow | 5 | 0 | 5 | 0 | 0 | 0 | 10 |
+| locks | 11 | 0 | 2 | 0 | 0 | 0 | 13 |
+| loop-crafted | 2 | 0 | 7 | 0 | 0 | 0 | 9 |
+| loop-invariants | 0 | 2 | 8 | 0 | 0 | **2** | 10 |
+| loops | 11 | 9 | 43 | 0 | 0 | **2** | 63 |
+| **Total** | **29** | **11** | **65** | **0** | **0** | **4** | **105** |
+
+**Soundness / completeness flags:**
+  - UNSOUND: `c/loops/linear_sea.ch` expected SAFE, got UNSAFE
+  - UNSOUND: `c/loops/veris.c_NetBSD-libc_loop.i` expected SAFE, got UNSAFE
+  - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
+  - UNSOUND: `c/loop-invariants/odd` expected SAFE, got UNSAFE
+
+---
+
+---
+
