@@ -136,7 +136,7 @@ check_one() {
     fi
 
     # Compile to bitcode.
-    if ! "$CLANG" -O3 -g -fno-inline -c -emit-llvm \
+    if ! "$CLANG" -O0 -g -fno-inline -c -emit-llvm \
             "-I$SCRIPT_DIR" "$conv" -o "$bc" 2>/dev/null; then
         printf '%-12s  %s\n' "ERROR(cc)" "$src"
         printf '%s,%s,%s,ERROR_COMPILE,0\n' "$stem" "$src_dir" "$expected" >> "$CSV_FILE"
