@@ -4,11 +4,15 @@
 # Usage
 # -----
 #   ./run.sh --benchmarks /path/to/sv-benchmarks [options]
+#   ./run.sh --benchmarks /path/to/sv-benchmarks --file c/loops/compact.c [options]
 #
 # Required
 #   --benchmarks DIR   Root of the sv-benchmarks repository clone.
 #
 # Options
+#   --file REL         Run only this one file (relative to --benchmarks root).
+#                      Looks up expected verdict from the matching .yml; if no
+#                      .yml exists the expected verdict is shown as "unknown".
 #   --categories FILE  Category list (default: categories.txt next to this script).
 #   --out-dir DIR      Directory for converted sources and bitcode (default: ./out).
 #   --limit N          Stop after N files per source directory (default: unlimited).
@@ -39,6 +43,7 @@ CSV_FILE="$SCRIPT_DIR/results.csv"
 BENCHMARKS_DIR=""
 MEM_LIMIT_MB=0
 TIMEOUT_S=300
+SINGLE_FILE=""
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -46,6 +51,7 @@ TIMEOUT_S=300
 while [ $# -gt 0 ]; do
     case "$1" in
         --benchmarks)    BENCHMARKS_DIR="$2"; shift 2 ;;
+        --file)          SINGLE_FILE="$2";    shift 2 ;;
         --categories)    CATEGORIES_FILE="$2"; shift 2 ;;
         --out-dir)       OUT_DIR="$2"; shift 2 ;;
         --limit)         LIMIT="$2"; shift 2 ;;
@@ -169,6 +175,29 @@ check_one() {
     printf '%-12s  %s\n' "$verdict" "$(basename "$src")"
     printf '%s,%s,%s,%s,%s\n' "$stem" "$src_dir" "$expected" "$verdict" "$time_s" >> "$CSV_FILE"
 }
+
+# ---------------------------------------------------------------------------
+# Single-file mode
+# ---------------------------------------------------------------------------
+if [ -n "$SINGLE_FILE" ]; then
+    src="$BENCHMARKS_DIR/$SINGLE_FILE"
+    if [ ! -f "$src" ]; then
+        printf 'error: file not found: %s\n' "$src" >&2; exit 1
+    fi
+    src_dir=$(dirname "$SINGLE_FILE")
+    # Look for a matching .yml to get the expected verdict.
+    stem=$(basename "$src" .c)
+    yml="$BENCHMARKS_DIR/$src_dir/${stem}.yml"
+    if [ -f "$yml" ]; then
+        expected=$(yml_unreach_verdict "$yml")
+    else
+        expected="unknown"
+    fi
+    printf 'file,directory,expected,verdict,time_s\n' > "$CSV_FILE"
+    check_one "$src" "$src_dir" "$expected"
+    printf '\nExpected: %s\n' "$expected"
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Main loop
