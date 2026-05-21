@@ -27,7 +27,7 @@
    the WP of `TypeBound` is identity (sound for type-system facts; avoids
    breaking inductiveness of loop invariants over nondeterministic inputs).
 
-4. `driver.rs::analyze_module_with_llm`
+4. `driver.rs::analyze_module_with_provider`
    runs the full interprocedural analysis:
    - Pre-scans all functions to build the module-wide vtable map.
    - Loads external summaries from the `CandidateProvider`.
@@ -40,9 +40,6 @@
 
 5. `driver.rs::analyze_with_summaries`
    per-function orchestration:
-   - Runs `discover_loop_invariants` (ACHAR grammar-based synthesis) once per
-     function to find `InductiveHint` candidates, then upgrades them to
-     `VerifiedLoopInvariant` via `verify_precomputed`.
    - Builds a `Query` per assertion site and enqueues them into the
      `Scheduler`.
    - Drains the scheduler, collects `SmashRunResult`s, assembles a
@@ -72,7 +69,7 @@
      `VerifiedLoopInvariant` (all three checks pass) is accepted by
      `run_backward`.
    - ACHAR (`achar.rs`) uses grammar-based CEGIS to synthesise candidates;
-     CHC (`chc.rs`) provides a fixpoint-based alternative.
+     all three checks are run per candidate before acceptance.
 
 9. `oracle.rs` / `smt/solver.rs`
    all SMT queries go here.  `oracle.check_infeasible`, `oracle.implies`, and

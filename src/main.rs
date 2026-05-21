@@ -10,7 +10,7 @@ use common::llvm_utils::llvm_wrap::{initialize_target, Context, Module};
 use common::llvm_utils::program_graph::{dump_graphs, generate_program_graph, FunctionGraph};
 use common::oracle::Oracle;
 use env_logger::{Builder, Env};
-use may_must_analysis::backward::{self, InvariantConfig, SynthesisMode};
+use may_must_analysis::backward::{self, InvariantConfig};
 use may_must_analysis::driver::{ModuleReport, SafetyVerdict};
 use may_must_analysis::providers::NoProvider;
 use std::path::Path;
@@ -34,8 +34,6 @@ fn main() {
         .arg(arg!(--"show-summaries" "Print inferred summaries"))
         .arg(arg!(--"debug-invariants" "Enable loop invariant debug logging"))
         .arg(arg!(--"diff-debug" "Print each rule firing and new predicates added"))
-        .arg(arg!(--"inv-observer" "Run only the observer-disjunction invariant phase"))
-        .arg(arg!(--"inv-grammar" "Run only the ACHAR grammar-based invariant phase"))
         .arg(
             arg!(--"max-function-size" <N> "Skip analysis of functions with more than N instructions (default: 500; 0 = unlimited)")
                 .required(false)
@@ -107,16 +105,7 @@ fn invariant_config(matches: &clap::ArgMatches) -> InvariantConfig {
         |raw| (raw > 0).then_some(raw),
     );
 
-    let mode = if matches.get_flag("inv-observer") {
-        SynthesisMode::ObserverOnly
-    } else if matches.get_flag("inv-grammar") {
-        SynthesisMode::GrammarOnly
-    } else {
-        SynthesisMode::Default
-    };
-
     InvariantConfig {
-        mode,
         max_function_size,
         achar_timeout: std::time::Duration::from_secs(achar_timeout_secs),
         bmc_bound,
@@ -154,7 +143,7 @@ fn handle(
 
     let memory_pure = common::adapter::infer_memory_pure_functions(&graphs);
     let oracle = Oracle::new();
-    let report = may_must_analysis::driver::analyze_module_with_llm(
+    let report = may_must_analysis::driver::analyze_module_with_provider(
         &graphs,
         &memory_pure,
         &NoProvider,
