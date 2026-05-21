@@ -6,9 +6,8 @@ and flags any soundness or completeness anomalies.
 > **Note**: This file is only updated on the `stable` branch (via CI).
 > Do not commit benchmark runs from `main`.
 
----
 
-## 2026-05-21 — `dd4ea8a`
+## 2026-05-20 — `2a5f88b`
 
 Run: all files
 
@@ -31,9 +30,6 @@ Run: all files
   - UNSOUND: `c/loops/veris.c_NetBSD-libc_loop.i` expected SAFE, got UNSAFE
   - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
 
----
-
----
 
 
 ## 2026-05-21 — `a53ae94`
@@ -60,6 +56,7 @@ Run: all files
   - UNSOUND: `c/loops/veris.c_NetBSD-libc_loop.i` expected SAFE, got UNSAFE
   - MISSED:  `c/loops/vogal-2.i` expected UNSAFE, got SAFE
   - UNSOUND: `c/loop-invariants/bin-suffix-5` expected SAFE, got UNSAFE
+
 
 
 ---
