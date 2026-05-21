@@ -29,7 +29,6 @@ use crate::may_must_analysis::backward::{
 };
 use crate::may_must_analysis::bmc;
 use crate::may_must_analysis::forward_must::{self, DartConfig};
-use crate::may_must_analysis::loops::VerifiedLoopInvariant;
 use crate::may_must_analysis::node_summary::NodeSummary;
 use crate::may_must_analysis::rules::Judgement;
 use crate::may_must_analysis::summaries::SummaryTables;
@@ -60,7 +59,6 @@ pub enum VerdictEngine {
 /// 2. **Forward MUST direction** (DART path enumeration): if `bmc_bound > 0`, enumerate
 ///    concrete paths up to `bmc_bound` loop re-visits and return BugFound on first SAT model.
 /// 3. Return the may direction's Unknown verdict if both directions are inconclusive.
-#[allow(clippy::too_many_arguments)]
 pub fn run_smash(
     cfg: &AbstractCfg,
     procedure_name: &str,
@@ -68,7 +66,6 @@ pub fn run_smash(
     oracle: &Oracle,
     db: &SmashSummaryDB,
     config: Option<&InvariantConfig>,
-    verified_invariants: Option<&[VerifiedLoopInvariant]>,
     debug_names: &HashMap<String, String>,
 ) -> SmashRunResult {
     let may_result = analyze_with_tables(
@@ -78,7 +75,6 @@ pub fn run_smash(
         oracle,
         &db.tables,
         config,
-        verified_invariants,
         debug_names,
     );
 

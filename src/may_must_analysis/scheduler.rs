@@ -4,18 +4,24 @@
 //! assertion queries.  See `design_notes/QUERY_REFACTOR.md` for the full
 //! architectural design.
 //!
-//! # Current scope
+//! # Current scope (step 6B)
 //!
-//! - [`Scheduler`] is **per-module**: it registers one [`ProcedureContext`]
-//!   per procedure and shares a [`ContextualSummaryTable`] across all
-//!   dispatches so that summaries produced by one procedure become available
-//!   to others without an extra plumbing step.
+//! - [`Scheduler`] is **module-scoped**: one instance covers every procedure
+//!   in the module.  It holds `initial_tables` (return summaries seeded
+//!   before dispatch) and accumulates `table` (contextual not-may / must
+//!   summaries) as each query completes, so procedures enqueued later
+//!   benefit from summaries produced by procedures dispatched earlier.
 //! - [`Scheduler::enqueue`] adds an assertion query; [`Scheduler::drain`]
 //!   pops and dispatches each one via [`smash::run_smash`], collecting
 //!   [`DispatchOutcome`]s.
 //! - Calls are still inlined eagerly via the legacy [`ReturnSummary`] path
-//!   (call-spawned sub-queries are a future step).
-//! - Query-result subsumption caching (step 7 of QUERY_REFACTOR) is pending.
+//!   (call-spawned sub-queries are a future step — step 6C).
+//! - [`InProgressQuery`] tracking (step 7 / #21): the `active` map records
+//!   queries currently being dispatched.  Subsumption checks against this
+//!   map during `enqueue` will prevent re-entering the same analysis for
+//!   recursive call edges once sub-query spawning (step 6C) is wired in.
+//!   The subsumption path is infrastructure-only today — it is not triggered
+//!   because sub-queries are not yet spawned from call edges.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -23,10 +29,9 @@ use crate::common::abstract_cfg::AbstractCfg;
 use crate::common::adapter::AssertionSite;
 use crate::common::oracle::Oracle;
 use crate::may_must_analysis::backward::InvariantConfig;
-use crate::may_must_analysis::loops::VerifiedLoopInvariant;
 use crate::may_must_analysis::query::{
     create_must_summary_with_debug_names, create_notmay_summary_with_debug_names,
-    ContextualSummaryTable, ProcedureInterface, Query, QueryId,
+    ContextualSummaryTable, InProgressQuery, PlaceholderKind, ProcedureInterface, Query, QueryId,
 };
 use crate::may_must_analysis::rules::Judgement;
 use crate::may_must_analysis::smash::{self, SmashRunResult, SmashSummaryDB};
@@ -41,10 +46,6 @@ use crate::may_must_analysis::summaries::{ProcedureName, SummaryTables};
 #[derive(Clone, Debug)]
 pub struct AssertionProvenance {
     pub site: AssertionSite,
-    /// Pre-computed VerifiedLoopInvariants for this procedure (from the
-    /// driver's `discover_loop_invariants` pre-pass + tables).  Carried
-    /// per-query rather than re-derived inside the scheduler.
-    pub verified_invariants: Option<Vec<VerifiedLoopInvariant>>,
 }
 
 /// The work queued for one procedure's analysis.
@@ -96,36 +97,76 @@ pub struct ProcedureContext {
 ///   (top-level + sub-queries) in the module.
 /// - One [`ProcedureContext`] per procedure (registered via
 ///   [`register_procedure`]).
-/// - The shared [`ContextualSummaryTable`] populated by every query's
-///   completion path (see `create_and_merge_summary`).
+/// - `initial_tables` — return-summary / loop-invariant tables loaded
+///   before any dispatch (set once by the driver via
+///   [`Scheduler::with_initial_tables`]).
+/// - `table` — contextual summaries accumulated as each query completes
+///   (populated by `CREATE_NOTMAYSUMMARY` / `CREATE_MUSTSUMMARY`).
+/// - `active` — [`InProgressQuery`] map tracking which queries are
+///   currently being dispatched, for step-7 / #21 subsumption detection
+///   once call-edge sub-query spawning is wired in.
 ///
-/// Step 6A change: previously a `Scheduler` was per-procedure and the
-/// driver built one per `AdaptedProcedure`.  Now a single `Scheduler`
-/// covers the whole module so contextual summaries created by leaf
-/// procedures are available when caller procedures are analysed,
-/// without a separate plumbing step.
+/// Step 6B: a single `Scheduler` now covers the whole module.  Each
+/// `dispatch_next` call derives the effective legacy tables by merging
+/// `initial_tables` with `table`, so summaries from earlier dispatches
+/// are visible to later ones without a separate plumbing step.
 pub struct Scheduler {
     pending: VecDeque<QueryId>,
     in_progress: BTreeMap<QueryId, PendingEntry>,
     completed: BTreeMap<QueryId, DispatchOutcome>,
+    /// Return-summary / loop-invariant tables seeded before dispatch.
+    /// Never mutated after construction; merged with `self.table` at
+    /// dispatch time by [`Scheduler::legacy_tables_for_dispatch`].
+    initial_tables: SummaryTables,
     /// Contextual summaries discovered so far.  Populated by
     /// CREATE_NOTMAYSUMMARY / CREATE_MUSTSUMMARY after each query
-    /// completes; shared across procedures in the same module.
+    /// completes; merged into `initial_tables` at dispatch time.
     pub table: ContextualSummaryTable,
     procedures: BTreeMap<ProcedureName, ProcedureContext>,
     next_id: usize,
+    /// Queries currently being dispatched.  Infrastructure for step-7
+    /// (#21) in-progress subsumption: when sub-query spawning is added,
+    /// `enqueue` will check this map for a covering active query before
+    /// adding a new pending entry.
+    active: BTreeMap<QueryId, InProgressQuery>,
 }
 
 impl Scheduler {
+    /// Create a scheduler with no pre-loaded summaries.  Equivalent to
+    /// `with_initial_tables(SummaryTables::new())`.
     pub fn new() -> Self {
+        Self::with_initial_tables(SummaryTables::new())
+    }
+
+    /// Create a scheduler pre-loaded with `initial_tables` (e.g., return
+    /// summaries and loop invariants from a prior inference pass).  These
+    /// are merged with contextual summaries accumulated in `self.table`
+    /// each time a query is dispatched.
+    pub fn with_initial_tables(initial_tables: SummaryTables) -> Self {
         Self {
             pending: VecDeque::new(),
             in_progress: BTreeMap::new(),
             completed: BTreeMap::new(),
+            initial_tables,
             table: ContextualSummaryTable::new(),
             procedures: BTreeMap::new(),
             next_id: 0,
+            active: BTreeMap::new(),
         }
+    }
+
+    /// Build the effective summary tables for the next dispatch by merging
+    /// `initial_tables` (static return summaries) with `self.table`
+    /// (contextual summaries from earlier dispatches in this drain).
+    fn legacy_tables_for_dispatch(&self) -> SummaryTables {
+        let mut merged = self.initial_tables.clone();
+        merged.extend_from(&self.table);
+        merged
+    }
+
+    /// Return the outcome of a completed query, or `None` if not yet done.
+    pub fn completed_outcome(&self, id: QueryId) -> Option<&DispatchOutcome> {
+        self.completed.get(&id)
     }
 
     /// Registers a procedure with the scheduler.  Must be called before
@@ -171,19 +212,19 @@ impl Scheduler {
         id
     }
 
-    /// Dispatches the next pending query against the given procedure's CFG
-    /// and the supplied interprocedural [`SummaryTables`] (legacy must/notmay
-    /// summaries — to be migrated to the contextual table in step 5).
-    ///
     /// Dispatches the next pending query.  Looks up the procedure's
     /// [`ProcedureContext`] from the registered set (the query's
     /// `procedure` field is the key).  Returns `None` when the queue is
     /// empty; emits a warning and returns `Unprovenanced` if the query
     /// references an un-registered procedure.
+    ///
+    /// The effective summary tables are derived internally by merging
+    /// `self.initial_tables` (static return summaries) with `self.table`
+    /// (contextual summaries from prior dispatches in this drain), so
+    /// each successive dispatch sees all summaries produced earlier.
     pub fn dispatch_next(
         &mut self,
         oracle: &Oracle,
-        legacy_tables: &SummaryTables,
         config: Option<&InvariantConfig>,
     ) -> Option<DispatchOutcome> {
         let id = self.pending.pop_front()?;
@@ -192,6 +233,20 @@ impl Scheduler {
             target: "scheduler",
             "[dispatch] {:?}: procedure={} pre={:?} post={:?}",
             id, entry.query.procedure, entry.query.pre, entry.query.post,
+        );
+
+        // #21 infrastructure: record this query as active while it is
+        // being dispatched.  When call-edge sub-query spawning is added,
+        // `enqueue` will check this map to detect recursive re-entries
+        // and register a dependency rather than spawning a new dispatch.
+        self.active.insert(
+            id,
+            InProgressQuery {
+                id,
+                query: entry.query.clone(),
+                dependents: Vec::new(),
+                placeholder: PlaceholderKind::NotMayOptimistic,
+            },
         );
 
         // Look up the procedure's context.  Cloning here keeps the
@@ -215,9 +270,11 @@ impl Scheduler {
 
         let outcome = match entry.provenance.as_ref() {
             Some(prov) => {
-                // Existing intra-procedural analysis path.
+                // Merge initial_tables + contextual summaries from prior
+                // dispatches in this drain.  This is the core step-6B
+                // change: later procedures see summaries from earlier ones.
                 let db = SmashSummaryDB {
-                    tables: legacy_tables.clone(),
+                    tables: self.legacy_tables_for_dispatch(),
                 };
                 let run = smash::run_smash(
                     &ctx.cfg,
@@ -226,7 +283,6 @@ impl Scheduler {
                     oracle,
                     &db,
                     config,
-                    prov.verified_invariants.as_deref(),
                     &ctx.debug_names,
                 );
                 log::debug!(
@@ -259,6 +315,10 @@ impl Scheduler {
                 DispatchOutcome::Unprovenanced
             }
         };
+
+        // #21 infrastructure: clear the active entry now that dispatch
+        // is complete.  Future: notify any registered dependents here.
+        self.active.remove(&id);
 
         self.completed.insert(id, outcome.clone());
         Some(outcome)
@@ -350,17 +410,18 @@ impl Scheduler {
         }
     }
 
-    /// Drains all pending queries.  Each is dispatched against its
-    /// registered procedure context.  Returns the outcomes in dispatch
-    /// order (FIFO, no subsumption reordering yet).
+    /// Drains all pending queries in FIFO order.  The effective summary
+    /// tables for each dispatch are derived from `initial_tables` merged
+    /// with contextual summaries accumulated so far, so each query
+    /// benefits from summaries produced by all previously dispatched
+    /// queries in this drain.  Returns outcomes in dispatch order.
     pub fn drain(
         &mut self,
         oracle: &Oracle,
-        legacy_tables: &SummaryTables,
         config: Option<&InvariantConfig>,
     ) -> Vec<DispatchOutcome> {
         let mut out = Vec::new();
-        while let Some(o) = self.dispatch_next(oracle, legacy_tables, config) {
+        while let Some(o) = self.dispatch_next(oracle, config) {
             out.push(o);
         }
         out

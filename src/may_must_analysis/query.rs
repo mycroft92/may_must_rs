@@ -359,6 +359,42 @@ impl ContextualSummaryTable {
             .unwrap_or(&[])
     }
 
+    /// Merge all entries from `other` into `self` using structural deduplication
+    /// (no SMT subsumption — use `merge_notmay` / `merge_must` where subsumption
+    /// matters).  Loop invariants from `other` are only inserted when `self` does
+    /// not already have an entry for that procedure, so locally discovered
+    /// invariants take precedence.
+    ///
+    /// Used by [`Scheduler::legacy_tables_for_dispatch`] to blend the
+    /// pre-loaded `initial_tables` with contextual summaries accumulated
+    /// during prior dispatches.
+    pub fn extend_from(&mut self, other: &ContextualSummaryTable) {
+        for (proc, summaries) in &other.notmay {
+            for s in summaries {
+                self.add_notmay(proc.clone(), s.clone());
+            }
+        }
+        for (proc, summaries) in &other.must {
+            let entries = self.must.entry(proc.clone()).or_default();
+            for s in summaries {
+                if !entries.contains(s) {
+                    entries.push(s.clone());
+                }
+            }
+        }
+        for (proc, summaries) in &other.forward_may {
+            for s in summaries {
+                self.add_forward_may(proc.clone(), s.clone());
+            }
+        }
+        // Preserve existing loop invariants; only fill in missing entries.
+        for (proc, invariants) in &other.loop_invariants {
+            self.loop_invariants
+                .entry(proc.clone())
+                .or_insert_with(|| invariants.clone());
+        }
+    }
+
     /// All procedure names referenced by any of the four maps.
     pub fn all_procedure_names(&self) -> Vec<ProcedureName> {
         let mut names: Vec<ProcedureName> = self

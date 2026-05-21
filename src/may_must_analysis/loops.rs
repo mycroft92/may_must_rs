@@ -5,79 +5,32 @@
 //! 1. **Detection** — [`detect_loops`] identifies natural loops in the CFG by
 //!    finding back edges and computing the corresponding loop bodies.
 //!
-//! 2. **Candidate generation** — [`observer_disjunction_candidates`] and
-//!    [`entry_safety_candidates`] produce formula candidates; the caller (in
-//!    `backward.rs`) tries them in order before falling through to the ACHAR
-//!    grammar enumerator in `achar.rs`.
-//!
-//! 3. **Invariant checking** — [`check_loop_invariant_verbose`] performs the
+//! 2. **Invariant checking** — [`check_loop_invariant_verbose`] performs the
 //!    three-part soundness check for a candidate formula:
 //!    - **Initiation**: the invariant holds on entry to the loop.
 //!    - **Inductiveness**: the invariant is preserved by one loop iteration.
 //!    - **Exit closure**: for each exit edge, `invariant ∧ exit_violation` is
 //!      infeasible — the invariant cannot co-exist with a violation at any exit.
-//!      Passing `&BTreeMap::new()` skips this check; callers must **only** do
-//!      this in the pre-pass (no assertion site) or for interprocedural summaries
-//!      where a subsequent `analyze_with_tables` performs the authoritative check.
 //!      **Never** skip exit closure and rely on `run_backward` to substitute for
 //!      it: `run_backward` blocks back edges and cannot reason about loop-carried
 //!      state, so an inductive-but-not-exit-closed invariant can produce a false
-//!      `Verified` on an unsafe program (the array-2 soundness bug, fixed v0.11.0).
+//!      `Verified` on an unsafe program.
 //!
-//! # Invariant strength: VerifiedLoopInvariant vs InductiveHint
+//! # Invariant strength
 //!
-//! Two distinct concepts are enforced at the type level:
+//! Only one invariant strength is used:
 //!
 //! - **[`VerifiedLoopInvariant`]** — all three checks passed: initiation,
 //!   inductiveness, AND exit closure.  The invariant is sufficient to discharge
-//!   the specific assertion at the loop exits.  This is the only kind that may
-//!   be passed to `run_backward` as a verdict-bearing invariant.
+//!   the specific assertion at the loop exits.  This is the only kind passed to
+//!   `run_backward`.
 //!
-//! - **InductiveHint** (`(CfgNodeId, Formula)` pair) — only initiation and
-//!   inductiveness passed; exit closure was not checked.  Produced by the
-//!   pre-pass ([`discover_loop_invariants`] with `&BTreeMap::new()`).  May be
-//!   cached in `SummaryTables` and upgraded to [`VerifiedLoopInvariant`] via
-//!   [`verify_precomputed`] before being used to produce a `Verified` verdict.
+//! # Exit closure: current implementation
 //!
-//! The soundness-critical rule: **hints must never reach `run_backward` directly**.
-//! Upgrade via [`verify_precomputed`] first, or let synthesis return
-//! [`VerifiedLoopInvariant`] directly.
-//!
-//! [`discover_loop_invariants`]: crate::may_must_analysis::backward::discover_loop_invariants
-//! [`verify_precomputed`]: crate::may_must_analysis::backward::verify_precomputed
-//!
-//! # Exit closure: current implementation and future direction
-//!
-//! The current exit closure check in [`check_loop_invariant_verbose`] is a
-//! **one-step** backward analysis: it propagates the bad condition backward
-//! from the exit edge through the loop body (back edge excluded) and checks
-//! `I_h ∧ exit_header` infeasible.  Combined with inductiveness, this is sound:
-//! any state satisfying I_h at the header passes through the loop body unchanged
-//! (by inductiveness), so one-step closure implies multi-step closure.
-//!
-//! A stronger alternative (planned, see `TODO.md`) is a **backward fixpoint**
-//! inside the loop body with the back edge included, seeded with the bad
-//! condition and intersected with I_h at each iteration until convergence.
-//! This would compute `B_{h,e} = I_h ∧ PreBad_{L,e}` directly and discharge
-//! with `UNSAT(I_h ∧ B_{h,e})`, which is more general but also more expensive.
-//!
-//! # Entry-safety candidate soundness constraints
-//!
-//! [`entry_safety_candidates`] generates `counter_init == v || safety` disjunctions
-//! from preheader store facts.  Two invariants maintain soundness:
-//!
-//! - **Concrete-integer filter**: only store facts whose stored value is a
-//!   compile-time integer constant are used.  Facts from `nondet_int()` calls or
-//!   other unresolved pointer arguments produce variable-valued store facts; using
-//!   those would generate candidates that trivially satisfy initiation (the
-//!   forward reach already encodes the same `select == var` equation) and pass
-//!   inductiveness vacuously through the false branch — but are not genuinely
-//!   inductive, leading to unsound verification of unsafe programs.
-//!
-//! - **Whole-formula negation**: the safety formula is the negation of the whole
-//!   exit violation, not individual conjuncts.  Extracting conjuncts and negating
-//!   each produces spurious safety atoms (e.g. `j < 0` from unsigned-comparison
-//!   `Assume(j >= 0)` in the backward WP) that contaminate the candidate space.
+//! The exit closure check in [`check_loop_invariant_verbose`] is a **one-step**
+//! backward analysis: it propagates the bad condition backward from the exit edge
+//! through the loop body (back edge excluded) and checks `I_h ∧ exit_header`
+//! infeasible.  Combined with inductiveness, this is sound.
 //!
 //! # Nested loops
 //!
@@ -143,12 +96,8 @@ pub type InnerInvariants<'a> = &'a [(CfgNodeId, Formula)];
 /// inductiveness, and exit closure.
 ///
 /// This is the only invariant type that may be passed to `run_backward` as a
-/// verdict-bearing invariant.  Callers obtain it from
-/// [`synthesize_loop_invariants`] or [`verify_precomputed`] — never construct
-/// directly outside the analysis pipeline.
-///
-/// [`synthesize_loop_invariants`]: crate::may_must_analysis::backward::synthesize_loop_invariants
-/// [`verify_precomputed`]: crate::may_must_analysis::backward::verify_precomputed
+/// verdict-bearing invariant.  Produced by ACHAR synthesis in
+/// [`synthesize_loop_invariants`] — never construct directly.
 #[derive(Clone, Debug)]
 pub struct VerifiedLoopInvariant {
     pub header: CfgNodeId,
@@ -168,11 +117,8 @@ impl VerifiedLoopInvariant {
 
 /// Detailed outcome of [`check_loop_invariant_verbose`].
 ///
-/// `Accepted` means all checks *that were requested* passed.  Whether that is
-/// a full **VerifiedLoopInvariant** (all three checks, suitable for verdict use)
-/// or an **InductiveHint** (initiation + inductiveness only, pre-pass context)
-/// depends on whether `assertion_postconditions` was non-empty.  See the module
-/// documentation for when each kind is safe to use with `run_backward`.
+/// `Accepted` means all three checks (initiation, inductiveness, exit closure)
+/// passed.  The caller wraps the formula into a [`VerifiedLoopInvariant`].
 ///
 /// The failure variants identify *which* condition was the first to fail,
 /// enabling targeted logging and CEGIS feedback.
@@ -489,22 +435,6 @@ pub fn check_loop_invariant_verbose(
     }
 
     InvariantCheckResult::Accepted
-}
-
-fn push_nontrivial(candidates: &mut Vec<Formula>, formula: Formula) {
-    if formula == Formula::True || formula == Formula::False {
-        return;
-    }
-    // Skip tautological implications a => a (generated when a bool variable is substituted
-    // with its defining predicate by normalize_formula_with_defs).
-    if let Formula::Implies(lhs, rhs) = &formula {
-        if lhs == rhs {
-            return;
-        }
-    }
-    if !candidates.contains(&formula) {
-        candidates.push(formula);
-    }
 }
 
 // ── Forward reach (initiation support) ───────────────────────────────────────
@@ -849,64 +779,6 @@ fn summarize_inner_loops(
     (headers, blocked_nodes)
 }
 
-// ── Candidate generators ──────────────────────────────────────────────────────
-
-/// Generate observer-disjunction invariant candidates: `counter <= k || NOT(violation_at_k)`.
-///
-/// For each `select(region, k)` index term appearing in exit-edge violation formulas, and
-/// for the loop counter extracted from the back-edge guard (`counter < bound` form), produces:
-///
-///   `counter <= k  ||  NOT(violation_conjunct_involving_select(region, k))`
-///
-/// These candidates are designed to pass full exit closure for safe programs: the right
-/// disjunct IS the assertion's safety condition, so `invariant AND violation` is immediately
-/// infeasible at the exit.  The left disjunct covers the case where the loop has not yet
-/// processed index `k` (so the safety condition need not hold yet at that point).
-///
-/// Returns an empty list when the back-edge guard does not match `counter < bound`, or
-/// when no `select` terms appear in the exit violations.
-pub fn observer_disjunction_candidates(
-    info: &LoopInfo,
-    cfg: &AbstractCfg,
-    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-) -> Vec<Formula> {
-    let Some(counter) = extract_back_edge_counter(info) else {
-        return vec![];
-    };
-
-    let mut candidates = Vec::new();
-    for exit_edge in &info.exit_edges {
-        let Ok(edge) = cfg.edge(*exit_edge) else {
-            continue;
-        };
-        let Some(violation) = assertion_postconditions.get(&edge.target) else {
-            continue;
-        };
-        if *violation == Formula::False {
-            continue;
-        }
-        for atom in formula_conjuncts(violation) {
-            let indices = collect_select_indices_in_formula(atom);
-            if indices.is_empty() {
-                continue;
-            }
-            let Some(safety) = negate_comparison(atom) else {
-                continue;
-            };
-            for index in indices {
-                push_nontrivial(
-                    &mut candidates,
-                    Formula::or(
-                        Formula::le(Term::Var(counter.clone()), index),
-                        safety.clone(),
-                    ),
-                );
-            }
-        }
-    }
-    candidates
-}
-
 /// Extract the counter variable from a back-edge guard of the form `counter < bound`
 /// or `counter <= bound`.  Returns `None` for all other guard shapes.
 pub(crate) fn extract_back_edge_counter(info: &LoopInfo) -> Option<Var> {
@@ -929,44 +801,6 @@ pub(crate) fn formula_conjuncts(formula: &Formula) -> Vec<&Formula> {
     }
 }
 
-fn collect_select_indices_in_formula(formula: &Formula) -> Vec<Term> {
-    let mut out = Vec::new();
-    collect_select_indices_formula(formula, &mut out);
-    out
-}
-
-fn collect_select_indices_formula(formula: &Formula, out: &mut Vec<Term>) {
-    match formula {
-        Formula::Lt(l, r)
-        | Formula::Le(l, r)
-        | Formula::Gt(l, r)
-        | Formula::Ge(l, r)
-        | Formula::Eq(l, r) => {
-            collect_select_indices_term(l, out);
-            collect_select_indices_term(r, out);
-        }
-        Formula::Not(inner) => collect_select_indices_formula(inner, out),
-        Formula::And(items) | Formula::Or(items) => {
-            for item in items {
-                collect_select_indices_formula(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_select_indices_term(term: &Term, out: &mut Vec<Term>) {
-    match term {
-        Term::Select(_, index) => out.push(*index.clone()),
-        Term::Add(l, r) | Term::Sub(l, r) | Term::Mul(l, r) | Term::Div(l, r) | Term::Rem(l, r) => {
-            collect_select_indices_term(l, out);
-            collect_select_indices_term(r, out);
-        }
-        Term::Neg(inner) => collect_select_indices_term(inner, out),
-        _ => {}
-    }
-}
-
 /// Negate a comparison precisely: Lt↔Ge, Le↔Gt, Gt↔Le, Ge↔Lt, Not(f)→f.
 ///
 /// Returns `None` for compound formulas (And, Or, Implies) where precise negation
@@ -982,144 +816,10 @@ pub(crate) fn negate_comparison(formula: &Formula) -> Option<Formula> {
     })
 }
 
-/// Generate fallback invariant candidates of the form `counter == init || safety`.
-///
-/// Used when [`observer_disjunction_candidates`] produces no candidates (e.g. because
-/// the back-edge guard is not a simple `counter < bound`).
-///
-/// Two candidate sets are generated:
-/// 1. **Direct**: `init_fact || NOT(violation_at_exit_target)` — uses the assertion
-///    violation formula directly from the exit-edge target to avoid loop-path conditions
-///    that inflate the formula and defeat inductiveness.
-/// 2. **Propagated**: `init_fact || NOT(exit_header)` — uses the violation condition
-///    backward-propagated to the header as a fallback when the direct form is too weak.
-///
-/// Only store facts with concrete integer initial values are used.  Variable-valued
-/// facts (e.g. from `nondet_int()` assignments) would produce candidates that trivially
-/// pass initiation (since the forward reach already encodes the same equation) yet are
-/// not truly inductive — leading to unsound verification.
-///
-/// Safety is computed as the negation of the whole violation formula, not individual
-/// conjuncts.  Per-conjunct negation extracts type-bound assumptions (e.g. `j >= 0`
-/// from unsigned comparisons) and negates them to spurious atoms like `j < 0`.
-///
-/// These candidates are checked via the full three-part check including exit closure.
-/// Only candidates that pass exit closure become [`VerifiedLoopInvariant`] values.
-pub fn entry_safety_candidates(
-    info: &LoopInfo,
-    cfg: &AbstractCfg,
-    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    inner: InnerInvariants<'_>,
-) -> Vec<Formula> {
-    let store_facts = preheader_store_facts_at_header(cfg, info.header, inner);
-    if store_facts.is_empty() {
-        return vec![];
-    }
-
-    let mut candidates = Vec::new();
-
-    // Helper: emit `counter_eq || safety` for every store fact with a concrete integer value.
-    let push_with_safety = |candidates: &mut Vec<Formula>, safety: Formula| {
-        for ((region, offset), value) in &store_facts {
-            if *offset != 0 {
-                continue;
-            }
-            // Only concrete integer initial values.  Variable-valued facts (e.g. from
-            // nondet_int()) create tautological candidates that trivially satisfy initiation
-            // because forward_reach_at_header already encodes the same equation.
-            if !matches!(value, Term::Int(_)) {
-                continue;
-            }
-            let counter_eq = Formula::eq(
-                Term::select(Memory::var(region.clone()), Term::int(*offset)),
-                value.clone(),
-            );
-            push_nontrivial(candidates, Formula::or(counter_eq, safety.clone()));
-        }
-    };
-
-    // Direct: negate each exit violation as a whole formula.
-    // negate_comparison handles simple comparisons (Lt/Le/Gt/Ge) and Not-wrapped atoms
-    // without introducing double negations; compound violations fall back to Formula::not.
-    for exit_edge in &info.exit_edges {
-        let Ok(edge) = cfg.edge(*exit_edge) else {
-            continue;
-        };
-        let Some(postcondition) = assertion_postconditions.get(&edge.target) else {
-            continue;
-        };
-        if *postcondition == Formula::False {
-            continue;
-        }
-        let safety =
-            negate_comparison(postcondition).unwrap_or_else(|| Formula::not(postcondition.clone()));
-        push_with_safety(&mut candidates, safety);
-    }
-
-    // Propagated: negate the violation backward-propagated to the header.
-    if let Some(exit_violation) =
-        exit_violation_at_header(info, cfg, assertion_postconditions, inner)
-    {
-        let safety = negate_comparison(&exit_violation)
-            .unwrap_or_else(|| Formula::not(exit_violation.clone()));
-        push_with_safety(&mut candidates, safety);
-    }
-
-    candidates
-}
-
-/// Compute the violation condition at the loop header by backward propagation from exit edges.
-fn exit_violation_at_header(
-    info: &LoopInfo,
-    cfg: &AbstractCfg,
-    assertion_postconditions: &BTreeMap<CfgNodeId, Formula>,
-    inner: InnerInvariants<'_>,
-) -> Option<Formula> {
-    let excluded: BTreeSet<CfgEdgeId> = cfg.detect_back_edges().into_iter().collect();
-    let mut header_violations = Vec::new();
-    for exit_edge in &info.exit_edges {
-        let Ok(edge) = cfg.edge(*exit_edge) else {
-            continue;
-        };
-        let Some(postcondition) = assertion_postconditions.get(&edge.target) else {
-            continue;
-        };
-        if *postcondition == Formula::False {
-            continue;
-        }
-        let Some(exit_requirement) = edge_source_requirement(cfg, *exit_edge, postcondition) else {
-            continue;
-        };
-        let Some(exit_states) = backward_states(
-            cfg,
-            &[(edge.source, exit_requirement)],
-            &excluded,
-            Some(&info.body),
-            true,
-            inner,
-            false,
-        ) else {
-            continue;
-        };
-        let exit_header = exit_states
-            .get(&info.header)
-            .cloned()
-            .unwrap_or(Formula::False);
-        if exit_header != Formula::False {
-            header_violations.push(exit_header);
-        }
-    }
-    if header_violations.is_empty() {
-        return None;
-    }
-    Some(Formula::or_all(header_violations))
-}
-
 /// Return store facts that hold at the loop header on first entry.
 ///
 /// Runs the same forward SP pass as [`forward_reach_at_header`] but returns
 /// the accumulated concrete store facts at the header rather than the formula.
-/// Used by [`entry_safety_candidates`] to construct `counter == init` guards.
 pub(crate) fn preheader_store_facts_at_header(
     cfg: &AbstractCfg,
     header: CfgNodeId,
