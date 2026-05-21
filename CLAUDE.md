@@ -378,5 +378,6 @@ Never push directly to stable without a passing `cargo test` locally first.
 - Add focused unit tests for new logic.
 - Update `TODO.md` if the backlog or next-session plan changes.
 - Update `README.md` when CLI behavior or support boundaries change.
-- After every development test, commit, merge to stable and push.
+- After every development test, commit and push.
+- Fix warnings in compilation after tests pass.
 - When you find and fix a soundness bug, write a summary in bug\_summaries folder explaining the bug and the fix. Commit into repo.
