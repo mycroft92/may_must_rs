@@ -190,6 +190,14 @@ heap-manipulation category.
 - **Floating point** — `float_compare.c` style still unsupported.
 - **Variable-amount shifts** — leave result unconstrained.
 
+## Testing infrastructure
+
+- **Move integration tests out of `driver.rs`** — the `#[cfg(test)]` block
+  in `src/analysis/interproc/driver.rs` is large and inflates context windows
+  when reading that module.  Restructure tests into a separate file
+  (e.g., `src/analysis/interproc/driver_tests.rs` or a `tests/` integration
+  test crate) without changing test logic.
+
 ## Long-term / structural
 
 - **Integer overflow / wrap-around** — unbounded-Int model doesn't wrap.
